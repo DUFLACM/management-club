@@ -1,0 +1,37 @@
+{
+  "_comment": "契约 fixture：GET /club-bridge/v1/contests/:tid/results 响应样例（构造值）。ACM 语义：accept 降序、罚时 time 升序、并列同 rank、unrank 不参与排名；完整性标记不做伪造（judgeComplete=null）。",
+  "schemaVersion": 1,
+  "instanceId": "11111111-1111-4111-8111-111111111111",
+  "domainId": "acm-club",
+  "docId": "670100000000000000000001",
+  "title": "2026 秋季新生赛",
+  "beginAt": "2026-10-01T08:00:00.000Z",
+  "endAt": "2026-10-01T13:00:00.000Z",
+  "results": {
+    "rule": "acm",
+    "status": "final",
+    "detailAvailable": true,
+    "frozen": false,
+    "ended": true,
+    "entryKind": "acm",
+    "entries": [
+      { "rank": 1, "uid": 1001, "accept": 11, "time": 723, "unrank": false, "tied": false },
+      { "rank": 2, "uid": 1002, "accept": 9, "time": 640, "unrank": false, "tied": false },
+      { "rank": 2, "uid": 1003, "accept": 9, "time": 640, "unrank": false, "tied": true },
+      { "rank": 4, "uid": 1004, "accept": 4, "time": 300, "unrank": false, "tied": false },
+      { "rank": null, "uid": 1999, "accept": 7, "time": 500, "unrank": true, "tied": false }
+    ],
+    "integrity": {
+      "ended": true,
+      "frozen": false,
+      "judgeComplete": null,
+      "participantCount": 5,
+      "rankedCount": 4,
+      "problemCount": 12,
+      "maxStatusRevision": 31,
+      "note": "ACM 语义：rank 按 accept 降序、罚时 time 升序；并列同 rank；unrank 不参与排名"
+    }
+  },
+  "snapshotHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "generatedAt": "2026-10-05T11:30:00.000Z"
+}

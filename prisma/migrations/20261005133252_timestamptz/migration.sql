@@ -1,0 +1,302 @@
+-- AlterTable
+ALTER TABLE "activities" ALTER COLUMN "start_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "end_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "register_start_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "register_deadline" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "cancel_deadline" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "leave_deadline" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "published_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "activity_participants" ALTER COLUMN "frozen_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "activity_registrations" ALTER COLUMN "accepted_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "confirm_deadline" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "cancelled_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "activity_venue_bindings" ALTER COLUMN "bound_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "anonymous_bindings" ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "app_meta" ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "appeals" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "closed_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "attendance_attempts" ALTER COLUMN "server_time" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "attendance_challenges" ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "consumed_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "attendance_checkpoints" ALTER COLUMN "accepted_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "attendance_corrections" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "attendance_policies" ALTER COLUMN "checkin_open_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "checkin_close_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "checkout_open_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "checkout_close_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "attendance_qr_windows" ALTER COLUMN "issued_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "revoked_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "attendance_results" ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "audit_logs" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "auth_attempts" ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "consumed_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "auth_identities" ALTER COLUMN "first_seen_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "last_seen_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "badge_awards" ALTER COLUMN "granted_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "badge_definitions" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "badge_rule_versions" ALTER COLUMN "publicized_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "calculation_batches" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "competition_registrations" ALTER COLUMN "registered_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "confirmed_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "disclosures" ALTER COLUMN "starts_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "ends_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "published_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "effective_score_snapshots" ALTER COLUMN "computed_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "hydro_event_receipts" ALTER COLUMN "received_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "processed_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "hydro_identity_links" ALTER COLUMN "valid_from" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "valid_until" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "revoked_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "hydro_nonces" ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "incident_reports" ALTER COLUMN "started_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "ended_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "integration_instances" ALTER COLUMN "last_checked_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "invitation_redemptions" ALTER COLUMN "redeemed_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "invitations" ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "revoked_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "jobs" ALTER COLUMN "run_after" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "lease_until" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "leave_requests" ALTER COLUMN "reviewed_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "media_assets" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "membership_terms" ALTER COLUMN "semester_registered_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "effective_from" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "effective_to" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "membership_transitions" ALTER COLUMN "effective_from" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "monthly_scores" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "outbound_rate_limits" ALTER COLUMN "next_allowed_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "outbox_events" ALTER COLUMN "published_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "platform_accounts" ALTER COLUMN "verified_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "valid_from" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "valid_until" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "last_sync_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "platform_contests" ALTER COLUMN "start_time" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "end_time" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "last_synced_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "platform_rating_points" ALTER COLUMN "occurred_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "platform_results" ALTER COLUMN "synced_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "points_claims" ALTER COLUMN "reviewed_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "points_ledger" ALTER COLUMN "recorded_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "principals" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "ranking_freezes" ALTER COLUMN "freeze_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "registration_history" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "registration_intents" ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "consumed_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "remote_permissions" ALTER COLUMN "approved_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "restrictions" ALTER COLUMN "starts_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "ends_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "revoked_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "review_cases" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "closed_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "review_votes" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "role_grants" ALTER COLUMN "granted_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "valid_until" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "revoked_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "room_bookings" ALTER COLUMN "starts_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "ends_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "approved_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "rule_versions" ALTER COLUMN "publicized_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "effective_from" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "secret_references" ALTER COLUMN "last_rotated" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "disabled_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "semesters" ALTER COLUMN "starts_on" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "ends_on" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "sessions" ALTER COLUMN "auth_time" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "idle_expires_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "revoked_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "setting_events" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "site_setting_versions" ALTER COLUMN "published_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "effective_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "source_snapshots" ALTER COLUMN "fetched_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "staff_profiles" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "teams" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "user_profiles" ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "users" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "venue_review_events" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "venue_verification_samples" ALTER COLUMN "sampled_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "received_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "venue_version_contributors" ALTER COLUMN "first_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "last_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "venue_versions" ALTER COLUMN "valid_from" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "valid_until" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "submitted_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "approved_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "revoked_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3);
+
+-- AlterTable
+ALTER TABLE "venues" ALTER COLUMN "created_at" SET DATA TYPE TIMESTAMPTZ(3),
+ALTER COLUMN "updated_at" SET DATA TYPE TIMESTAMPTZ(3);

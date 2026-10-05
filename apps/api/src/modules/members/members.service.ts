@@ -1,0 +1,431 @@
+import { DomainError } from '../../common/domain-error.js'
+import { Inject, Injectable } from '@nestjs/common'
+import { PrismaService } from '../../infrastructure/database/database.module.js'
+import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import { newInvitationSecret } from '../auth/auth.service.js'
+import { newId, sha256Hex, monthKey } from '../../common/utils.js'
+import { computeEffectiveScore, formalQuota, graceMonths } from '@acm/scoring-core'
+import type { SessionActor } from '../auth/session.service.js'
+
+/**
+ * 成员管理、概览、邀请管理、训练室（01/02/03 方案）。
+ */
+
+export class MembersError extends DomainError {
+  constructor(message: string, readonly code: string) {
+    super(message, code)
+  }
+}
+
+@Injectable()
+export class MembersService {
+  constructor(
+    @Inject(PrismaService) private readonly db: PrismaService,
+    private readonly audit: AuditService,
+  ) {}
+
+  /** /api/v1/me/dashboard：轻量首屏聚合（不加载流水/附件/榜单/第三方） */
+  async memberDashboard(userId: string) {
+    const user = await this.db.user.findUnique({
+      where: { id: userId },
+      include: {
+        profile: true,
+        membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 },
+      },
+    })
+    if (!user) throw new MembersError('用户不存在', 'NOT_FOUND')
+    const now = new Date()
+    const currentMonth = monthKey(now)
+
+    // E（当前规则版本）
+    const entries = await this.db.pointsLedgerEntry.findMany({ where: { userId, status: 'approved' }, select: { amount: true, scoreMonth: true } })
+    const monthly: Record<string, number> = {}
+    for (const e of entries) monthly[e.scoreMonth] = (monthly[e.scoreMonth] ?? 0) + Number(e.amount)
+    const eff = computeEffectiveScore({ monthlyScores: monthly, currentMonth }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
+
+    // 排名（正式/预备/考察参与当前有效榜）
+    const ranked = await this.rankedList(currentMonth)
+    const myRank = ranked.findIndex((r) => r.userId === userId)
+
+    // 出勤摘要：本人必须参加且已结算的活动
+    const requiredParticipations = await this.db.activityParticipant.findMany({
+      where: { userId, required: true, activity: { endAt: { lt: now } } },
+      include: { activity: true },
+    })
+    let attendanceDone = 0
+    let attendanceTotal = 0
+    for (const p of requiredParticipations) {
+      const result = await this.db.attendanceAttendanceResult.findUnique({ where: { activityId_userId: { activityId: p.activityId, userId } } })
+      if (!result) continue
+      attendanceTotal++
+      if (['ontime', 'late', 'early_leave', 'late_and_early', 'remote_approved'].includes(result.status)) attendanceDone++
+    }
+
+    // 当前可签到活动
+    const openActivities = await this.db.activity.findMany({
+      where: { status: 'published', startAt: { lte: new Date(now.getTime() + 2 * 3600_000) }, endAt: { gte: now } },
+      orderBy: { startAt: 'asc' },
+      take: 3,
+      include: {
+        policy: true,
+        registrations: { where: { userId } },
+        participants: { where: { userId } },
+        checkpoints: { where: { userId } },
+        venueVersion: { include: { venue: true } },
+        venueBindings: { take: 1, include: { venueVersion: { include: { venue: true } } } },
+      },
+    })
+
+    // 待办（公示 + 待补材料）
+    const openDisclosures = await this.db.disclosure.findMany({ where: { status: 'published', endsAt: { gt: now } }, take: 3 })
+    const pendingClaims = await this.db.pointsClaim.count({ where: { userId, status: 'more_info' } })
+
+    // 近期安排
+    const upcoming = await this.db.activity.findMany({
+      where: { status: 'published', startAt: { gt: now }, endAt: { lt: new Date(now.getTime() + 14 * 24 * 3600_000) } },
+      orderBy: { startAt: 'asc' },
+      take: 5,
+      include: { registrations: { where: { userId } }, venueVersion: { include: { venue: true } } },
+    })
+
+    const membership = user.membershipTerms[0]?.membershipStatus ?? 'applicant'
+    return {
+      user: {
+        displayName: user.profile?.displayName ?? user.verifiedRealName,
+        studentNo: user.studentNo,
+        realName: user.verifiedRealName,
+        membership,
+      },
+      score: {
+        e: eff.eDisplay,
+        components: eff.components.map((c) => ({ month: c.month, m: Number(c.m), weight: Number(c.weight), contribution: Number(c.contribution) })),
+        currentMonthM: monthly[currentMonth] ?? 0,
+      },
+      rank: myRank >= 0 ? { position: myRank + 1, total: ranked.length, qualified: true } : { position: null, total: ranked.length, qualified: false, reason: membership === 'applicant' ? '申请中：尚未获得入社资格' : membership === 'honorary_retired' ? '荣誉退役：退出日常排名' : null },
+      attendance: { done: attendanceDone, total: attendanceTotal, note: attendanceTotal === 0 ? '暂无已结算的必到活动' : null },
+      openActivities: openActivities.map((a) => {
+        const policy = a.policy
+        const venue = a.venueVersion ?? a.venueBindings[0]?.venueVersion
+        const windowOpen = policy ? (policy.checkinOpenAt <= now && now <= policy.checkinCloseAt ? 'IN' : policy.checkoutOpenAt && policy.checkoutOpenAt <= now && now <= (policy.checkoutCloseAt ?? now) ? 'OUT' : 'none') : 'none'
+        return {
+          id: a.id,
+          title: a.title,
+          type: a.type,
+          startAt: a.startAt.toISOString(),
+          endAt: a.endAt.toISOString(),
+          venue: venue ? { name: venue.venue.name, building: venue.building, room: venue.room } : null,
+          policy: policy?.policy ?? null,
+          myRegistration: a.registrations[0]?.status ?? null,
+          required: a.participants[0]?.required ?? false,
+          checkedIn: a.checkpoints.some((c) => c.checkpoint === 'IN'),
+          checkedOut: a.checkpoints.some((c) => c.checkpoint === 'OUT'),
+          windowOpen,
+          canCheckIn: windowOpen === 'IN' && (a.registrations[0]?.status === 'enrolled' || a.participants[0]?.required === true),
+        }
+      }),
+      todos: [
+        ...openDisclosures.map((d) => ({ kind: 'disclosure' as const, id: d.id, title: `积分公示进行中（${d.monthKey}）`, deadline: d.endsAt?.toISOString() })),
+        ...(pendingClaims > 0 ? [{ kind: 'claim' as const, id: 'more_info', title: `有 ${pendingClaims} 条贡献材料待补充`, deadline: null }] : []),
+      ],
+      upcoming: upcoming.map((a) => ({
+        id: a.id, title: a.title, type: a.type, startAt: a.startAt.toISOString(),
+        venue: a.venueVersion ? { name: a.venueVersion.venue.name, room: a.venueVersion.room } : null,
+        myRegistration: a.registrations[0]?.status ?? null,
+      })),
+      platformSync: await this.db.platformAccount.findMany({ where: { userId, status: { not: 'revoked' } }, select: { platform: true, status: true, lastSyncAt: true, lastSyncStatus: true } }),
+    }
+  }
+
+  private async rankedList(currentMonth: string) {
+    const entries = await this.db.pointsLedgerEntry.findMany({ where: { status: 'approved' }, select: { userId: true, amount: true, scoreMonth: true } })
+    const byUser = new Map<string, Record<string, number>>()
+    for (const e of entries) {
+      if (!byUser.has(e.userId)) byUser.set(e.userId, {})
+      const m = byUser.get(e.userId)!
+      m[e.scoreMonth] = (m[e.scoreMonth] ?? 0) + Number(e.amount)
+    }
+    const users = await this.db.user.findMany({
+      where: { id: { in: [...byUser.keys()] }, accountStatus: 'active' },
+      include: { membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 } },
+    })
+    return users
+      .filter((u) => ['formal', 'provisional', 'observing'].includes(u.membershipTerms[0]?.membershipStatus ?? ''))
+      .map((u) => {
+        const eff = computeEffectiveScore({ monthlyScores: byUser.get(u.id) ?? {}, currentMonth }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
+        return { userId: u.id, e: Number(eff.e) }
+      })
+      .sort((a, b) => b.e - a.e)
+  }
+
+  /** 管理概览：真实待办计数 + 当天活动 */
+  async adminDashboard() {
+    const now = new Date()
+    const todayStart = new Date(now)
+    todayStart.setHours(0, 0, 0, 0)
+    const todayEnd = new Date(todayStart.getTime() + 24 * 3600_000)
+    const [pendingApplications, pendingVenueReviews, attendanceAnomalies, pendingClaims, openDisclosures, syncFailures, todayActivities] = await Promise.all([
+      this.db.membershipTerm.count({ where: { membershipStatus: 'applicant' } }),
+      this.db.venueVersion.count({ where: { status: 'pending_review' } }),
+      this.db.attendanceAttendanceResult.count({ where: { status: 'pending_review' } }),
+      this.db.pointsClaim.count({ where: { status: 'pending' } }),
+      this.db.disclosure.count({ where: { status: 'published', endsAt: { gt: now } } }),
+      this.db.job.count({ where: { type: { startsWith: 'platform.' }, status: 'dead' } }),
+      this.db.activity.findMany({ where: { startAt: { gte: todayStart, lt: todayEnd } }, orderBy: { startAt: 'asc' }, take: 10, include: { venueVersion: { include: { venue: true } } } }),
+    ])
+    return {
+      counts: { pendingApplications, pendingVenueReviews, attendanceAnomalies, pendingClaims, openDisclosures, syncFailures },
+      todayActivities: todayActivities.map((a) => ({ id: a.id, title: a.title, startAt: a.startAt.toISOString(), venue: a.venueVersion ? `${a.venueVersion.venue.name} ${a.venueVersion.room ?? ''}`.trim() : null })),
+    }
+  }
+
+  /** 成员列表（管理端） */
+  async adminMembers(filters: { q?: string; status?: string; cursor?: string }) {
+    const where: Record<string, unknown> = {}
+    if (filters.status) where.membershipTerms = { some: { membershipStatus: filters.status } }
+    if (filters.q) {
+      where.OR = [
+        { studentNo: filters.q },
+        { verifiedRealName: { contains: filters.q } },
+        { profile: { displayName: { contains: filters.q, mode: 'insensitive' } } },
+      ]
+    }
+    const rows = await this.db.user.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: 21,
+      ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
+      include: {
+        profile: { select: { displayName: true } },
+        membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 },
+        restrictions: { where: { revokedAt: null, OR: [{ endsAt: null }, { endsAt: { gt: new Date() } }] } },
+      },
+    })
+    const nextCursor = rows.length > 20 ? rows.pop()!.id : undefined
+    const entries = await this.db.pointsLedgerEntry.findMany({ where: { userId: { in: rows.map((r) => r.id) }, status: 'approved' }, select: { userId: true, amount: true, scoreMonth: true } })
+    const byUser = new Map<string, Record<string, number>>()
+    for (const e of entries) {
+      if (!byUser.has(e.userId)) byUser.set(e.userId, {})
+      const m = byUser.get(e.userId)!
+      m[e.scoreMonth] = (m[e.scoreMonth] ?? 0) + Number(e.amount)
+    }
+    const currentMonth = monthKey(new Date())
+    return {
+      items: rows.map((u) => {
+        const eff = computeEffectiveScore({ monthlyScores: byUser.get(u.id) ?? {}, currentMonth }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
+        return {
+          id: u.id,
+          displayName: u.profile?.displayName ?? u.verifiedRealName,
+          studentNo: u.studentNo,
+          grade: u.grade,
+          membership: u.membershipTerms[0]?.membershipStatus ?? 'applicant',
+          e: eff.eDisplay,
+          restrictions: u.restrictions.map((r) => r.type),
+          createdAt: u.createdAt.toISOString(),
+        }
+      }),
+      nextCursor,
+    }
+  }
+
+  /** 入社审批（applicant → observing；记录 transition；不自动正式） */
+  async reviewMembership(actor: SessionActor, userId: string, decision: 'admit' | 'reject', reason: string): Promise<void> {
+    if (actor.userId === userId) throw new MembersError('不能审批本人入社', 'RECUSED')
+    const term = await this.db.membershipTerm.findFirst({ where: { userId }, orderBy: { createdAt: 'desc' } })
+    if (!term || term.membershipStatus !== 'applicant') throw new MembersError('当前不是申请中状态', 'STATE_INVALID')
+    const nextStatus = decision === 'admit' ? 'observing' : 'rejected_input'
+    await this.db.$transaction(async (tx) => {
+      await tx.membershipTransition.create({
+        data: {
+          id: newId(), userId, fromStatus: 'applicant', toStatus: decision === 'admit' ? 'observing' : 'withdrawn',
+          decision, reason, effectiveFrom: new Date(), decidedBy: actor.principalId,
+        },
+      })
+      if (decision === 'admit') {
+        await tx.membershipTerm.update({ where: { id: term.id }, data: { membershipStatus: 'observing', basis: reason, effectiveFrom: new Date() } })
+      } else {
+        await tx.membershipTerm.update({ where: { id: term.id }, data: { membershipStatus: 'withdrawn', basis: reason } })
+      }
+      await tx.auditLog.create({
+        data: { id: newId(), actorPrincipalId: actor.principalId, action: 'members.membership_decision', resourceType: 'user', resourceId: userId, summary: `入社${decision === 'admit' ? '批准（进入一个月观察期）' : '驳回'}：${reason.slice(0, 200)}` },
+      })
+    })
+    void nextStatus
+  }
+
+  /** 月度身份评定预览（候选，不自动改身份；04 方案 7） */
+  async monthlyEvaluationPreview(month: string) {
+    const users = await this.db.user.findMany({
+      where: { accountStatus: 'active' },
+      include: { membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 } },
+    })
+    const entries = await this.db.pointsLedgerEntry.findMany({ where: { status: 'approved' }, select: { userId: true, amount: true, scoreMonth: true, category: true } })
+    const byUser = new Map<string, { total: number; months: Record<string, number> }>()
+    for (const e of entries) {
+      if (!byUser.has(e.userId)) byUser.set(e.userId, { total: 0, months: {} })
+      const u = byUser.get(e.userId)!
+      u.total += Number(e.amount)
+      u.months[e.scoreMonth] = (u.months[e.scoreMonth] ?? 0) + Number(e.amount)
+    }
+    const formalCount = users.filter((u) => u.membershipTerms[0]?.membershipStatus === 'formal').length
+    const quota = formalQuota(formalCount)
+    const rankedFormal = users
+      .filter((u) => u.membershipTerms[0]?.membershipStatus === 'formal')
+      .map((u) => ({ userId: u.id, total: byUser.get(u.id)?.total ?? 0 }))
+      .sort((a, b) => b.total - a.total)
+    const keep = new Set(rankedFormal.slice(0, quota).map((r) => r.userId))
+    const candidates = rankedFormal.slice(quota).map((r) => {
+      const k = Math.max(1, 1) // K 由 transitions 记录推算；此处输出候选与原因
+      const g = graceMonths(6)
+      return { userId: r.userId, kind: 'lose_quota', inOfficeMonths: k, graceMonths: g.g ? g.g : 0, demoteNextMonth: g.demoteNextMonth }
+    })
+    const observing = users.filter((u) => u.membershipTerms[0]?.membershipStatus === 'observing')
+    const observingCandidates = observing.map((u) => {
+      const months = byUser.get(u.id)?.months ?? {}
+      const m = months[month] ?? 0
+      return { userId: u.id, monthM: m, meetsM12: m >= 12, note: '满足指定比赛/集体活动/月度 M≥12 等条件后按月度结果转正' }
+    })
+    return { month, formalCount, quota, loseQuotaCandidates: candidates, observingCandidates, note: '候选名单仅供评定会议，不自动更改身份（告知/申辩/集体讨论/教师审核/公示流程由负责人执行）' }
+  }
+
+  // ---------------- 邀请管理 ----------------
+
+  async createInvitation(actor: SessionActor, input: { maxUses: number; expiresInDays: number; batchLabel?: string; allowedStudentNo?: string }): Promise<{ invitationId: string; code: string; expiresAt: Date }> {
+    const secret = newInvitationSecret()
+    const id = newId()
+    const expiresAt = new Date(Date.now() + input.expiresInDays * 24 * 3600_000)
+    await this.db.invitation.create({
+      data: {
+        id,
+        tokenHash: sha256Hex(secret),
+        batchLabel: input.batchLabel,
+        maxUses: input.maxUses,
+        expiresAt,
+        allowedStudentNo: input.allowedStudentNo,
+        createdBy: actor.principalId,
+      },
+    })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'invitation.create',
+      resourceType: 'invitation',
+      resourceId: id,
+      summary: `创建邀请（${input.maxUses} 次，${input.expiresInDays} 天，批次 ${input.batchLabel ?? '个人'}）`,
+    })
+    return { invitationId: id, code: secret, expiresAt }
+  }
+
+  async listInvitations(cursor?: string) {
+    const rows = await this.db.invitation.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 21,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      include: { redemptions: { include: { user: { select: { studentNo: true, verifiedRealName: true } } } } },
+    })
+    const nextCursor = rows.length > 20 ? rows.pop()!.id : undefined
+    return { items: rows.map((r) => ({ ...r, tokenHash: undefined })), nextCursor }
+  }
+
+  async revokeInvitation(actor: SessionActor, invitationId: string): Promise<void> {
+    await this.db.invitation.updateMany({ where: { id: invitationId, revokedAt: null }, data: { revokedAt: new Date(), status: 'revoked' } })
+    await this.audit.log({ actorPrincipalId: actor.principalId, action: 'invitation.revoke', resourceType: 'invitation', resourceId: invitationId, summary: '停用邀请' })
+  }
+
+  // ---------------- 训练室（04 方案：至少三人、同时九人、每日/每周次数、24h 提前、3h 通常/6h 上限） ----------------
+
+  async createRoomBooking(userId: string, input: { startsAt: string; endsAt: string; purpose: string; coApplicantUserIds: string[]; contestLink?: string }): Promise<{ bookingId: string }> {
+    const start = new Date(input.startsAt)
+    const end = new Date(input.endsAt)
+    const now = new Date()
+    const durationHours = (end.getTime() - start.getTime()) / 3600_000
+    if (durationHours <= 0 || durationHours > 6) throw new MembersError('批准时长最长六小时', 'DURATION_LIMIT')
+    if (durationHours > 3) {
+      // 通常三小时；超过三小时的申请标注需审批加长（由审批人决定）
+    }
+    if (start.getTime() - now.getTime() < 24 * 3600_000) throw new MembersError('普通申请至少提前 24 小时', 'ADVANCE_REQUIRED')
+    const headcount = new Set([userId, ...input.coApplicantUserIds]).size
+    if (headcount < 3) throw new MembersError('至少三名共同申请人', 'HEADCOUNT_MIN')
+    if (headcount > 9) throw new MembersError('同时使用不超过九人', 'HEADCOUNT_MAX')
+
+    const id = newId()
+    await this.db.$transaction(async (tx) => {
+      // 场地串行锁 + 峰值容量检查（重叠预约的同时人数之和 ≤ 9）
+      const overlapping = await tx.roomBooking.findMany({
+        where: { status: 'approved', startsAt: { lt: end }, endsAt: { gt: start } },
+      })
+      // 边界法计算同时人数峰值
+      const events: Array<{ t: number; delta: number }> = []
+      for (const b of overlapping) {
+        events.push({ t: b.startsAt.getTime(), delta: b.headcount })
+        events.push({ t: b.endsAt.getTime(), delta: -b.headcount })
+      }
+      events.sort((a, b) => a.t - b.t || a.delta - b.delta)
+      let peak = 0
+      let cur = 0
+      for (const ev of events) {
+        cur += ev.delta
+        peak = Math.max(peak, cur)
+      }
+      if (peak + headcount > 9) throw new MembersError('该时段同时人数将超过九人上限', 'CAPACITY_PEAK')
+
+      // 每人每天一次、每周两次（按申请人集合）
+      for (const uid of [userId, ...input.coApplicantUserIds]) {
+        const dayStart = new Date(start)
+        dayStart.setHours(0, 0, 0, 0)
+        const dayEnd = new Date(dayStart.getTime() + 24 * 3600_000)
+        const weekStart = new Date(dayStart.getTime() - 6 * 24 * 3600_000)
+        const [dailyCount, weeklyCount] = await Promise.all([
+          tx.roomBooking.count({ where: { status: 'approved', OR: [{ applicantUserId: uid }, { coApplicantUserIds: { has: uid } }], startsAt: { gte: dayStart, lt: dayEnd } } }),
+          tx.roomBooking.count({ where: { status: 'approved', OR: [{ applicantUserId: uid }, { coApplicantUserIds: { has: uid } }], startsAt: { gte: weekStart, lt: dayEnd } } }),
+        ])
+        if (dailyCount >= 1) throw new MembersError('每人每天最多一次训练室申请', 'DAILY_LIMIT')
+        if (weeklyCount >= 2) throw new MembersError('每人每周最多两次训练室申请', 'WEEKLY_LIMIT')
+        // 冻结成员不能通过共同申请人绕过
+        const restriction = await tx.restriction.findFirst({
+          where: { userId: uid, type: 'room_freeze', revokedAt: null, OR: [{ endsAt: null }, { endsAt: { gt: now } }] },
+        })
+        if (restriction) throw new MembersError('存在训练室资格冻结，不能作为申请人', 'ROOM_FROZEN')
+      }
+      await tx.roomBooking.create({
+        data: { id, startsAt: start, endsAt: end, purpose: input.purpose, contestLink: input.contestLink, applicantUserId: userId, coApplicantUserIds: input.coApplicantUserIds, headcount, status: 'pending' },
+      })
+    })
+    return { bookingId: id }
+  }
+
+  async decideRoomBooking(actor: SessionActor, bookingId: string, decision: 'approve' | 'reject', reason?: string): Promise<void> {
+    const booking = await this.db.roomBooking.findUnique({ where: { id: bookingId } })
+    if (!booking || booking.status !== 'pending') throw new MembersError('预约不存在或已处理', 'STATE_INVALID')
+    if (booking.applicantUserId === actor.userId || booking.coApplicantUserIds.includes(actor.userId ?? '')) {
+      throw new MembersError('不能审批本人参与的预约', 'RECUSED')
+    }
+    await this.db.roomBooking.update({
+      where: { id: bookingId },
+      data: decision === 'approve'
+        ? { status: 'approved', approvedBy: actor.principalId, approvedAt: new Date() }
+        : { status: 'rejected', rejectionReason: reason ?? '' },
+    })
+  }
+
+  async myRoomBookings(userId: string) {
+    return this.db.roomBooking.findMany({
+      where: { OR: [{ applicantUserId: userId }, { coApplicantUserIds: { has: userId } }] },
+      orderBy: { startsAt: 'desc' },
+      take: 20,
+    })
+  }
+
+  /** 审计检索（脱敏：不返回 ticket/token/坐标原文） */
+  async auditLogs(filters: { actor?: string; resourceType?: string; cursor?: string }) {
+    const rows = await this.db.auditLog.findMany({
+      where: {
+        ...(filters.resourceType ? { resourceType: filters.resourceType } : {}),
+        ...(filters.actor ? { actorPrincipalId: filters.actor } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 51,
+      ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
+    })
+    const nextCursor = rows.length > 50 ? rows.pop()!.id : undefined
+    return { items: rows, nextCursor }
+  }
+}

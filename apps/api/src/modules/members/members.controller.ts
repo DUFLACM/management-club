@@ -1,0 +1,158 @@
+import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
+import { z } from 'zod'
+import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentUser, CurrentActor, ok } from '../../common/guards.js'
+import { MembersService } from './members.service.js'
+import { PrismaService } from '../../infrastructure/database/database.module.js'
+import type { SessionActor } from '../auth/session.service.js'
+
+@Controller('/api/v1/me')
+@UseGuards(SessionGuard, PermissionsGuard)
+export class MeController {
+  constructor(
+    private readonly members: MembersService,
+    private readonly db: PrismaService,
+  ) {}
+
+  @Get('dashboard')
+  async dashboard(@CurrentUser() user: { userId: string }) {
+    return ok(await this.members.memberDashboard(user.userId))
+  }
+
+  /** 本人出勤历史 */
+  @Get('attendance')
+  async attendance(@CurrentUser() user: { userId: string }) {
+    const results = await this.db.attendanceAttendanceResult.findMany({
+      where: { userId: user.userId },
+      orderBy: { updatedAt: 'desc' },
+      take: 50,
+      include: { activity: { select: { id: true, title: true, type: true, startAt: true, endAt: true } } },
+    })
+    return ok(results)
+  }
+
+  @Get('room-bookings')
+  async roomBookings(@CurrentUser() user: { userId: string }) {
+    return ok(await this.members.myRoomBookings(user.userId))
+  }
+
+  @Post('room-bookings')
+  async createRoomBooking(@CurrentUser() user: { userId: string }, @Body() body: unknown) {
+    const parsed = z.object({
+      startsAt: z.string().datetime(),
+      endsAt: z.string().datetime(),
+      purpose: z.string().min(3).max(300),
+      coApplicantUserIds: z.array(z.string().uuid()).min(2).max(8),
+      contestLink: z.string().max(300).optional(),
+    }).parse(body)
+    return ok(await this.members.createRoomBooking(user.userId, parsed))
+  }
+}
+
+@Controller('/api/v1/admin')
+@UseGuards(SessionGuard, PermissionsGuard, ActionGuard)
+export class MembersAdminController {
+  constructor(
+    private readonly members: MembersService,
+    private readonly db: PrismaService,
+  ) {}
+
+  @Get('dashboard')
+  async dashboard() {
+    return ok(await this.members.adminDashboard())
+  }
+
+  @Get('members')
+  @RequireAction('members.read')
+  async list(@Query('q') q?: string, @Query('status') status?: string, @Query('cursor') cursor?: string) {
+    return ok(await this.members.adminMembers({ q, status, cursor }))
+  }
+
+  @Get('members/:id')
+  @RequireAction('members.read')
+  async detail(@Param('id', ParseUUIDPipe) id: string) {
+    const user = await this.db.user.findUnique({
+      where: { id },
+      include: {
+        profile: true,
+        membershipTerms: { orderBy: { createdAt: 'desc' } },
+        platformAccounts: true,
+        restrictions: true,
+        registrations: { take: 10, orderBy: { createdAt: 'desc' }, include: { activity: { select: { title: true, startAt: true } } } },
+      },
+    })
+    return ok(user)
+  }
+
+  @Post('members/:id/membership-decision')
+  @RequireAction('members.review')
+  async membershipDecision(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ decision: z.enum(['admit', 'reject']), reason: z.string().min(3).max(500) }).parse(body)
+    await this.members.reviewMembership(actor, id, parsed.decision, parsed.reason)
+    return ok({ decided: true })
+  }
+
+  @Get('membership-evaluation')
+  @RequireAction('members.review')
+  async evaluationPreview(@Query('month') month?: string) {
+    const m = month && /^\d{4}-\d{2}$/.test(month) ? month : undefined
+    return ok(await this.members.monthlyEvaluationPreview(m ?? currentMonth()))
+  }
+
+  // ---- 邀请 ----
+  @Get('invitations')
+  @RequireAction('invitations.manage')
+  async listInvitations(@Query('cursor') cursor?: string) {
+    return ok(await this.members.listInvitations(cursor))
+  }
+
+  @Post('invitations')
+  @RequireAction('invitations.manage')
+  async createInvitation(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
+    const parsed = z.object({
+      maxUses: z.number().int().min(1).max(200).default(1),
+      expiresInDays: z.number().int().min(1).max(365).default(14),
+      batchLabel: z.string().max(64).optional(),
+      allowedStudentNo: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/).optional(),
+    }).parse(body)
+    return ok(await this.members.createInvitation(actor, parsed))
+  }
+
+  @Post('invitations/:id/revoke')
+  @RequireAction('invitations.manage')
+  async revokeInvitation(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    await this.members.revokeInvitation(actor, id)
+    return ok({ revoked: true })
+  }
+
+  // ---- 训练室 ----
+  @Get('room-bookings')
+  @RequireAction('rooms.approve')
+  async roomBookings(@Query('status') status?: string) {
+    const rows = await this.db.roomBooking.findMany({
+      where: status ? { status } : { status: 'pending' },
+      orderBy: { startsAt: 'asc' },
+      take: 50,
+    })
+    return ok(rows)
+  }
+
+  @Post('room-bookings/:id/decision')
+  @RequireAction('rooms.approve')
+  async roomDecision(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ decision: z.enum(['approve', 'reject']), reason: z.string().max(500).optional() }).parse(body)
+    await this.members.decideRoomBooking(actor, id, parsed.decision, parsed.reason)
+    return ok({ decided: true })
+  }
+
+  // ---- 审计 ----
+  @Get('audit-logs')
+  @RequireAction('audit.read')
+  async audit(@Query('resourceType') resourceType?: string, @Query('cursor') cursor?: string) {
+    return ok(await this.members.auditLogs({ resourceType, cursor }))
+  }
+}
+
+function currentMonth(): string {
+  const d = new Date(Date.now() + 8 * 3600_000)
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+}

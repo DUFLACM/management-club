@@ -1,0 +1,32 @@
+{
+  "name": "dlufl-acm-club",
+  "version": "0.1.0",
+  "private": true,
+  "description": "大连外国语大学 ACM 算法协会积分管理系统（NestJS + PostgreSQL + React/Vite + shadcn/ui）",
+  "packageManager": "pnpm@12.4.2",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "postinstall": "pnpm --filter @acm/db generate",
+    "dev": "pnpm run --parallel /^dev:/",
+    "dev:api": "pnpm --filter @acm/api dev",
+    "dev:web": "pnpm --filter @acm/web dev",
+    "dev:worker": "pnpm --filter @acm/worker dev",
+    "build": "pnpm --filter @acm/scoring-core build && pnpm --filter @acm/db generate && pnpm --filter @acm/db build && pnpm --filter @acm/integrations build && pnpm --filter @acm/hydro-bridge build && pnpm --filter @acm/api build && pnpm --filter @acm/worker build && pnpm --filter @acm/web build",
+    "test": "pnpm --filter @acm/scoring-core test && pnpm --filter @acm/hydro-bridge test && pnpm --filter @acm/api test && pnpm --filter @acm/web test",
+    "test:integration": "pnpm --filter @acm/api test:integration",
+    "lint": "pnpm -r --if-present run lint",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "db:migrate": "pnpm --filter @acm/db migrate",
+    "db:migrate:deploy": "pnpm --filter @acm/db migrate:deploy",
+    "db:seed": "pnpm --filter @acm/db seed",
+    "db:studio": "pnpm --filter @acm/db studio",
+    "cli": "pnpm --filter @acm/api cli",
+    "screenshot": "pnpm --filter @acm/web screenshot"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.0",
+    "typescript": "^5.9.3"
+  }
+}

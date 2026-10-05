@@ -1,0 +1,155 @@
+@import 'tailwindcss';
+@import './tokens.css';
+
+/* 深色模式由 .dark 类驱动（html.dark），三态切换见 ThemeToggle。 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * 语义变量 → Tailwind v4 颜色工具类（CSS-first 配置）。
+ * 颜色直接引用 hex CSS 变量，不经 HSL 包装。
+ */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-subtle: var(--destructive-subtle);
+
+  --color-success: var(--success-foreground);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-subtle: var(--success-subtle);
+
+  --color-info: var(--info-foreground);
+  --color-info-foreground: var(--info-foreground);
+  --color-info-subtle: var(--info-subtle);
+
+  --color-warning: var(--warning-foreground);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-subtle: var(--warning-subtle);
+
+  --color-lilac: var(--lilac-foreground);
+  --color-lilac-foreground: var(--lilac-foreground);
+  --color-lilac-subtle: var(--lilac-subtle);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* 圆角：--radius 0.625rem(10px) 为基准（Button/Input/Select） */
+  --radius-sm: calc(var(--radius) - 4px); /* 6px：Badge */
+  --radius-md: calc(var(--radius) - 2px); /* 8px */
+  --radius-lg: var(--radius); /* 10px：Button/Input/Select */
+  --radius-xl: calc(var(--radius) + 2px); /* 12px */
+
+  /* 中文系统字体栈（§3.3），首屏不加载完整中文 webfont */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+
+  /* handle、比赛 ID、公式等数据与代码 */
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+
+  /* 阴影（深色减弱，不叠加发光） */
+  --shadow-card: var(--elevation-card);
+  --shadow-overlay: var(--elevation-overlay);
+}
+
+:root {
+  --elevation-card: 0 4px 16px rgb(32 43 70 / 4%);
+  --elevation-overlay: 0 12px 40px rgb(32 43 70 / 12%);
+}
+
+.dark {
+  --elevation-card: 0 4px 16px rgb(0 0 0 / 24%);
+  --elevation-overlay: 0 12px 40px rgb(0 0 0 / 48%);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 22px;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* 全局键盘焦点：2px ring + 2px offset，所有可操作元素可由键盘识别 */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  /* 数值默认启用等宽数字（tabular-nums 也可按元素单独使用） */
+  table.num,
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background-color: var(--secondary);
+    color: var(--secondary-foreground);
+  }
+}
+
+@layer utilities {
+  /* 等宽数字工具类（Tailwind 自带 tabular-nums；此处补充语义别名） */
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* 减少动态效果：关闭非必要过渡/动画，保留静态状态提示 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

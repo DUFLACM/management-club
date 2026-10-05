@@ -1,0 +1,38 @@
+{
+  "_comment": "契约 fixture：GET /club-bridge/v1/contests 响应样例（构造值）。题数=pids.length；封榜状态与可见性遵循比赛字段；受限未授权赛仅返回存在性标记。",
+  "schemaVersion": 1,
+  "instanceId": "11111111-1111-4111-8111-111111111111",
+  "domainId": "acm-club",
+  "contests": [
+    {
+      "docId": "670100000000000000000001",
+      "domainId": "acm-club",
+      "title": "2026 秋季新生赛",
+      "rule": "acm",
+      "ruleKnown": true,
+      "beginAt": "2026-10-01T08:00:00.000Z",
+      "endAt": "2026-10-01T13:00:00.000Z",
+      "problemCount": 12,
+      "rated": true,
+      "attendance": 87,
+      "durationHours": null,
+      "frozen": false,
+      "lock": { "lockAt": "2026-10-01T12:00:00.000Z", "unlocked": true, "isLocked": false },
+      "scoreboard": { "displayOnly": false, "detailAvailable": true },
+      "ended": true,
+      "autoHide": false,
+      "keepScoreboardHidden": false,
+      "visibility": "public",
+      "exportable": true
+    },
+    {
+      "docId": "67010000000000000000000a",
+      "domainId": "acm-club",
+      "visibility": "restricted",
+      "exportable": false
+    }
+  ],
+  "nextCursor": null,
+  "snapshotHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "generatedAt": "2026-10-05T11:30:00.000Z"
+}

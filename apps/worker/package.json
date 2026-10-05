@@ -1,0 +1,23 @@
+{
+  "name": "@acm/worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@acm/db": "workspace:*",
+    "@acm/integrations": "workspace:*",
+    "@acm/scoring-core": "workspace:*",
+    "dotenv": "^17.2.3",
+    "sharp": "^0.35.5",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3"
+  }
+}

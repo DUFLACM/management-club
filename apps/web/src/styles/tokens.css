@@ -1,0 +1,97 @@
+/*
+ * 设计 token（晴空训练室）
+ * 完整对应 docs/scheme/06-ui-design-and-glm-handoff.md §3.2 的 CSS 变量落点。
+ * 颜色一律使用 hex CSS 变量，不转 HSL、不用 hsl() 包裹；
+ * 所有面板必须从这些语义 token 取色，禁止各自另写一套蓝色。
+ */
+
+:root {
+  color-scheme: light;
+  --background: #f5f7fd;
+  --foreground: #202b46;
+  --card: #ffffff;
+  --card-foreground: #202b46;
+  --popover: #ffffff;
+  --popover-foreground: #202b46;
+  --primary: #3659cf;
+  --primary-foreground: #ffffff;
+  --secondary: #edf1ff;
+  --secondary-foreground: #3659cf;
+  --muted: #f0f3fa;
+  --muted-foreground: #61708a;
+  --accent: #edf1ff;
+  --accent-foreground: #3659cf;
+  --destructive: #b43d4b;
+  --destructive-foreground: #ffffff;
+  --destructive-subtle: #fcecef;
+  --border: #dee5f0;
+  --input: #7d8ba5;
+  --ring: #3659cf;
+  --success-foreground: #245c53;
+  --success-subtle: #e8f6f0;
+  --info-foreground: #3659cf;
+  --info-subtle: #edf1ff;
+  --warning-foreground: #92531c;
+  --warning-subtle: #fff2de;
+  --lilac-foreground: #70588d;
+  --lilac-subtle: #f1ecfa;
+  --chart-1: #3659cf;
+  --chart-2: #245c53;
+  --chart-3: #70588d;
+  --chart-4: #92531c;
+  --chart-5: #61708a;
+  --sidebar: #f0f3fb;
+  --sidebar-foreground: #202b46;
+  --sidebar-primary: #3659cf;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e5ebff;
+  --sidebar-accent-foreground: #3659cf;
+  --sidebar-border: #dee5f0;
+  --sidebar-ring: #3659cf;
+  --radius: 0.625rem;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: #111a2c;
+  --foreground: #e9eefa;
+  --card: #182237;
+  --popover: #182237;
+  --card-foreground: #e9eefa;
+  --popover-foreground: #e9eefa;
+  --primary: #acc0ff;
+  --primary-foreground: #17203a;
+  --secondary: #263554;
+  --secondary-foreground: #c8d5ff;
+  --muted: #202d46;
+  --muted-foreground: #afbcd5;
+  --accent: #263554;
+  --accent-foreground: #c8d5ff;
+  --destructive: #f3adb8;
+  --destructive-foreground: #301b24;
+  --destructive-subtle: #412530;
+  --border: #35445f;
+  --input: #7c8fac;
+  --ring: #acc0ff;
+  --success-foreground: #91d5bd;
+  --success-subtle: #18392f;
+  --info-foreground: #acc0ff;
+  --info-subtle: #263554;
+  --warning-foreground: #f3cb92;
+  --warning-subtle: #3c3021;
+  --lilac-foreground: #dec5f4;
+  --lilac-subtle: #312641;
+  --chart-1: #acc0ff;
+  --chart-2: #91d5bd;
+  --chart-3: #dec5f4;
+  --chart-4: #f3cb92;
+  --chart-5: #afbcd5;
+  --sidebar: #131e32;
+  --sidebar-foreground: #e9eefa;
+  --sidebar-primary: #acc0ff;
+  --sidebar-primary-foreground: #17203a;
+  --sidebar-accent: #263554;
+  --sidebar-accent-foreground: #c8d5ff;
+  --sidebar-border: #35445f;
+  --sidebar-ring: #acc0ff;
+}

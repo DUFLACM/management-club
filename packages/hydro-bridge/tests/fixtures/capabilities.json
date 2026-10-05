@@ -1,0 +1,32 @@
+{
+  "_comment": "契约 fixture：GET /club-bridge/v1/capabilities 响应样例（构造值，非学校实例真实数据）。snapshotHash/generatedAt 为运行时生成，此处为示意。",
+  "schemaVersion": 1,
+  "instanceId": "11111111-1111-4111-8111-111111111111",
+  "adapter": "hydro-v5",
+  "adapterVersion": "0.1.0",
+  "hydroVersion": "5.0.7",
+  "sourceVersion": "5.0.7",
+  "allowedDomains": ["acm-club"],
+  "knownRules": ["acm", "oi", "ioi", "strictioi", "homework", "ledo"],
+  "resultRules": ["acm", "oi", "ioi", "strictioi"],
+  "webhook": {
+    "endpoint": "https://club.example.edu.cn/api/v1/integrations/hydro/events",
+    "keyId": "hydro:11111111-1111-4111-8111-111111111111"
+  },
+  "routes": {
+    "capabilities": "/club-bridge/v1/capabilities",
+    "contests": "/club-bridge/v1/contests",
+    "participants": "/club-bridge/v1/contests/:tid/participants",
+    "records": "/club-bridge/v1/contests/:tid/records",
+    "results": "/club-bridge/v1/contests/:tid/results"
+  },
+  "pagination": { "defaultLimit": 200, "maxLimit": 200 },
+  "maxResponseBytes": 1048576,
+  "serviceAccountPerms": [
+    "1",
+    "2",
+    "4",
+    "8"
+  ],
+  "serverTime": "2026-10-05T11:30:00.000Z"
+}

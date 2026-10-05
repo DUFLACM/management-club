@@ -1,0 +1,35 @@
+{
+  "msg": "OK",
+  "code": 0,
+  "data": {
+    "dataList": [
+      {
+        "contestId": 140235,
+        "contestName": "牛客周赛 Round 161",
+        "startTime": 1789297200000,
+        "endTime": 1789304400000,
+        "contestDuration": 7200000,
+        "participationType": "OFFICIAL",
+        "isTeamSignUp": false,
+        "rank": 370,
+        "signUpCnt": 1202,
+        "userCount": 898,
+        "acceptedCount": 3,
+        "problemCount": 6,
+        "totalScore": 355.0,
+        "fullScore": 1050.0,
+        "rating": 989.0,
+        "changeValue": 0.0,
+        "ratingStatus": "FINISHED",
+        "canShowRank": true
+      }
+    ],
+    "pageInfo": {
+      "pageCount": 2,
+      "pageSize": 10,
+      "elementCount": 16,
+      "totalCount": 16,
+      "pageCurrent": 1
+    }
+  }
+}

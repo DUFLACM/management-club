@@ -1,0 +1,1560 @@
+// 大连外国语大学 ACM 算法协会积分管理系统 - PostgreSQL 数据模型
+// 依据 docs/scheme/02-architecture-and-data.md、03、04、05、07、08、09 专题设计。
+// 主键统一 UUID；时间统一 timestamptz；业务自然月按 Asia/Shanghai 推导（应用层）。
+
+generator client {
+  provider = "prisma-client"
+  output   = "../packages/db/src/generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ===========================================================================
+// 一、身份、认证与注册
+// ===========================================================================
+
+model Principal {
+  id        String   @id @db.Uuid
+  kind      String // student | staff | system
+  createdAt DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  users          User[]
+  staffProfiles  StaffProfile[]
+  authIdentities AuthIdentity[]
+  sessions       Session[]
+  roleGrants     RoleGrant[]
+  adminCredential AdminCredential?
+
+  @@map("principals")
+}
+
+model User {
+  id               String   @id @db.Uuid
+  principalId      String   @unique @map("principal_id") @db.Uuid
+  // CAS 验真的学生校园编号；opaque 文本保留前导零，迁移中附加格式 CHECK。
+  studentNo        String   @unique @map("student_no") @db.VarChar(64)
+  verifiedRealName String   @map("verified_real_name")
+  accountStatus    String   @default("active") @map("account_status") // active | disabled
+  grade            Int?
+  phone            String?
+  createdAt        DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+  updatedAt        DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  principal            Principal             @relation(fields: [principalId], references: [id])
+  profile              UserProfile?
+  invitationRedemptions InvitationRedemption[]
+  membershipTerms      MembershipTerm[]
+  registrations        ActivityRegistration[]
+  participation        ActivityParticipant[]
+  checkpoints          AttendanceCheckpoint[]
+  attendanceResults    AttendanceAttendanceResult[]
+  leaveRequests        LeaveRequest[]
+  remotePermissions    RemotePermission[]
+  restrictions         Restriction[]
+  pointsClaims         PointsClaim[]
+  appeals              Appeal[]
+  ledgerEntries        PointsLedgerEntry[]
+  monthlyScores        MonthlyScore[]
+  platformAccounts     PlatformAccount[]
+  badgeAwards          BadgeAward[]
+  featuredBadges       ProfileFeaturedBadge[]
+
+  @@index([studentNo])
+  @@map("users")
+}
+
+model StaffProfile {
+  id             String   @id @db.Uuid
+  principalId    String   @unique @map("principal_id") @db.Uuid
+  // CAS 验真的教职工校园编号；与 User.studentNo 分开建模。
+  staffNo        String?  @unique @map("staff_no") @db.VarChar(64)
+  realName       String   @map("real_name")
+  title          String?
+  approvedSource String   @map("approved_source") // 校方批准的教师认证来源说明
+  status         String   @default("active")
+  createdAt      DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  principal Principal @relation(fields: [principalId], references: [id])
+  @@map("staff_profiles")
+}
+
+model AuthIdentity {
+  id                 String   @id @db.Uuid
+  principalId        String   @map("principal_id") @db.Uuid
+  provider           String // cas（当前仅学校 CAS）
+  subject            String // CAS 稳定主体（如 user_id），独立于学号保存
+  verifiedCampusId   String?  @map("verified_campus_id") @db.VarChar(64)
+  verifiedRealName   String?  @map("verified_real_name")
+  firstSeenAt        DateTime @db.Timestamptz(3) @default(now()) @map("first_seen_at")
+  lastSeenAt         DateTime @db.Timestamptz(3) @default(now()) @map("last_seen_at")
+
+  principal Principal @relation(fields: [principalId], references: [id])
+
+  @@unique([provider, subject])
+  @@unique([principalId, provider])
+  @@map("auth_identities")
+}
+
+// 每次 CAS 尝试的高熵 flow：服务端状态 + 浏览器绑定 + 精确 service
+model AuthAttempt {
+  id                String    @id @db.Uuid
+  flowHash          String    @unique @map("flow_hash")
+  purpose           String // login | register | reauth | attendance_intent
+  cookieBindingHash String    @map("cookie_binding_hash")
+  exactService      String    @map("exact_service")
+  returnTarget      String?   @map("return_target")
+  registrationIntentId String? @map("registration_intent_id") @db.Uuid
+  attendanceIntentId String?  @map("attendance_intent_id") @db.Uuid
+  status            String    @default("pending") // pending | validating | consumed | failed | expired
+  failureReason     String?   @map("failure_reason")
+  expiresAt         DateTime @db.Timestamptz(3)  @map("expires_at")
+  consumedAt        DateTime? @db.Timestamptz(3) @map("consumed_at")
+  createdAt         DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  @@index([status, expiresAt])
+  @@map("auth_attempts")
+}
+
+// 匿名 CSRF bootstrap（登录/邀请交换/扫码意图前置）
+model AnonymousBinding {
+  id         String   @id @db.Uuid
+  cookieHash String   @unique @map("cookie_hash")
+  tokenHash  String   @map("token_hash")
+  expiresAt  DateTime @db.Timestamptz(3) @map("expires_at")
+  createdAt  DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  @@index([expiresAt])
+  @@map("anonymous_bindings")
+}
+
+model Session {
+  id            String    @id @db.Uuid
+  tokenHash     String    @unique @map("token_hash")
+  principalId   String    @map("principal_id") @db.Uuid
+  authTime      DateTime @db.Timestamptz(3)  @map("auth_time")
+  expiresAt     DateTime @db.Timestamptz(3)  @map("expires_at")
+  idleExpiresAt DateTime @db.Timestamptz(3)  @map("idle_expires_at")
+  revokedAt     DateTime? @db.Timestamptz(3) @map("revoked_at")
+  revokeReason  String?   @map("revoke_reason")
+  authzVersion  Int       @default(1) @map("authz_version")
+  userAgent     String?   @map("user_agent")
+  createdAt     DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  principal Principal @relation(fields: [principalId], references: [id])
+
+  @@index([principalId])
+  @@map("sessions")
+}
+
+// 独立本地管理员凭证：不依赖 CAS/邀请码，密码仅保存慢哈希。
+model AdminCredential {
+  id                String    @id @db.Uuid
+  principalId       String    @unique @map("principal_id") @db.Uuid
+  username          String    @unique @db.VarChar(64)
+  displayName       String    @map("display_name")
+  passwordHash      String    @map("password_hash") @db.Text
+  status            String    @default("active") // active | disabled
+  disabledAt        DateTime? @db.Timestamptz(3) @map("disabled_at")
+  failedAttempts    Int       @default(0) @map("failed_attempts")
+  lockedUntil       DateTime? @db.Timestamptz(3) @map("locked_until")
+  passwordChangedAt DateTime  @db.Timestamptz(3) @default(now()) @map("password_changed_at")
+  lastLoginAt       DateTime? @db.Timestamptz(3) @map("last_login_at")
+  createdAt         DateTime  @db.Timestamptz(3) @default(now()) @map("created_at")
+  updatedAt         DateTime  @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  principal Principal @relation(fields: [principalId], references: [id])
+
+  @@map("admin_credentials")
+}
+
+// 管理员入口的全站密语；固定单例 key=primary，轮换时 version 递增。
+model AdminAccessSecret {
+  key        String   @id @default("primary")
+  secretHash String   @map("secret_hash") @db.Text
+  version    Int      @default(1)
+  createdAt  DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+  updatedAt  DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  @@map("admin_access_secrets")
+}
+
+// 密语验证成功后签发的短期 HttpOnly gate token，密语轮换会将其全部撤销。
+model AdminGateChallenge {
+  id            String    @id @db.Uuid
+  tokenHash     String    @unique @map("token_hash")
+  secretVersion Int       @map("secret_version")
+  ipHash        String?   @map("ip_hash")
+  expiresAt     DateTime  @db.Timestamptz(3) @map("expires_at")
+  consumedAt    DateTime? @db.Timestamptz(3) @map("consumed_at")
+  createdAt     DateTime  @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  loginChallenges AdminLoginChallenge[]
+
+  @@index([expiresAt])
+  @@map("admin_gate_challenges")
+}
+
+// 服务端生成的单次验证码；答案仅保存哈希，无论成败都只能消费一次。
+model AdminLoginChallenge {
+  id         String    @id @db.Uuid
+  gateId     String    @map("gate_id") @db.Uuid
+  answerHash String    @map("answer_hash")
+  expiresAt  DateTime  @db.Timestamptz(3) @map("expires_at")
+  consumedAt DateTime? @db.Timestamptz(3) @map("consumed_at")
+  createdAt  DateTime  @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  gate AdminGateChallenge @relation(fields: [gateId], references: [id])
+
+  @@index([gateId, expiresAt])
+  @@map("admin_login_challenges")
+}
+
+// 按场景 + IP/账号摘要持久化失败窗口，不保存原始 IP。
+model AdminAuthThrottle {
+  id              String    @id @db.Uuid
+  scope           String
+  keyHash         String    @map("key_hash")
+  failedCount     Int       @default(0) @map("failed_count")
+  windowStartedAt DateTime  @db.Timestamptz(3) @map("window_started_at")
+  blockedUntil    DateTime? @db.Timestamptz(3) @map("blocked_until")
+  updatedAt       DateTime  @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  @@unique([scope, keyHash])
+  @@index([blockedUntil])
+  @@map("admin_auth_throttles")
+}
+
+// 邀请秘密仅保存摘要；二维码与手输共用服务端校验器
+model Invitation {
+  id                String    @id @db.Uuid
+  tokenHash         String    @unique @map("token_hash")
+  batchId           String?   @map("batch_id") @db.Uuid
+  batchLabel        String?   @map("batch_label")
+  purpose           String    @default("registration")
+  status            String    @default("active") // active | exhausted | revoked | expired
+  expiresAt         DateTime @db.Timestamptz(3)  @map("expires_at")
+  maxUses           Int       @default(1) @map("max_uses")
+  usedCount         Int       @default(0) @map("used_count")
+  revokedAt         DateTime? @db.Timestamptz(3) @map("revoked_at")
+  allowedStudentNo  String?   @map("allowed_student_no") @db.VarChar(64)
+  createdBy         String    @map("created_by") @db.Uuid
+  createdAt         DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  redemptions       InvitationRedemption[]
+  registrationIntents RegistrationIntent[]
+
+  @@index([status, expiresAt])
+  @@map("invitations")
+}
+
+model InvitationRedemption {
+  id           String   @id @db.Uuid
+  invitationId String   @map("invitation_id") @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  redeemedAt   DateTime @db.Timestamptz(3) @default(now()) @map("redeemed_at")
+
+  invitation Invitation @relation(fields: [invitationId], references: [id])
+  user       User       @relation(fields: [userId], references: [id])
+
+  @@unique([invitationId, userId])
+  @@map("invitation_redemptions")
+}
+
+// 注册意图：邀请码/二维码换取的服务端短期意图，最终注册事务原子消费
+model RegistrationIntent {
+  id                String    @id @db.Uuid
+  invitationId      String?   @map("invitation_id") @db.Uuid
+  anonymousCookieHash String  @map("anonymous_cookie_hash")
+  casSubject        String?   @map("cas_subject")
+  studentNo         String?   @map("student_no") @db.VarChar(64)
+  realName          String?   @map("real_name")
+  status            String    @default("pending") // pending | cas_verified | consumed | failed | expired
+  failureReason     String?   @map("failure_reason")
+  expiresAt         DateTime @db.Timestamptz(3)  @map("expires_at")
+  consumedAt        DateTime? @db.Timestamptz(3) @map("consumed_at")
+  createdAt         DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  invitation Invitation?  @relation(fields: [invitationId], references: [id])
+
+  @@index([expiresAt])
+  @@map("registration_intents")
+}
+
+model Semester {
+  id          String   @id @db.Uuid
+  code        String   @unique // 例如 2026F
+  name        String
+  startsOn    DateTime @db.Timestamptz(3) @map("starts_on")
+  endsOn      DateTime @db.Timestamptz(3) @map("ends_on")
+  createdAt   DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  membershipTerms MembershipTerm[]
+
+  @@map("semesters")
+}
+
+model MembershipTerm {
+  id                    String    @id @db.Uuid
+  userId                String    @map("user_id") @db.Uuid
+  semesterId            String    @map("semester_id") @db.Uuid
+  membershipStatus      String    @map("membership_status") // applicant|observing|provisional|formal|honorary_retired|withdrawn|dismissed|vetoed
+  semesterRegisteredAt  DateTime? @db.Timestamptz(3) @map("semester_registered_at")
+  effectiveFrom         DateTime? @db.Timestamptz(3) @map("effective_from")
+  effectiveTo           DateTime? @db.Timestamptz(3) @map("effective_to")
+  basis                 String? // 审批依据
+  createdAt             DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  user     User     @relation(fields: [userId], references: [id])
+  semester Semester @relation(fields: [semesterId], references: [id])
+
+  @@unique([userId, semesterId])
+  @@map("membership_terms")
+}
+
+model MembershipTransition {
+  id             String   @id @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  fromStatus     String?  @map("from_status")
+  toStatus       String   @map("to_status")
+  monthsInStatus Int?     @map("months_in_status") // K
+  graceMonths    Int?     @map("grace_months") // G
+  decision       String // promote | demote | admit | withdraw | retire | dismiss | veto
+  reason         String
+  ruleVersionId  String?  @map("rule_version_id") @db.Uuid
+  effectiveFrom  DateTime @db.Timestamptz(3) @map("effective_from")
+  decidedBy      String   @map("decided_by") @db.Uuid
+  createdAt      DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("membership_transitions")
+}
+
+model RoleGrant {
+  id         String    @id @db.Uuid
+  principalId String   @map("principal_id") @db.Uuid
+  role       String // member|activity_manager|points_reviewer|presidium|advisor|system_admin
+  scopeType  String    @default("global") // global | activity | contest
+  scopeId    String?   @map("scope_id") @db.Uuid
+  grantedBy  String    @map("granted_by") @db.Uuid
+  grantedAt  DateTime @db.Timestamptz(3)  @default(now()) @map("granted_at")
+  validUntil DateTime? @db.Timestamptz(3) @map("valid_until")
+  revokedAt  DateTime? @db.Timestamptz(3) @map("revoked_at")
+
+  principal Principal @relation(fields: [principalId], references: [id])
+
+  @@index([principalId, role])
+  @@map("role_grants")
+}
+
+model Restriction {
+  id         String    @id @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  type       String // contest_ban | room_freeze | apply_freeze | discipline_hold ...
+  reason     String
+  startsAt   DateTime @db.Timestamptz(3)  @map("starts_at")
+  endsAt     DateTime? @db.Timestamptz(3) @map("ends_at")
+  decidedBy  String    @map("decided_by") @db.Uuid
+  revokedAt  DateTime? @db.Timestamptz(3) @map("revoked_at")
+  createdAt  DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, type])
+  @@map("restrictions")
+}
+
+// ===========================================================================
+// 二、活动地点与认证（venues / venue_versions / 认证证据）
+// ===========================================================================
+
+model Venue {
+  id                 String   @id @db.Uuid
+  name               String
+  campus             String?
+  building           String?
+  floor              String?
+  room               String?
+  description        String?
+  directions         String? // 到达指引
+  operationalStatus  String   @default("active") @map("operational_status") // active|suspended|archived
+  effectiveVersionId String?  @map("effective_version_id") @db.Uuid
+  revision           Int      @default(1)
+  suspendReason      String?  @map("suspend_reason")
+  createdBy          String   @map("created_by") @db.Uuid
+  createdAt          DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+  updatedAt          DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  versions        VenueVersion[]
+
+  @@index([operationalStatus])
+  @@map("venues")
+}
+
+model VenueVersion {
+  id                  String    @id @db.Uuid
+  venueId             String    @map("venue_id") @db.Uuid
+  versionNo           Int       @map("version_no")
+  status              String    @default("draft") // draft|pending_review|approved|rejected
+  name                String
+  campus              String?
+  building            String?
+  floor               String?
+  room                String?
+  description         String?
+  directions          String?
+  // WGS84 围栏：QR_ONLY 地点可无坐标（lat/lgn 同时为空）
+  latitude            Decimal?  @db.Decimal(10, 7)
+  longitude           Decimal?  @db.Decimal(10, 7)
+  radiusMeters        Decimal?  @map("radius_meters") @db.Decimal(8, 2)
+  maxAccuracyMeters   Decimal?  @map("max_accuracy_meters") @db.Decimal(8, 2)
+  coordinateSource    String?   @map("coordinate_source") // map_pick | field_sampling | manual_verified
+  allowedCapabilities String[]  @map("allowed_capabilities") // ["GEO","QR"] 子集；GEO 能力要求有效坐标与实测
+  validFrom           DateTime? @db.Timestamptz(3) @map("valid_from")
+  validUntil          DateTime? @db.Timestamptz(3) @map("valid_until")
+  revision            Int       @default(1)
+  submittedBy         String?   @map("submitted_by") @db.Uuid
+  submittedAt         DateTime? @db.Timestamptz(3) @map("submitted_at")
+  contentHash         String?   @map("content_hash") @db.VarChar(64)
+  evidenceDigest      String?   @map("evidence_digest") // 提交时冻结的证据清单摘要
+  approvedBy          String?   @map("approved_by") @db.Uuid
+  approvedAt          DateTime? @db.Timestamptz(3) @map("approved_at")
+  rejectedReason      String?   @map("rejected_reason")
+  revokedAt           DateTime? @db.Timestamptz(3) @map("revoked_at")
+  revokedReason       String?   @map("revoked_reason")
+  createdAt           DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  venue        Venue                      @relation(fields: [venueId], references: [id])
+  primaryActivities Activity[]
+  contributors VenueVersionContributor[]
+  samples      VenueVerificationSample[]
+  reviewEvents VenueReviewEvent[]
+  activityBindings ActivityVenueBinding[]
+  qrWindows    AttendanceQrWindow[]
+  checkpoints  AttendanceCheckpoint[]
+
+  @@unique([venueId, versionNo])
+  @@index([status])
+  @@map("venue_versions")
+}
+
+// 本版本创建/实际编辑/提交主体，构成完整审核回避集合
+model VenueVersionContributor {
+  id          String   @id @db.Uuid
+  versionId   String   @map("version_id") @db.Uuid
+  principalId String   @map("principal_id") @db.Uuid
+  role        String // creator | editor | submitter
+  firstAt     DateTime @db.Timestamptz(3) @default(now()) @map("first_at")
+  lastAt      DateTime @db.Timestamptz(3) @default(now()) @map("last_at")
+
+  version VenueVersion @relation(fields: [versionId], references: [id])
+
+  @@unique([versionId, principalId])
+  @@map("venue_version_contributors")
+}
+
+// 现场定位样本：仅 draft 可追加；提交后冻结
+model VenueVerificationSample {
+  id            String   @id @db.Uuid
+  versionId     String   @map("version_id") @db.Uuid
+  source        String // browser_geolocation | manual_note | device_check
+  sampledAt     DateTime @db.Timestamptz(3) @map("sampled_at")
+  receivedAt    DateTime @db.Timestamptz(3) @default(now()) @map("received_at")
+  latitude      Decimal? @db.Decimal(10, 7)
+  longitude     Decimal? @db.Decimal(10, 7)
+  accuracyMeters Decimal? @map("accuracy_meters") @db.Decimal(8, 2)
+  deviceType    String?  @map("device_type")
+  note          String?
+  contentHash   String?  @map("content_hash") @db.VarChar(64)
+  retention     String   @default("active") // active | purged | preserved
+
+  version VenueVersion @relation(fields: [versionId], references: [id])
+
+  @@index([versionId])
+  @@map("venue_verification_samples")
+}
+
+model VenueReviewEvent {
+  id          String   @id @db.Uuid
+  versionId   String   @map("version_id") @db.Uuid
+  principalId String   @map("principal_id") @db.Uuid
+  action      String // submit | approve | reject | revoke
+  reason      String
+  evidenceRef String?  @map("evidence_ref")
+  contentHash String?  @map("content_hash") @db.VarChar(64)
+  createdAt   DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  version VenueVersion @relation(fields: [versionId], references: [id])
+
+  @@index([versionId])
+  @@map("venue_review_events")
+}
+
+// ===========================================================================
+// 三、活动、报名与参与
+// ===========================================================================
+
+model Activity {
+  id               String    @id @db.Uuid
+  type             String // weekly_contest | monthly_contest | custom_contest | lecture | training | meeting | gathering | camp | service
+  sourceType       String    @default("custom") @map("source_type") // platform | hydro | custom
+  platform         String? // nowcoder | codeforces | atcoder | hydro | custom
+  platformContestId String?  @map("platform_contest_id")
+  hydroInstanceId  String?   @map("hydro_instance_id") @db.Uuid
+  title            String
+  announcement     String    @db.Text
+  joinNotes        String?   @map("join_notes")
+  startAt          DateTime @db.Timestamptz(3)  @map("start_at")
+  endAt            DateTime @db.Timestamptz(3)  @map("end_at")
+  registerStartAt  DateTime? @db.Timestamptz(3) @map("register_start_at")
+  registerDeadline DateTime? @db.Timestamptz(3) @map("register_deadline")
+  cancelDeadline   DateTime? @db.Timestamptz(3) @map("cancel_deadline")
+  capacity         Int? // null = 不限
+  waitlistCapacity Int?     @map("waitlist_capacity")
+  approvalRequired Boolean  @default(false) @map("approval_required")
+  waitlistConfirmHours Int? @map("waitlist_confirm_hours")
+  remoteAllowed    Boolean  @default(false) @map("remote_allowed")
+  remotePolicy     String?  @map("remote_policy")
+  leaveDeadline    DateTime? @db.Timestamptz(3) @map("leave_deadline")
+  requireValidSubmission Boolean @default(false) @map("require_valid_submission")
+  ruleVersionId    String?   @map("rule_version_id") @db.Uuid
+  ruleVersion      RuleVersion? @relation(fields: [ruleVersionId], references: [id])
+  venueVersion     VenueVersion? @relation(fields: [venueVersionId], references: [id])
+  scoringConfig    Json?     @map("scoring_config") // B/λ/上限等发布时快照
+  contestMeta      Json?     @map("contest_meta") // 赛制、题数、理论满分、成绩来源
+  venueVersionId   String?   @map("venue_version_id") @db.Uuid // 可选主显示地点
+  policyVersion    Int       @default(1) @map("policy_version")
+  status           String    @default("draft") // draft | published | cancelled | archived
+  publishedAt      DateTime? @db.Timestamptz(3) @map("published_at")
+  createdBy        String    @map("created_by") @db.Uuid
+  revision         Int       @default(1)
+  createdAt        DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+  updatedAt        DateTime @db.Timestamptz(3)  @default(now()) @updatedAt @map("updated_at")
+
+  registrations   ActivityRegistration[]
+  participants    ActivityParticipant[]
+  venueBindings   ActivityVenueBinding[]
+  policy          AttendancePolicy?
+  qrWindows       AttendanceQrWindow[]
+  challenges      AttendanceChallenge[]
+  attempts        AttendanceAttempt[]
+  checkpoints     AttendanceCheckpoint[]
+  results         AttendanceAttendanceResult[]
+  leaveRequests   LeaveRequest[]
+  remotePermissions RemotePermission[]
+  incidents       IncidentReport[]
+
+  @@index([status, startAt])
+  @@index([platform, platformContestId])
+  @@map("activities")
+}
+
+model ActivityVenueBinding {
+  activityId     String @map("activity_id") @db.Uuid
+  venueVersionId String @map("venue_version_id") @db.Uuid
+  fenceSnapshot  Json?  @map("fence_snapshot") // 发布时固定围栏快照
+  boundAt        DateTime @db.Timestamptz(3) @default(now()) @map("bound_at")
+
+  activity     Activity     @relation(fields: [activityId], references: [id])
+  venueVersion VenueVersion @relation(fields: [venueVersionId], references: [id])
+
+  @@unique([activityId, venueVersionId])
+  @@map("activity_venue_bindings")
+}
+
+model AttendancePolicy {
+  id                String  @id @db.Uuid
+  activityId        String  @unique @map("activity_id") @db.Uuid
+  policy            String // GEO_ONLY | QR_ONLY | GEO_OR_QR | GEO_AND_QR
+  checkinOpenAt     DateTime @db.Timestamptz(3) @map("checkin_open_at")
+  checkinCloseAt    DateTime @db.Timestamptz(3) @map("checkin_close_at")
+  checkoutOpenAt    DateTime? @db.Timestamptz(3) @map("checkout_open_at")
+  checkoutCloseAt   DateTime? @db.Timestamptz(3) @map("checkout_close_at")
+  maxAccuracyMeters Decimal @default(50) @map("max_accuracy_meters") @db.Decimal(8, 2)
+  qrRotateSeconds   Int     @default(25) @map("qr_rotate_seconds")
+  qrTtlSeconds      Int     @default(60) @map("qr_ttl_seconds")
+  selfCheckout      Boolean @default(true) @map("self_checkout") // false = 工作人员点验
+  version           Int     @default(1)
+  revision          Int     @default(1)
+
+  activity Activity @relation(fields: [activityId], references: [id])
+
+  @@map("attendance_policies")
+}
+
+model ActivityRegistration {
+  id               String    @id @db.Uuid
+  activityId       String    @map("activity_id") @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  status           String // enrolled | waitlisted | pending_approval | cancelled | rejected
+  acceptedAt       DateTime? @db.Timestamptz(3) @map("accepted_at")
+  waitlistSeq      Int?      @map("waitlist_seq")
+  confirmDeadline  DateTime? @db.Timestamptz(3) @map("confirm_deadline")
+  cancelledAt      DateTime? @db.Timestamptz(3) @map("cancelled_at")
+  cancelReason     String?   @map("cancel_reason")
+  idempotencyKey   String?   @map("idempotency_key")
+  revision         Int       @default(1)
+  createdAt        DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+  updatedAt        DateTime @db.Timestamptz(3)  @default(now()) @updatedAt @map("updated_at")
+
+  activity Activity             @relation(fields: [activityId], references: [id])
+  user     User                 @relation(fields: [userId], references: [id])
+  history  RegistrationHistory[]
+
+  @@unique([activityId, userId])
+  @@index([userId])
+  @@map("activity_registrations")
+}
+
+model RegistrationHistory {
+  id             String   @id @db.Uuid
+  registrationId String   @map("registration_id") @db.Uuid
+  fromStatus     String?  @map("from_status")
+  toStatus       String   @map("to_status")
+  actorPrincipalId String? @map("actor_principal_id") @db.Uuid
+  note           String?
+  createdAt      DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  registration ActivityRegistration @relation(fields: [registrationId], references: [id])
+
+  @@index([registrationId])
+  @@map("registration_history")
+}
+
+// 必须参加名单：独立于自愿报名
+model ActivityParticipant {
+  id              String   @id @db.Uuid
+  activityId      String   @map("activity_id") @db.Uuid
+  userId          String   @map("user_id") @db.Uuid
+  required        Boolean  @default(false)
+  participationMode String @default("onsite") @map("participation_mode") // onsite | remote_approved
+  eligibilityNote String?  @map("eligibility_note")
+  frozenAt        DateTime? @db.Timestamptz(3) @map("frozen_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+
+  @@unique([activityId, userId])
+  @@map("activity_participants")
+}
+
+model LeaveRequest {
+  id            String    @id @db.Uuid
+  activityId    String    @map("activity_id") @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  reason        String
+  status        String    @default("pending") // pending | approved | rejected
+  evidenceAssetId String? @map("evidence_asset_id") @db.Uuid
+  reviewedBy    String?   @map("reviewed_by") @db.Uuid
+  reviewedAt    DateTime? @db.Timestamptz(3) @map("reviewed_at")
+  reviewNote    String?   @map("review_note")
+  createdAt     DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@unique([activityId, userId])
+  @@map("leave_requests")
+}
+
+model RemotePermission {
+  id          String    @id @db.Uuid
+  activityId  String    @map("activity_id") @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  status      String    @default("pending")
+  reason      String
+  approvedBy  String?   @map("approved_by") @db.Uuid
+  approvedAt  DateTime? @db.Timestamptz(3) @map("approved_at")
+  monthKey    String    @map("month_key") @db.VarChar(7)
+  createdAt   DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@unique([activityId, userId])
+  @@map("remote_permissions")
+}
+
+model IncidentReport {
+  id          String   @id @db.Uuid
+  activityId  String   @map("activity_id") @db.Uuid
+  scope       String // device_fault | network | platform | other
+  description String
+  startedAt   DateTime @db.Timestamptz(3) @map("started_at")
+  endedAt     DateTime? @db.Timestamptz(3) @map("ended_at")
+  affectedUserIds String[] @map("affected_user_ids")
+  createdBy   String   @map("created_by") @db.Uuid
+  createdAt   DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+
+  @@map("incident_reports")
+}
+
+// ===========================================================================
+// 四、出勤：动态二维码、个人挑战、检查点与结果
+// ===========================================================================
+
+// 共享现场码：不全局消费，多人可用；nonce 只保存摘要
+model AttendanceQrWindow {
+  id             String    @id @db.Uuid
+  activityId     String    @map("activity_id") @db.Uuid
+  venueVersionId String    @map("venue_version_id") @db.Uuid
+  checkpoint     String // IN | OUT
+  nonceHash      String    @unique @map("nonce_hash")
+  issuedAt       DateTime @db.Timestamptz(3)  @default(now()) @map("issued_at")
+  expiresAt      DateTime @db.Timestamptz(3)  @map("expires_at")
+  revokedAt      DateTime? @db.Timestamptz(3) @map("revoked_at")
+  policyVersion  Int       @map("policy_version")
+
+  activity     Activity     @relation(fields: [activityId], references: [id])
+  venueVersion VenueVersion @relation(fields: [venueVersionId], references: [id])
+
+  @@index([activityId, checkpoint])
+  @@map("attendance_qr_windows")
+}
+
+// 个人 challenge：绑定用户、活动、检查点与策略版本
+model AttendanceChallenge {
+  id            String    @id @db.Uuid
+  activityId    String    @map("activity_id") @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  checkpoint    String
+  policyVersion Int       @map("policy_version")
+  nonceHash     String    @map("nonce_hash")
+  expiresAt     DateTime @db.Timestamptz(3)  @map("expires_at")
+  consumedAt    DateTime? @db.Timestamptz(3) @map("consumed_at")
+  createdAt     DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+
+  @@unique([nonceHash])
+  @@index([activityId, userId])
+  @@map("attendance_challenges")
+}
+
+model AttendanceAttempt {
+  id             String   @id @db.Uuid
+  activityId     String   @map("activity_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  checkpoint     String
+  method         String // GEO | QR
+  result         String // accepted | pending_review | rejected | already_recorded
+  failureCode    String? @map("failure_code")
+  serverTime     DateTime @db.Timestamptz(3) @default(now()) @map("server_time")
+  policyVersion  Int      @map("policy_version")
+  qrWindowId     String?  @map("qr_window_id") @db.Uuid
+  challengeId    String?  @map("challenge_id") @db.Uuid
+  // 定位证据密文（受限访问，短期保留）；QR 方式为空
+  geoEvidenceEnc String?  @map("geo_evidence_enc")
+  idempotencyKey String?  @map("idempotency_key")
+  createdAt      DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+
+  @@unique([userId, idempotencyKey])
+  @@index([activityId, checkpoint])
+  @@map("attendance_attempts")
+}
+
+model AttendanceCheckpoint {
+  id             String   @id @db.Uuid
+  activityId     String   @map("activity_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  checkpoint     String // IN | OUT
+  method         String
+  acceptedAt     DateTime @db.Timestamptz(3) @map("accepted_at")
+  venueVersionId String?  @map("venue_version_id") @db.Uuid
+  attemptId      String?  @map("attempt_id") @db.Uuid
+  revision       Int      @default(1)
+
+  activity     Activity     @relation(fields: [activityId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+  venueVersion VenueVersion? @relation(fields: [venueVersionId], references: [id])
+
+  @@unique([activityId, userId, checkpoint])
+  @@map("attendance_checkpoints")
+}
+
+model AttendanceAttendanceResult {
+  id             String   @id @db.Uuid
+  activityId     String   @map("activity_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  status         String // pending | ontime | late | early_leave | late_and_early | absent | leave_approved | remote_approved | pending_review
+  lateMinutes    Int      @default(0) @map("late_minutes")
+  earlyMinutes   Int      @default(0) @map("early_minutes")
+  reviewStatus   String   @default("pending") // pending | confirmed | corrected
+  reviewNote     String?  @map("review_note")
+  incidentRef    String?  @map("incident_ref")
+  revision       Int      @default(1)
+  decidedBy      String?  @map("decided_by") @db.Uuid
+  updatedAt      DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+  corrections AttendanceCorrection[]
+
+  @@unique([activityId, userId])
+  @@map("attendance_results")
+}
+
+model AttendanceCorrection {
+  id            String   @id @db.Uuid
+  resultId      String   @map("result_id") @db.Uuid
+  originalValue Json     @map("original_value")
+  correctedValue Json    @map("corrected_value")
+  reason        String
+  evidenceRef   String?  @map("evidence_ref")
+  operatorId    String   @map("operator_id") @db.Uuid
+  approvedBy    String?  @map("approved_by") @db.Uuid
+  createdAt     DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  result AttendanceAttendanceResult @relation(fields: [resultId], references: [id])
+
+  @@map("attendance_corrections")
+}
+
+// ===========================================================================
+// 五、平台账号、比赛与证据
+// ===========================================================================
+
+model PlatformAccount {
+  id                  String    @id @db.Uuid
+  platform            String // nowcoder | codeforces | atcoder
+  externalId          String    @map("external_id") // 规范化 UID/handle
+  displayHandle       String?   @map("display_handle")
+  userId              String    @map("user_id") @db.Uuid
+  status              String    @default("unverified") // unverified|pending_review|verified|revoked
+  proofSummary        String?   @map("proof_summary")
+  verifiedBy          String?   @map("verified_by") @db.Uuid
+  verifiedAt          DateTime? @db.Timestamptz(3) @map("verified_at")
+  validFrom           DateTime @db.Timestamptz(3)  @default(now()) @map("valid_from")
+  validUntil          DateTime? @db.Timestamptz(3) @map("valid_until")
+  lastSyncAt          DateTime? @db.Timestamptz(3) @map("last_sync_at")
+  lastSyncStatus      String?   @map("last_sync_status") // ok | failed | truncated
+  lastSyncError       String?   @map("last_sync_error")
+  createdAt           DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  user     User              @relation(fields: [userId], references: [id])
+  results  PlatformResult[]
+  ratings  PlatformRatingPoint[]
+
+  // 活跃绑定对 (platform, canonical external_id) 唯一 —— 迁移中建立部分唯一索引
+  @@index([platform, externalId])
+  @@map("platform_accounts")
+}
+
+model PlatformContest {
+  id                String   @id @db.Uuid
+  platform          String // nowcoder | codeforces | atcoder | hydro
+  externalContestId String   @map("external_contest_id")
+  name              String
+  startTime         DateTime @db.Timestamptz(3) @map("start_time")
+  endTime           DateTime? @db.Timestamptz(3) @map("end_time")
+  durationSeconds   Int?     @map("duration_seconds")
+  rule              String? // 赛制（ACM/OI/分数制等原始描述）
+  problemCount      Int?     @map("problem_count")
+  fullScore         Decimal? @map("full_score") @db.Decimal(12, 2)
+  rated             Boolean?
+  factsVersion      Int      @default(1) @map("facts_version")
+  sourceUrl         String?  @map("source_url")
+  lastSyncedAt      DateTime? @db.Timestamptz(3) @map("last_synced_at")
+  syncStatus        String?  @map("sync_status") // ok | failed | truncated | pending
+  createdAt         DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  results PlatformResult[]
+
+  @@unique([platform, externalContestId])
+  @@map("platform_contests")
+}
+
+model PlatformResult {
+  id                String    @id @db.Uuid
+  platformContestId String    @map("platform_contest_id") @db.Uuid
+  platformAccountId String    @map("platform_account_id") @db.Uuid
+  participationType String    @default("OFFICIAL") @map("participation_type") // OFFICIAL | VIRTUAL | PRACTICE | OUT_OF_COMPETITION | TEAM
+  score             Decimal?  @db.Decimal(14, 4)
+  fullScore         Decimal?  @map("full_score") @db.Decimal(14, 4)
+  acceptedCount     Int?      @map("accepted_count")
+  problemCount      Int?      @map("problem_count")
+  rank              Int?
+  rankTotal         Int?      @map("rank_total")
+  signUpCount       Int?      @map("sign_up_count")
+  rating            Decimal?  @db.Decimal(10, 2)
+  ratingChange      Decimal?  @map("rating_change") @db.Decimal(10, 2)
+  ratingStatus      String?   @map("rating_status")
+  canShowRank       Boolean?  @map("can_show_rank")
+  status            String    @default("provisional") // provisional | complete | pending_review | rejected
+  sourceSnapshotId  String?   @map("source_snapshot_id") @db.Uuid
+  factsVersion      Int       @default(1) @map("facts_version")
+  syncedAt          DateTime @db.Timestamptz(3)  @default(now()) @map("synced_at")
+
+  platformContest PlatformContest   @relation(fields: [platformContestId], references: [id])
+  platformAccount PlatformAccount   @relation(fields: [platformAccountId], references: [id])
+
+  @@unique([platformContestId, platformAccountId, participationType])
+  @@map("platform_results")
+}
+
+model SourceSnapshot {
+  id             String   @id @db.Uuid
+  platform       String
+  sourceUrl      String   @map("source_url")
+  fetchedAt      DateTime @db.Timestamptz(3) @default(now()) @map("fetched_at")
+  adapterVersion String   @map("adapter_version")
+  contentType    String   @map("content_type")
+  contentHash    String   @map("content_hash") @db.VarChar(64)
+  storageRef     String?  @map("storage_ref")
+  status         String   @default("ok")
+  byteSize       Int?     @map("byte_size")
+
+  @@index([platform, fetchedAt])
+  @@map("source_snapshots")
+}
+
+// 出站域名共享限流（所有 Worker 实例共享）
+model OutboundRateLimit {
+  host           String   @id
+  nextAllowedAt  DateTime @db.Timestamptz(3) @map("next_allowed_at")
+
+  @@map("outbound_rate_limits")
+}
+
+// ===========================================================================
+// 六、Hydro 集成
+// ===========================================================================
+
+model IntegrationInstance {
+  id             String   @id @db.Uuid
+  kind           String   @default("hydro")
+  instanceId     String   @unique @map("instance_id") @db.Uuid
+  displayName    String   @map("display_name")
+  baseUrl        String   @map("base_url")
+  allowedDomains String[] @map("allowed_domains")
+  adapterVersion String   @map("adapter_version")
+  enabled        Boolean  @default(false)
+  status         String   @default("registered") // registered | connected | error | disabled
+  config         Json?
+  secretRef      String?  @map("secret_ref")
+  lastCheckedAt  DateTime? @db.Timestamptz(3) @map("last_checked_at")
+  createdAt      DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  identityLinks HydroIdentityLink[]
+  eventReceipts HydroEventReceipt[]
+  ratingPoints  PlatformRatingPoint[]
+
+  @@map("integration_instances")
+}
+
+// CAS 学号 ↔ Hydro uid 的已审核映射
+model HydroIdentityLink {
+  id             String    @id @db.Uuid
+  instanceId     String    @map("instance_id") @db.Uuid
+  hydroUid       Int       @map("hydro_uid")
+  hydroUname     String?   @map("hydro_uname")
+  userId         String    @map("user_id") @db.Uuid
+  verifiedStudentNo String @map("verified_student_no") @db.VarChar(64)
+  proofType      String    @map("proof_type")
+  reviewedBy     String    @map("reviewed_by") @db.Uuid
+  validFrom      DateTime @db.Timestamptz(3)  @default(now()) @map("valid_from")
+  validUntil     DateTime? @db.Timestamptz(3) @map("valid_until")
+  revokedAt      DateTime? @db.Timestamptz(3) @map("revoked_at")
+  createdAt      DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  instance IntegrationInstance @relation(fields: [instanceId], references: [id])
+
+  @@unique([instanceId, hydroUid])
+  @@map("hydro_identity_links")
+}
+
+model HydroEventReceipt {
+  id          String   @id @db.Uuid
+  instanceId  String   @map("instance_id") @db.Uuid
+  eventId     String   @unique @map("event_id") @db.Uuid
+  bodyHash    String   @map("body_hash") @db.VarChar(64)
+  payload     Json
+  status      String   @default("received") // received | processed | conflict
+  receivedAt  DateTime @db.Timestamptz(3) @default(now()) @map("received_at")
+  processedAt DateTime? @db.Timestamptz(3) @map("processed_at")
+
+  instance IntegrationInstance @relation(fields: [instanceId], references: [id])
+
+  @@map("hydro_event_receipts")
+}
+
+model HydroNonce {
+  id         String   @id @db.Uuid
+  instanceId String   @map("instance_id") @db.Uuid
+  keyId      String   @map("key_id")
+  nonce      String
+  expiresAt  DateTime @db.Timestamptz(3) @map("expires_at")
+  createdAt  DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  @@unique([instanceId, keyId, nonce])
+  @@index([expiresAt])
+  @@map("hydro_nonces")
+}
+
+// ===========================================================================
+// 七、任务队列与 Outbox
+// ===========================================================================
+
+model Job {
+  id           String    @id @db.Uuid
+  type         String
+  payload      Json
+  dedupeKey    String?   @map("dedupe_key")
+  status       String    @default("queued") // queued | running | done | failed | dead
+  priority     Int       @default(5)
+  runAfter     DateTime @db.Timestamptz(3)  @default(now()) @map("run_after")
+  attempts     Int       @default(0)
+  maxAttempts  Int       @default(8) @map("max_attempts")
+  lockedBy     String?   @map("locked_by")
+  leaseToken   String?   @map("lease_token") @db.Uuid
+  leaseUntil   DateTime? @db.Timestamptz(3) @map("lease_until")
+  lastError    String?   @map("last_error") @db.Text
+  result       Json?
+  createdAt    DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+  updatedAt    DateTime @db.Timestamptz(3)  @default(now()) @updatedAt @map("updated_at")
+
+  @@index([status, runAfter, priority])
+  @@map("jobs")
+}
+
+model OutboxEvent {
+  id           String    @id @db.Uuid
+  aggregateType String   @map("aggregate_type")
+  aggregateId  String    @map("aggregate_id")
+  type         String
+  payload      Json
+  publishedAt  DateTime? @db.Timestamptz(3) @map("published_at")
+  attempts     Int       @default(0) @map("attempts")
+  lastError    String?   @map("last_error")
+  createdAt    DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  @@index([publishedAt, createdAt])
+  @@map("outbox_events")
+}
+
+// ===========================================================================
+// 八、积分规则、账本、公示与审核
+// ===========================================================================
+
+model RuleVersion {
+  id            String    @id @db.Uuid
+  version       Int       @unique
+  source        String // 制度依据说明
+  params        Json // λ/B/X/上限/扣分/权重等全部参数快照
+  pendingItems  Json?     @map("pending_items") // R01-R13 未决口径标记
+  status        String    @default("draft") // draft | approved | published
+  publicizedAt  DateTime? @db.Timestamptz(3) @map("publicized_at")
+  effectiveFrom DateTime @db.Timestamptz(3)  @map("effective_from")
+  approvedBy    String?   @map("approved_by") @db.Uuid
+  createdAt     DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  activities  Activity[]
+  disclosures Disclosure[]
+  freezes     RankingFreeze[]
+  batches     CalculationBatch[]
+
+  @@map("rule_versions")
+}
+
+model CalculationBatch {
+  id            String   @id @db.Uuid
+  monthKey      String   @map("month_key") @db.VarChar(7)
+  ruleVersionId String?  @map("rule_version_id") @db.Uuid
+  status        String   @default("preview") // preview | approved | rejected
+  summary       Json?
+  createdBy     String   @map("created_by") @db.Uuid
+  createdAt     DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  ruleVersion RuleVersion? @relation(fields: [ruleVersionId], references: [id])
+
+  @@map("calculation_batches")
+}
+
+model PointsLedgerEntry {
+  id             String    @id @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  sourceKey      String    @map("source_key") // 稳定逻辑键：赛事/活动/贡献来源，不含活动ID与地点
+  category       String // contest | remote_contest | activity | contribution | service | award | initial | penalty | reversal
+  amount         Decimal   @db.Decimal(20, 10) // 精确原分，负号保留
+  scoreMonth     String    @map("score_month") @db.VarChar(7)
+  recordedAt     DateTime @db.Timestamptz(3)  @map("recorded_at")
+  status         String    @default("approved") // approved | reversed | superseded
+  batchId        String?   @map("batch_id") @db.Uuid
+  ruleVersionId  String?   @map("rule_version_id") @db.Uuid
+  detail         Json? // 计算过程、组件、上限调整
+  evidenceRef    String?   @map("evidence_ref")
+  approvedBy     String?   @map("approved_by") @db.Uuid
+  reversesEntryId String?  @map("reverses_entry_id") @db.Uuid
+  replacedByEntryId String? @map("replaced_by_entry_id") @db.Uuid
+  reversalReason String?   @map("reversal_reason")
+  idempotencyKey String?   @map("idempotency_key")
+  createdAt      DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  user User                @relation(fields: [userId], references: [id])
+  reverses PointsLedgerEntry?  @relation("reversal", fields: [reversesEntryId], references: [id])
+  replacedBy PointsLedgerEntry? @relation("replacement", fields: [replacedByEntryId], references: [id])
+  reversesEntries PointsLedgerEntry[] @relation("reversal")
+  replacedByEntries PointsLedgerEntry[] @relation("replacement")
+
+  @@unique([idempotencyKey])
+  @@index([userId, scoreMonth])
+  @@index([sourceKey])
+  @@map("points_ledger")
+}
+
+model MonthlyScore {
+  id           String   @id @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  scoreMonth   String   @map("score_month") @db.VarChar(7)
+  rawTotal     Decimal  @map("raw_total") @db.Decimal(20, 10) // 取整前
+  m            Int? // 依确认的取整策略；未确认时为 null
+  roundingPolicy String? @map("rounding_policy")
+  categoryCaps Json?    @map("category_caps")
+  revision     Int      @default(1)
+  batchId      String?  @map("batch_id") @db.Uuid
+  status       String   @default("draft") // draft | published
+  createdAt    DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, scoreMonth, revision])
+  @@map("monthly_scores")
+}
+
+model EffectiveScoreSnapshot {
+  id               String   @id @db.Uuid
+  userId           String   @map("user_id") @db.Uuid
+  monthKey         String   @map("month_key") @db.VarChar(7)
+  e                Decimal  @db.Decimal(20, 4) // 一位小数展示，快照保留四位
+  components       Json // 近六个月 M 与权重
+  lowActivity      Boolean  @default(false) @map("low_activity")
+  inactiveMonths   Int      @default(0) @map("inactive_months")
+  qualification    String   @default("ranked") // ranked | not_ranked_reason
+  revision         Int      @default(1)
+  computedAt       DateTime @db.Timestamptz(3) @default(now()) @map("computed_at")
+
+  @@unique([userId, monthKey, revision])
+  @@index([monthKey, revision])
+  @@map("effective_score_snapshots")
+}
+
+model PointsClaim {
+  id           String   @id @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  category     String // contribution_lecture | solution | problem_setting | sharing | service | award
+  subType      String?  @map("sub_type")
+  activityId   String?  @map("activity_id") @db.Uuid
+  contestKey   String?  @map("contest_key")
+  title        String
+  description  String
+  evidenceAssetId String? @map("evidence_asset_id") @db.Uuid
+  scoreMonth   String   @map("score_month") @db.VarChar(7)
+  status       String   @default("pending") // pending | approved | rejected | more_info
+  reviewNote   String?  @map("review_note")
+  reviewedBy   String?  @map("reviewed_by") @db.Uuid
+  reviewedAt   DateTime? @db.Timestamptz(3) @map("reviewed_at")
+  createdAt    DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([status])
+  @@map("points_claims")
+}
+
+model ReviewCase {
+  id           String   @id @db.Uuid
+  type         String // membership | points | attendance | disclosure | settings | appeal | venue
+  subjectType  String   @map("subject_type")
+  subjectId    String   @map("subject_id") @db.Uuid
+  targetUserId String?  @map("target_user_id") @db.Uuid
+  payload      Json?
+  status       String   @default("open") // open | pending_teacher | resolved | rejected
+  teacherRequired Boolean @default(false) @map("teacher_required")
+  createdBy    String   @map("created_by") @db.Uuid
+  createdAt    DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+  closedAt     DateTime? @db.Timestamptz(3) @map("closed_at")
+
+  votes ReviewVote[]
+
+  @@index([type, status])
+  @@map("review_cases")
+}
+
+model ReviewVote {
+  id          String   @id @db.Uuid
+  caseId      String   @map("case_id") @db.Uuid
+  reviewerId  String   @map("reviewer_id") @db.Uuid // principal
+  verdict     String // approve | reject | more_info
+  reason      String
+  recused     Boolean  @default(false)
+  createdAt   DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  reviewCase ReviewCase @relation(fields: [caseId], references: [id])
+
+  @@unique([caseId, reviewerId])
+  @@map("review_votes")
+}
+
+model Appeal {
+  id                 String   @id @db.Uuid
+  userId             String   @map("user_id") @db.Uuid
+  disclosureId       String?  @map("disclosure_id") @db.Uuid
+  ledgerEntryId      String?  @map("ledger_entry_id") @db.Uuid
+  subject            String
+  materials          String?  @db.Text
+  status             String   @default("submitted") // submitted | in_review | resolved | rejected
+  resolutionNote     String?  @map("resolution_note")
+  reviewCaseId       String?  @map("review_case_id") @db.Uuid
+  createdAt          DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+  closedAt           DateTime? @db.Timestamptz(3) @map("closed_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([status])
+  @@map("appeals")
+}
+
+model Disclosure {
+  id            String    @id @db.Uuid
+  type          String // monthly | contest
+  monthKey      String?   @map("month_key") @db.VarChar(7)
+  scope         String // all_members | formal | contest
+  status        String    @default("draft") // draft | published | closed | superseded
+  startsAt      DateTime? @db.Timestamptz(3) @map("starts_at")
+  endsAt        DateTime? @db.Timestamptz(3) @map("ends_at")
+  ruleVersionId String?   @map("rule_version_id") @db.Uuid
+  revision      Int       @default(1)
+  publishedBy   String?   @map("published_by") @db.Uuid
+  publishedAt   DateTime? @db.Timestamptz(3) @map("published_at")
+
+  ruleVersion RuleVersion?      @relation(fields: [ruleVersionId], references: [id])
+  rows        DisclosureRow[]
+
+  @@map("disclosures")
+}
+
+model DisclosureRow {
+  id           String  @id @db.Uuid
+  disclosureId String  @map("disclosure_id") @db.Uuid
+  userId       String  @map("user_id") @db.Uuid
+  rank         Int
+  displayName  String  @map("display_name")
+  studentNo    String  @map("student_no") @db.VarChar(64)
+  grade        Int?
+  membership   String
+  lastMonthE   Decimal @map("last_month_e") @db.Decimal(20, 4)
+  monthAdded   Decimal @map("month_added") @db.Decimal(20, 4)
+  deductions   Decimal @default(0) @db.Decimal(20, 4)
+  currentE     Decimal @map("current_e") @db.Decimal(20, 4)
+
+  disclosure Disclosure @relation(fields: [disclosureId], references: [id])
+
+  @@unique([disclosureId, userId])
+  @@map("disclosure_rows")
+}
+
+model RankingFreeze {
+  id            String    @id @db.Uuid
+  contestKey    String    @map("contest_key")
+  title         String
+  freezeAt      DateTime @db.Timestamptz(3)  @map("freeze_at")
+  ruleVersionId String    @map("rule_version_id") @db.Uuid
+  status        String    @default("scheduled") // scheduled | frozen | cancelled
+  scopeNote     String?   @map("scope_note")
+  createdAt     DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  ruleVersion RuleVersion        @relation(fields: [ruleVersionId], references: [id])
+  rows        FrozenRankingRow[]
+
+  @@map("ranking_freezes")
+}
+
+model FrozenRankingRow {
+  id         String  @id @db.Uuid
+  freezeId   String  @map("freeze_id") @db.Uuid
+  userId     String  @map("user_id") @db.Uuid
+  position   Int
+  eSnapshot  Decimal @map("e_snapshot") @db.Decimal(20, 4)
+  qScore     Decimal? @map("q_score") @db.Decimal(20, 4)
+  eligible   Boolean @default(true)
+
+  freeze RankingFreeze @relation(fields: [freezeId], references: [id])
+
+  @@unique([freezeId, userId])
+  @@map("frozen_ranking_rows")
+}
+
+// ===========================================================================
+// 九、正式赛报名与组队
+// ===========================================================================
+
+model CompetitionRegistration {
+  id            String    @id @db.Uuid
+  contestKey    String    @map("contest_key")
+  title         String
+  userId        String    @map("user_id") @db.Uuid
+  status        String    @default("submitted") // submitted | shortlisted | confirmed | declined | waitlisted
+  freezeId      String?   @map("freeze_id") @db.Uuid
+  note          String?
+  registeredAt  DateTime @db.Timestamptz(3)  @default(now()) @map("registered_at")
+  confirmedAt   DateTime? @db.Timestamptz(3) @map("confirmed_at")
+
+  @@unique([contestKey, userId])
+  @@map("competition_registrations")
+}
+
+model Team {
+  id         String   @id @db.Uuid
+  contestKey String   @map("contest_key")
+  name       String
+  createdAt  DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  members TeamMember[]
+
+  @@unique([contestKey, name])
+  @@map("teams")
+}
+
+model TeamMember {
+  id     String @id @db.Uuid
+  teamId String @map("team_id") @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  role   String @default("member") // member | captain
+
+  team Team @relation(fields: [teamId], references: [id])
+
+  @@unique([teamId, userId])
+  @@map("team_members")
+}
+
+// ===========================================================================
+// 十、训练室预约
+// ===========================================================================
+
+model RoomBooking {
+  id                String    @id @db.Uuid
+  venueId           String?   @map("venue_id") @db.Uuid
+  startsAt          DateTime @db.Timestamptz(3)  @map("starts_at")
+  endsAt            DateTime @db.Timestamptz(3)  @map("ends_at")
+  purpose           String
+  contestLink       String?   @map("contest_link")
+  applicantUserId   String    @map("applicant_user_id") @db.Uuid
+  coApplicantUserIds String[] @map("co_applicant_user_ids")
+  headcount         Int       @default(3)
+  status            String    @default("pending") // pending | approved | rejected | cancelled
+  approvedBy        String?   @map("approved_by") @db.Uuid
+  approvedAt        DateTime? @db.Timestamptz(3) @map("approved_at")
+  rejectionReason   String?   @map("rejection_reason")
+  createdAt         DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  @@index([startsAt, endsAt])
+  @@map("room_bookings")
+}
+
+// ===========================================================================
+// 十一、个人主页、徽标与媒体
+// ===========================================================================
+
+model UserProfile {
+  userId              String  @id @map("user_id") @db.Uuid
+  displayName         String? @map("display_name")
+  bio                 String? @db.Text
+  avatarAssetId       String? @map("avatar_asset_id") @db.Uuid
+  visibility          String  @default("internal") // internal | self_only | public_opt_in
+  themePreference     String  @default("light") @map("theme_preference")
+  displayPreferences  Json?   @map("display_preferences")
+  revision            Int     @default(1)
+  updatedAt           DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("user_profiles")
+}
+
+model ProfileFeaturedBadge {
+  userId  String @map("user_id") @db.Uuid
+  slot    Int
+  awardId String @map("award_id") @db.Uuid
+
+  user  User        @relation(fields: [userId], references: [id])
+  award BadgeAward  @relation(fields: [awardId], references: [id])
+
+  @@unique([userId, slot])
+  @@unique([awardId])
+  @@map("profile_featured_badges")
+}
+
+model MediaAsset {
+  id           String   @id @db.Uuid
+  ownerUserId  String   @map("owner_user_id") @db.Uuid
+  purpose      String // avatar | evidence | badge_icon
+  status       String   @default("processing") // processing | ready | failed | purged
+  mimeType     String?  @map("mime_type")
+  width        Int?
+  height       Int?
+  frames       Int?
+  contentHash  String?  @map("content_hash") @db.VarChar(64)
+  storageKey   String?  @map("storage_key")
+  variants     Json?
+  visibility   String   @default("private")
+  revision     Int      @default(1)
+  createdAt    DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  @@index([ownerUserId])
+  @@map("media_assets")
+}
+
+model BadgeDefinition {
+  id           String   @id @db.Uuid
+  key          String   @unique
+  name         String
+  description  String
+  icon         String // 受控内置图标标识
+  theme        String @default("blue") // blue | mint | lilac | amber
+  category     String // honor | contribution | service | activity | growth
+  grantMethod  String   @default("manual") @map("grant_method") // manual | rule
+  isOfficialHonor Boolean @default(false) @map("is_official_honor")
+  status       String   @default("active") // active | retired
+  createdAt    DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  awards BadgeAward[]
+
+  @@map("badge_definitions")
+}
+
+model BadgeRuleVersion {
+  id           String   @id @db.Uuid
+  definitionId String   @map("definition_id") @db.Uuid
+  version      Int
+  conditions   Json // 声明式条件，非可执行代码
+  publicizedAt DateTime? @db.Timestamptz(3) @map("publicized_at")
+  preview      Json?
+
+  @@unique([definitionId, version])
+  @@map("badge_rule_versions")
+}
+
+model BadgeAward {
+  id             String    @id @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  definitionId   String    @map("definition_id") @db.Uuid
+  ruleVersion    Int?      @map("rule_version")
+  sourceKey      String    @map("source_key")
+  evidenceRef    String?   @map("evidence_ref")
+  grantedBy      String?   @map("granted_by") @db.Uuid
+  grantedAt      DateTime @db.Timestamptz(3)  @default(now()) @map("granted_at")
+  expiresAt      DateTime? @db.Timestamptz(3) @map("expires_at")
+  status         String    @default("active") // active | expired | revoked
+  revokedReason  String?   @map("revoked_reason")
+
+  user       User                  @relation(fields: [userId], references: [id])
+  definition BadgeDefinition       @relation(fields: [definitionId], references: [id])
+  featuredIn ProfileFeaturedBadge[]
+
+  @@unique([sourceKey])
+  @@index([userId, status])
+  @@map("badge_awards")
+}
+
+// 分平台 rating/成绩序列（Algorithm 与 Heuristic、RP 观察快照不混合）
+model PlatformRatingPoint {
+  id                   String   @id @db.Uuid
+  platform             String // nowcoder | codeforces | atcoder | hydro
+  integrationInstanceId String? @map("integration_instance_id") @db.Uuid
+  platformAccountId    String?  @map("platform_account_id") @db.Uuid
+  seriesType           String   @map("series_type") // algorithm_rating | heuristic_rating | rp_snapshot
+  externalEventId      String?  @map("external_event_id")
+  contestKey           String?  @map("contest_key")
+  occurredAt           DateTime @db.Timestamptz(3) @map("occurred_at")
+  oldValue             Decimal? @map("old_value") @db.Decimal(12, 4)
+  newValue             Decimal? @map("new_value") @db.Decimal(12, 4)
+  snapshotValue        Decimal? @map("snapshot_value") @db.Decimal(12, 4)
+  sourceRevision       Int      @default(1) @map("source_revision")
+  completeness         String   @default("complete") // complete | partial | unknown
+
+  platformAccount PlatformAccount?   @relation(fields: [platformAccountId], references: [id])
+  integrationInstance IntegrationInstance? @relation(fields: [integrationInstanceId], references: [id])
+
+  @@unique([platform, seriesType, platformAccountId, externalEventId])
+  @@index([platformAccountId, seriesType, occurredAt])
+  @@map("platform_rating_points")
+}
+
+// ===========================================================================
+// 十二、站点设置与审计
+// ===========================================================================
+
+model SiteSettingVersion {
+  id             String    @id @db.Uuid
+  group          String // branding|general|term|rule_defaults|attendance_defaults|invite_policy|badges|privacy_disclosures|platforms|worker|review_rules|cas|security|maintenance|backups
+  key            String
+  schemaVersion  Int       @default(1) @map("schema_version")
+  value          Json
+  secretRef      String?   @map("secret_ref")
+  status         String    @default("draft") // draft|validated|pending_approval|approved|published|rejected|superseded
+  revision       Int       @default(1)
+  changeSummary  String?   @map("change_summary")
+  createdBy      String    @map("created_by") @db.Uuid
+  approvedBy     String?   @map("approved_by") @db.Uuid
+  publishedAt    DateTime? @db.Timestamptz(3) @map("published_at")
+  effectiveAt    DateTime? @db.Timestamptz(3) @map("effective_at")
+  revertOfId     String?   @map("revert_of_id") @db.Uuid
+  createdAt      DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
+
+  @@index([group, key, status])
+  @@map("site_setting_versions")
+}
+
+model SettingEvent {
+  id         String   @id @db.Uuid
+  versionId  String   @map("version_id") @db.Uuid
+  principalId String  @map("principal_id") @db.Uuid
+  action     String // draft | validate | approve | publish | revert | reject
+  note       String?
+  createdAt  DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  @@index([versionId])
+  @@map("setting_events")
+}
+
+model SecretReference {
+  id          String   @id @db.Uuid
+  key         String   @unique // cas_ticket_secret | hydro_push_secret::<instance> 等
+  secretEnc   String   @map("secret_enc") // 加密存储，绝不通过 API 回显
+  version     Int      @default(1)
+  configured  Boolean  @default(true)
+  lastRotated DateTime @db.Timestamptz(3) @default(now()) @map("last_rotated")
+  disabledAt  DateTime? @db.Timestamptz(3) @map("disabled_at")
+
+  @@map("secret_references")
+}
+
+model AuditLog {
+  id                String   @id @db.Uuid
+  actorPrincipalId  String?  @map("actor_principal_id") @db.Uuid
+  action            String
+  resourceType      String   @map("resource_type")
+  resourceId        String   @map("resource_id")
+  summary           String?  @db.Text
+  beforeDigest      String?  @map("before_digest")
+  afterDigest       String?  @map("after_digest")
+  reason            String?
+  createdAt         DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  @@index([resourceType, resourceId])
+  @@index([actorPrincipalId, createdAt])
+  @@map("audit_logs")
+}
+
+model AppMeta {
+  key        String   @id
+  value      Json
+  updatedAt  DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  @@map("app_meta")
+}

@@ -1,0 +1,22 @@
+# 本地开发数据库（可选；与 scripts/dev-postgres.sh 二选一）。
+# 生产部署见 docs/deploy.md（账户拆分/备份/HTTPS 反代）。
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: acm
+      POSTGRES_HOST_AUTH_METHOD: trust # 仅本地开发
+      POSTGRES_DB: acm_club
+    command: postgres -c timezone=UTC # Prisma pg 适配器写入无偏移 UTC 串，会话时区必须固定 UTC
+    ports:
+      - '5433:5432'
+    volumes:
+      - acm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U acm -d acm_club']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  acm-pgdata:

@@ -1,0 +1,16 @@
+{
+  "_comment": "契约 fixture：bridge → 主系统 webhook 事件负载（07 方案 5.1 设计样例的构造版；eventId/revision/snapshotHash 由 bridge 生成，在测试中与源快照 fixture 对应构造并通过主系统协议验签）",
+  "schemaVersion": 1,
+  "eventId": "79b0db72-51e9-4aad-8855-95c3d6e72809",
+  "instanceId": "11111111-1111-4111-8111-111111111111",
+  "domainId": "acm-club",
+  "kind": "record.snapshot.available",
+  "resource": {
+    "contestId": "670100000000000000000001",
+    "recordId": "670100000000000000000002"
+  },
+  "revision": 3,
+  "snapshotHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "observedAt": "2026-10-05T11:30:00Z",
+  "sourceVersion": "5.0.7"
+}

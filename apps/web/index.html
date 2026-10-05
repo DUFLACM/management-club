@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light dark" />
+    <title>大连外国语大学 ACM 算法协会</title>
+    <script>
+      // 初始主题与 ThemeToggle 保持一致：仅主题偏好允许持久化（localStorage 键 club-theme）。
+      (function () {
+        try {
+          var stored = localStorage.getItem('club-theme');
+          var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          // 初始未选择时为浅色；仅显式选择深色/跟随系统时按偏好生效
+          var dark = stored === 'dark' || (stored === 'system' && prefersDark);
+          if (dark) document.documentElement.classList.add('dark');
+        } catch (_e) {
+          /* 无localStorage环境保持浅色 */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
