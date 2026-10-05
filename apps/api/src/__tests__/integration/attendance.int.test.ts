@@ -8,6 +8,9 @@ import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { sha256Hex } from '../../common/utils.js'
 import { createTestUser, makeActor, createApprovedVenue, minutesFromNow } from './helpers.js'
+import { AttendanceAdminController } from '../../modules/attendance/attendance.admin.controller.js'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 
 /**
  * 出勤检查点（真实 PostgreSQL 事务）：
@@ -148,6 +151,107 @@ describe('检查点唯一与幂等', () => {
     expect(sloppy.result).toBe('pending_review')
     const penaltyCount = await db.pointsLedgerEntry.count({ where: { userId: u2.userId, category: 'penalty' } })
     expect(penaltyCount).toBe(0) // 待复核不自动扣分
+  })
+})
+
+describe('必到成员现场签到后自动报名', () => {
+  async function requiredUser(activityId: string) {
+    const user = await createTestUser(db, { studentNo: crypto.randomUUID() })
+    await activities.setRequiredParticipants(manager, activityId, [user.userId])
+    return user
+  }
+
+  it.each(['GEO_ONLY', 'QR_ONLY', 'GEO_AND_QR'])('%s 成功入场才自动报名；截止、满额与审核不阻止必到签到，报名进入我的活动', async (policy) => {
+    const { activityId, versionIds } = await setupActivity(policy)
+    const user = await requiredUser(activityId)
+    expect(await db.activityRegistration.count({ where: { activityId } })).toBe(0)
+    await db.activity.update({ where: { id: activityId }, data: { capacity: 1, approvalRequired: true, registerDeadline: minutesFromNow(-1) } })
+    const alreadyEnrolled = await createTestUser(db, { studentNo: crypto.randomUUID() })
+    await db.activityRegistration.create({ data: { id: crypto.randomUUID(), activityId, userId: alreadyEnrolled.userId, status: 'enrolled' } })
+    const { challenge } = await attendance.issueChallenge(user.userId, activityId, 'IN')
+    expect(await db.activityRegistration.count({ where: { activityId, userId: user.userId } })).toBe(0)
+    const input = {
+      challenge, checkpoint: 'IN' as const, method: policy === 'GEO_ONLY' ? 'GEO' as const : 'QR' as const,
+      geo: policy !== 'QR_ONLY' ? { latitude: 39.9, longitude: 116.4, accuracyMeters: 20, sampledAt: new Date().toISOString() } : undefined,
+      qrToken: policy !== 'GEO_ONLY' ? (await attendance.issueQrWindow(manager.principalId, activityId, versionIds[0], 'IN')).token : undefined,
+      idempotencyKey: `required-checkin-${policy}`,
+    }
+    const result = await attendance.submitCheckpoint(user.userId, input)
+    expect(result.result).toBe('accepted')
+    const registration = await db.activityRegistration.findUniqueOrThrow({ where: { activityId_userId: { activityId, userId: user.userId } }, include: { history: true } })
+    expect(registration).toMatchObject({ status: 'enrolled', waitlistSeq: null, revision: 1 })
+    expect(registration.acceptedAt?.toISOString()).toBe(result.acceptedAt)
+    expect(registration.history).toHaveLength(1)
+    expect(registration.history[0].note).toBe('必到成员现场签到成功，自动报名')
+    expect((await attendance.submitCheckpoint(user.userId, input)).result).toBe('already_recorded')
+    expect(await db.registrationHistory.count({ where: { registrationId: registration.id } })).toBe(1)
+    const mine = await activities.listForUser(user.userId, { tab: 'mine' })
+    expect(mine.items.find((item) => item.id === activityId)).toMatchObject({ myRegistration: { status: 'enrolled' }, enrolledCount: 2 })
+    await expect(activities.cancelRegistration(user.userId, activityId)).rejects.toMatchObject({ code: 'REQUIRED_PARTICIPANT' })
+    expect((await attendance.attendanceContext(user.userId, activityId)).eligibility.registration?.status).toBe('enrolled')
+  })
+
+  it('并发签到只创建一条报名和一条历史，已有候补转为确认并清除候补/取消信息', async () => {
+    const { activityId } = await setupActivity('GEO_ONLY')
+    const user = await requiredUser(activityId)
+    await db.activityRegistration.create({ data: { id: crypto.randomUUID(), activityId, userId: user.userId, status: 'waitlisted', waitlistSeq: 3, confirmDeadline: minutesFromNow(5), cancelledAt: minutesFromNow(-5), cancelReason: '旧取消原因' } })
+    const challenges = await Promise.all([attendance.issueChallenge(user.userId, activityId, 'IN'), attendance.issueChallenge(user.userId, activityId, 'IN')])
+    const results = await Promise.all(challenges.map(({ challenge }, index) => attendance.submitCheckpoint(user.userId, {
+      challenge, method: 'GEO', checkpoint: 'IN', idempotencyKey: `required-concurrent-${index}`,
+      geo: { latitude: 39.9, longitude: 116.4, accuracyMeters: 20, sampledAt: new Date().toISOString() },
+    })))
+    expect(results.map((result) => result.result).sort()).toEqual(['accepted', 'already_recorded'])
+    const registration = await db.activityRegistration.findUniqueOrThrow({ where: { activityId_userId: { activityId, userId: user.userId } }, include: { history: true } })
+    expect(registration).toMatchObject({ status: 'enrolled', waitlistSeq: null, confirmDeadline: null, cancelledAt: null, cancelReason: null, revision: 2 })
+    expect(registration.history).toHaveLength(1)
+    expect(registration.history[0].fromStatus).toBe('waitlisted')
+  })
+
+  it('拒绝、待复核和仅签退都不报名；非必到且未报名成员仍不能取得签到资格', async () => {
+    const { activityId } = await setupActivity('GEO_ONLY', { checkoutOpenNow: true })
+    const outside = await requiredUser(activityId)
+    const pending = await requiredUser(activityId)
+    const checkoutOnly = await requiredUser(activityId)
+    expect((await geoSubmit(outside.userId, activityId, 'IN', { latitude: 39.95, longitude: 116.45, accuracyMeters: 20 })).result).toBe('rejected')
+    expect((await geoSubmit(pending.userId, activityId, 'IN', { latitude: 39.9, longitude: 116.4, accuracyMeters: 200 })).result).toBe('pending_review')
+    expect((await geoSubmit(checkoutOnly.userId, activityId, 'OUT')).result).toBe('accepted')
+    expect(await db.activityRegistration.count({ where: { activityId } })).toBe(0)
+    const voluntary = await createTestUser(db, { studentNo: crypto.randomUUID() })
+    await expect(attendance.issueChallenge(voluntary.userId, activityId, 'IN')).rejects.toMatchObject({ code: 'MEMBERSHIP_NOT_ELIGIBLE' })
+    await activities.requestLeave(outside.userId, activityId, '课程冲突')
+    expect(await db.leaveRequest.findUnique({ where: { activityId_userId: { activityId, userId: outside.userId } } })).toMatchObject({ status: 'pending' })
+  })
+
+  it('人工确认必到成员到场时自动报名；批准请假或认定缺席不报名', async () => {
+    const { activityId } = await setupActivity('GEO_ONLY')
+    const controller = new AttendanceAdminController(attendance, db, new AuditService(db))
+    for (const status of ['ontime', 'late', 'early_leave', 'late_and_early', 'leave_approved', 'absent', 'remote_approved']) {
+      const user = await requiredUser(activityId)
+      const result = await db.attendanceAttendanceResult.create({ data: { id: crypto.randomUUID(), activityId, userId: user.userId, status: 'pending_review' } })
+      await controller.correction(manager, result.id, { newStatus: status, reason: '现场人工核验记录' })
+      const present = ['ontime', 'late', 'early_leave', 'late_and_early'].includes(status)
+      expect(await db.activityRegistration.count({ where: { activityId, userId: user.userId, status: 'enrolled' } })).toBe(present ? 1 : 0)
+    }
+  })
+
+  it('迁移只补齐已有成功 IN 的必到报名，重复执行幂等', async () => {
+    const { activityId } = await setupActivity('GEO_ONLY')
+    const checkedIn = await requiredUser(activityId)
+    const notCheckedIn = await requiredUser(activityId)
+    const checkoutOnly = await requiredUser(activityId)
+    const voluntary = await createTestUser(db, { studentNo: crypto.randomUUID() })
+    const acceptedAt = minutesFromNow(-1)
+    for (const [userId, checkpoint] of [[checkedIn.userId, 'IN'], [checkoutOnly.userId, 'OUT'], [voluntary.userId, 'IN']]) {
+      await db.attendanceCheckpoint.create({ data: { id: crypto.randomUUID(), activityId, userId, checkpoint, method: 'GEO', acceptedAt } })
+    }
+    const migration = readFileSync(path.resolve(process.cwd(), '../../prisma/migrations/20261006091000_required_checkin_registration/migration.sql'), 'utf8')
+    await db.$executeRawUnsafe(migration)
+    await db.$executeRawUnsafe(migration)
+    const registration = await db.activityRegistration.findUniqueOrThrow({ where: { activityId_userId: { activityId, userId: checkedIn.userId } }, include: { history: true } })
+    expect(registration.status).toBe('enrolled')
+    expect(registration.acceptedAt?.toISOString()).toBe(acceptedAt.toISOString())
+    expect(registration.history).toHaveLength(1)
+    expect(await db.activityRegistration.count({ where: { activityId, userId: { in: [notCheckedIn.userId, checkoutOnly.userId, voluntary.userId] } } })).toBe(0)
   })
 })
 

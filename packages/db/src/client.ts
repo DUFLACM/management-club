@@ -4,6 +4,7 @@ import { PrismaClient as PrismaClientBase } from './generated/client/client.js'
 export { PrismaClient as PrismaClientBase } from './generated/client/client.js'
 export * from './generated/client/client.js'
 export { loadRuntimeEnvironment } from './runtime-env.js'
+export { attendanceDeadline, settleRequiredAbsences } from './required-attendance.js'
 
 /**
  * 创建 PrismaClient（Prisma 7 驱动适配器模式，无 Rust 引擎）。

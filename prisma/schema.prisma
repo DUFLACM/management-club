@@ -622,7 +622,7 @@ model RegistrationHistory {
   @@map("registration_history")
 }
 
-// 必须参加名单：独立于自愿报名
+// 必须参加名单：保存出勤义务与冻结快照，现场签到成功后自动确认报名
 model ActivityParticipant {
   id              String   @id @db.Uuid
   activityId      String   @map("activity_id") @db.Uuid

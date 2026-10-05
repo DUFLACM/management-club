@@ -5,6 +5,7 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { haversineMeters, newId, randomToken, sha256Hex } from '../../common/utils.js'
 import { z } from 'zod'
+import { enrollRequiredAfterCheckin } from './checkin-registration.js'
 
 /**
  * 出勤模块（03 方案 5-10）：
@@ -506,6 +507,9 @@ export class AttendanceService {
               method: input.method, acceptedAt: serverTime, venueVersionId: evidenceVenueVersionId, attemptId: attempt.id,
             },
         })
+        if (input.checkpoint === 'IN') {
+          await enrollRequiredAfterCheckin(tx, activityId, userId, serverTime)
+        }
         await tx.attendanceAttendanceResult.upsert({
           where: { activityId_userId: { activityId, userId } },
           create: { id: newId(), activityId, userId, status: input.checkpoint === 'IN' ? 'pending' : 'pending' },

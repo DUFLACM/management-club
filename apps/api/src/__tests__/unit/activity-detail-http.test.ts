@@ -17,7 +17,13 @@ const fixture = {
   policy: { policy: 'QR_ONLY' }, venueBindings: [], venueVersion: null,
 }
 const findUnique = vi.fn()
-const db = { activity: { findUnique } }
+const update = vi.fn()
+const audit = { log: vi.fn() }
+const db = {
+  activity: { findUnique, update },
+  $executeRaw: vi.fn(),
+  $transaction: async (callback: (tx: unknown) => unknown) => callback(db),
+}
 let actor: SessionActor | null
 let app: INestApplication
 
@@ -25,7 +31,7 @@ beforeAll(async () => {
   const module = await Test.createTestingModule({
     controllers: [ActivityAdminController, ActivityUserController],
     providers: [
-      { provide: ActivityService, useValue: new ActivityService(db, {}, {}, {}) },
+      { provide: ActivityService, useValue: new ActivityService(db, audit, {}, {}) },
       { provide: AttendanceService, useValue: {} },
       { provide: PrismaService, useValue: db },
       { provide: SessionService, useValue: { resolveActor: async () => actor } },
@@ -41,6 +47,8 @@ beforeEach(() => {
     authzVersion: 1, roles: ['presidium', 'system_admin'],
   }
   findUnique.mockReset().mockResolvedValue(fixture)
+  update.mockReset().mockResolvedValue({ revision: 2, title: '已编辑草稿' })
+  audit.log.mockReset()
 })
 
 afterAll(async () => { await app?.close() })
@@ -77,4 +85,31 @@ it('成员接口保留学生身份要求与本人记录过滤', async () => {
   actor!.roles = ['member']
   await request(app.getHttpServer()).get(`/api/v1/activities/${activityId}`).expect(200)
   expect(findUnique.mock.calls[0][0].include.registrations).toEqual({ where: { userId: actor!.userId } })
+})
+
+it('草稿 PATCH 接受有管理权限的本地管理员，校验版本并写审计', async () => {
+  const venueVersionId = crypto.randomUUID()
+  findUnique.mockResolvedValue({ ...fixture, revision: 1, startAt: new Date('2026-10-06T10:00:00Z'), endAt: new Date('2026-10-06T12:00:00Z'), venueVersionId, venueBindings: [{ venueVersionId }] })
+  const result = await request(app.getHttpServer()).patch(`/api/v1/admin/activities/${activityId}`)
+    .send({ expectedRevision: 1, title: '已编辑草稿' }).expect(200)
+  expect(result.body.data.revision).toBe(2)
+  expect(update.mock.calls[0][0].data.title).toBe('已编辑草稿')
+  expect(audit.log.mock.calls[0][0]).toMatchObject({ action: 'activity.update', actorPrincipalId: actor!.principalId })
+})
+
+it('PATCH 拒绝无权限、缺少版本与修改状态等非白名单字段', async () => {
+  actor!.roles = ['member']
+  await request(app.getHttpServer()).patch(`/api/v1/admin/activities/${activityId}`).send({ expectedRevision: 1, title: '成员不可编辑' }).expect(403)
+  actor!.roles = ['presidium']
+  await request(app.getHttpServer()).patch(`/api/v1/admin/activities/${activityId}`).send({ title: '缺少版本' }).expect(400)
+  await request(app.getHttpServer()).patch(`/api/v1/admin/activities/${activityId}`).send({ expectedRevision: 1, status: 'published' }).expect(400)
+  expect(update).not.toHaveBeenCalled()
+})
+
+it('新建活动请求缺少地点时直接拒绝', async () => {
+  const response = await request(app.getHttpServer()).post('/api/v1/admin/activities').send({
+    type: 'training', title: '缺少地点活动', announcement: '应当在创建时校验',
+    startAt: '2026-10-06T10:00:00Z', endAt: '2026-10-06T12:00:00Z',
+  }).expect(400)
+  expect(response.body.code).toBe('NO_VENUE')
 })

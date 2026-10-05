@@ -7,6 +7,8 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newId } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
+import { enrollRequiredAfterCheckin } from './checkin-registration.js'
+import { attendanceDeadline, settleRequiredAbsences } from '@acm/db'
 
 /** 现场码 / 补签 / 复核（/admin?section=activities&tab=attendance） */
 @Controller('/api/v1/admin')
@@ -17,6 +19,32 @@ export class AttendanceAdminController {
     private readonly db: PrismaService,
     private readonly audit: AuditService,
   ) {}
+
+  /** 大屏统计直接读取已接受检查点，最近名单有界，人数不受名单长度影响。 */
+  @Get('activities/:id/attendance/board')
+  @RequireAction('attendance.qr')
+  async board(@Param('id', ParseUUIDPipe) id: string) {
+    const activity = await this.db.activity.findUnique({ where: { id }, select: { id: true } })
+    if (!activity) throw new AttendanceError('活动不存在', 'NOT_FOUND')
+    const [checkedIn, checkedOut, recent] = await this.db.$transaction([
+      this.db.attendanceCheckpoint.count({ where: { activityId: id, checkpoint: 'IN' } }),
+      this.db.attendanceCheckpoint.count({ where: { activityId: id, checkpoint: 'OUT' } }),
+      this.db.attendanceCheckpoint.findMany({
+        where: { activityId: id, checkpoint: 'IN' },
+        orderBy: [{ acceptedAt: 'desc' }, { id: 'desc' }],
+        take: 24,
+        select: { userId: true, acceptedAt: true, user: { select: { verifiedRealName: true } } },
+      }),
+    ], { isolationLevel: 'RepeatableRead' })
+    return ok({
+      checkedIn,
+      checkedOut,
+      recentCheckins: recent.map((row) => ({
+        userId: row.userId, name: row.user.verifiedRealName ?? '成员', acceptedAt: row.acceptedAt.toISOString(),
+      })),
+      updatedAt: new Date().toISOString(),
+    })
+  }
 
   /** 当前活动指定地点/检查点的有效现场码（过期自动轮换签发新窗口） */
   @Post('activities/:id/attendance/qr')
@@ -65,6 +93,10 @@ export class AttendanceAdminController {
       throw new AttendanceError('不能为本人补签/更正（利益回避）', 'RECUSED')
     }
     await this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM activities WHERE id = ${result.activityId}::uuid FOR UPDATE`
+      if (['ontime', 'late', 'early_leave', 'late_and_early'].includes(parsed.newStatus)) {
+        await enrollRequiredAfterCheckin(tx, result.activityId, result.userId, new Date(), actor.principalId)
+      }
       await tx.attendanceCorrection.create({
         data: {
           id: newId(),
@@ -153,17 +185,16 @@ export class AttendanceAdminController {
   async settle(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
     const activity = await this.db.activity.findUnique({
       where: { id },
-      include: { participants: true, checkpoints: true, leaveRequests: true, remotePermissions: true },
+      include: { policy: true, participants: true, checkpoints: true, leaveRequests: true, remotePermissions: true },
     })
     if (!activity) throw new AttendanceError('活动不存在', 'NOT_FOUND')
     const now = new Date()
+    if (attendanceDeadline(activity) >= now) throw new AttendanceError('活动及出勤窗口尚未结束，不能提前认定缺勤', 'ATTENDANCE_NOT_ENDED')
     const checkpointsByUser = new Map<string, Map<string, Date>>()
     for (const c of activity.checkpoints) {
       if (!checkpointsByUser.has(c.userId)) checkpointsByUser.set(c.userId, new Map())
       checkpointsByUser.get(c.userId)!.set(c.checkpoint, c.acceptedAt)
     }
-    const leaveByUser = new Map(activity.leaveRequests.filter((l) => l.status === 'approved').map((l) => [l.userId, l]))
-    const remoteByUser = new Map(activity.remotePermissions.filter((r) => r.status === 'approved').map((r) => [r.userId, r]))
     const durationMin = (activity.endAt.getTime() - activity.startAt.getTime()) / 60_000
     let created = 0
     for (const [userId, cps] of checkpointsByUser) {
@@ -196,21 +227,8 @@ export class AttendanceAdminController {
       })
       created++
     }
-    // 必到名单缺席候选（请假/远程已批准除外）——只产生候选，扣分由审核确认
-    let absenceCandidates = 0
-    for (const p of activity.participants.filter((x) => x.required)) {
-      if (leaveByUser.has(p.userId) || remoteByUser.has(p.userId)) continue
-      if (!checkpointsByUser.has(p.userId)) {
-        await this.db.attendanceAttendanceResult.upsert({
-          where: { activityId_userId: { activityId: id, userId: p.userId } },
-          create: { id: newId(), activityId: id, userId: p.userId, status: 'pending_review', reviewNote: '必到名单无到场记录：缺席候选（-4 扣分由审核确认）' },
-          update: { status: 'pending_review', reviewNote: '必到名单无到场记录：缺席候选（-4 扣分由审核确认）' },
-        })
-        absenceCandidates++
-      }
-    }
+    const absences = await settleRequiredAbsences(this.db, id)
     void actor
-    void now
-    return ok({ created, absenceCandidates, note: '缺签退/边界/缺席均为待复核候选，不自动满勤、不自动扣分' })
+    return ok({ created, absenceCandidates: absences.absent + absences.pendingReview, absent: absences.absent, pendingReview: absences.pendingReview, note: '必到成员无操作逾期记为缺勤；待审核申请和签到异常保留待复核，扣分另行审核' })
   }
 }

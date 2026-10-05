@@ -131,6 +131,7 @@ function OverviewBody({ principalId }: { principalId: string }) {
               description="概览你的有效积分、排名、出勤与近期安排。"
               actions={
                 <Button
+                  className="ml-auto"
                   type="button"
                   onClick={() => {
                     setBindSubmitted(false);

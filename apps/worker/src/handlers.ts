@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { PrismaClient } from '@acm/db'
+import { settleRequiredAbsences, type PrismaClient } from '@acm/db'
 import {
   fetchNowcoderHistory,
   fetchNowcoderContestMeta,
@@ -97,6 +97,9 @@ async function upsertParticipations(db: PrismaClient, accountId: string, platfor
 }
 
 const handlers: Record<string, JobHandler> = {
+  'activity.settle_attendance': async (ctx, payload) => {
+    return settleRequiredAbsences(ctx.db, String(payload.activityId))
+  },
   /** 平台账号同步：牛客历史 / CF rating+提交 / AtCoder 历史；结果幂等 upsert */
   'platform.sync_account': async (ctx, payload) => {
     const accountId = String(payload.accountId)

@@ -32,6 +32,7 @@ import {
   fromLocalInputValue,
 } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
+import { AttendanceQrBoard } from '@/components/club/AttendanceQrBoard';
 import { PrincipalGate } from '@/components/club/QueryBoundary';
 import { EmptyState } from '@/components/club/EmptyState';
 import { ErrorState } from '@/components/club/ErrorState';
@@ -485,6 +486,7 @@ function ActivityDetailSheet({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [qrBoardOpen, setQrBoardOpen] = useState(false);
+  const [boardWasFullscreen, setBoardWasFullscreen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
 
   const query = usePrivateQuery<ActivityDetailDto, ApiError>(
@@ -539,7 +541,7 @@ function ActivityDetailSheet({
   return (
     <>
       <ResponsiveDetail
-        open
+        open={!qrBoardOpen}
         onOpenChange={(open) => {
           if (!open) onClose();
         }}
@@ -560,7 +562,7 @@ function ActivityDetailSheet({
               {query.data.status === 'draft' && (
                 <Button
                   size="sm"
-                  disabled={publishMutation.isPending}
+                  disabled={publishMutation.isPending || !query.data.policy || query.data.venueBindings.length === 0}
                   onClick={() => publishMutation.mutate()}
                 >
                   {publishMutation.isPending && (
@@ -570,7 +572,13 @@ function ActivityDetailSheet({
                 </Button>
               )}
               {query.data.policy && query.data.status === 'published' && (
-                <Button size="sm" variant="outline" onClick={() => setQrBoardOpen(true)}>
+                <Button size="sm" variant="outline" onClick={() => {
+                  setBoardWasFullscreen(Boolean(document.fullscreenElement));
+                  setQrBoardOpen(true);
+                  if (!document.fullscreenElement && document.fullscreenEnabled) {
+                    void document.documentElement.requestFullscreen().catch(() => undefined);
+                  }
+                }}>
                   <MonitorPlayIcon aria-hidden="true" />
                   现场码大屏
                 </Button>
@@ -592,7 +600,9 @@ function ActivityDetailSheet({
                 {query.data.status === 'archived'
                   ? '活动已归档，记录只读。'
                   : query.data.status === 'draft'
-                    ? '草稿可编辑，保存后再发布。'
+                    ? query.data.venueBindings.length === 0
+                      ? '请编辑草稿并选择签到地点后再发布。'
+                      : '草稿可编辑，保存后再发布。'
                     : '发布后配置已固化，如需修改请新建活动。'}
               </span>
             </div>
@@ -669,7 +679,7 @@ function ActivityDetailSheet({
       )}
 
       {qrBoardOpen && query.data && (
-        <QrBoardDialog activity={query.data} onClose={() => setQrBoardOpen(false)} />
+        <AttendanceQrBoard activity={query.data} principalId={principalId} wasFullscreen={boardWasFullscreen} onClose={() => setQrBoardOpen(false)} />
       )}
     </>
   );
@@ -926,7 +936,7 @@ function ParticipantsSection({
     },
     onSuccess: (userIds) => {
       setActionError(null);
-      setActionNotice(`已设置必到名单 ${userIds.length} 人（发布时冻结快照）。`);
+      setActionNotice(`已设置必到名单 ${userIds.length} 人（发布时冻结快照，现场签到成功后自动报名）。`);
       void queryClient.invalidateQueries({
         queryKey: ['principal', principalId, 'admin', 'activities'],
       });
@@ -1048,192 +1058,12 @@ function ParticipantsSection({
               设置必到名单（{Object.keys(selected).length}）
             </Button>
             <span className="text-xs text-muted-foreground">
-              多选；必到名单独立于自愿报名，发布时冻结。
+              多选；发布时冻结必到名单，现场签到成功后自动报名；缺席须申请请假，出勤截止无操作自动记为缺勤。
             </span>
           </div>
         </>
       )}
     </div>
-  );
-}
-
-// ======================= 现场码大屏 =======================
-
-function QrBoardDialog({
-  activity,
-  onClose,
-}: {
-  activity: ActivityDetailDto;
-  onClose: () => void;
-}) {
-  const venueOptions = activity.venueBindings;
-  const [venueVersionId, setVenueVersionId] = useState(venueOptions[0]?.venueVersionId ?? '');
-  const [checkpoint, setCheckpoint] = useState<'IN' | 'OUT'>('IN');
-  const [qr, setQr] = useState<{ dataUrl: string; expiresAt: string; rotateSeconds: number } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [countdown, setCountdown] = useState<number | null>(null);
-  const [online, setOnline] = useState(navigator.onLine);
-  const fetchToken = useRef(0);
-  const timerRef = useRef<number | null>(null);
-  const receivedAtRef = useRef<number>(0);
-  const remainingAtArrivalRef = useRef<number>(0);
-  const rotateSecondsRef = useRef<number>(25);
-
-  const ended = new Date(activity.endAt) < new Date();
-
-  const issue = useCallback(async () => {
-    if (ended) return;
-    const token = fetchToken.current + 1;
-    fetchToken.current = token;
-    try {
-      const { data } = await api.post<{
-        dataUrl: string;
-        expiresAt: string;
-        rotateSeconds: number;
-      }>(`/admin/activities/${activity.id}/attendance/qr`, { venueVersionId, checkpoint });
-      if (fetchToken.current !== token) return;
-      receivedAtRef.current = Date.now();
-      remainingAtArrivalRef.current = Math.max(
-        0,
-        new Date(data.expiresAt).getTime() - Date.now(),
-      );
-      rotateSecondsRef.current = data.rotateSeconds;
-      setCountdown(Math.ceil(remainingAtArrivalRef.current / 1000));
-      setQr(data);
-      setError(null);
-    } catch (cause) {
-      if (fetchToken.current !== token) return;
-      // 失败：移除旧码并显示错误
-      setQr(null);
-      setError(cause instanceof ApiError ? cause.message : '现场码获取失败');
-    }
-  }, [activity.id, checkpoint, ended, venueVersionId]);
-
-  // 轮询：按 rotateSeconds 取新码
-  useEffect(() => {
-    setQr(null);
-    setCountdown(null);
-    remainingAtArrivalRef.current = 0;
-    void issue();
-    if (ended) return;
-    let cancelled = false;
-    const schedule = () => {
-      timerRef.current = window.setTimeout(async () => {
-        if (cancelled) return;
-        await issue();
-        if (!cancelled) schedule();
-      }, Math.max(10_000, rotateSecondsRef.current * 1000));
-    };
-    schedule();
-    return () => {
-      cancelled = true;
-      fetchToken.current += 1;
-      if (timerRef.current != null) window.clearTimeout(timerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [issue, ended, venueVersionId, checkpoint]);
-
-  // 倒计时：expiresAt −（本地流逝时间）
-  useEffect(() => {
-    const interval = window.setInterval(() => {
-      setOnline(navigator.onLine);
-      if (remainingAtArrivalRef.current > 0) {
-        const elapsed = Date.now() - receivedAtRef.current;
-        const remaining = Math.max(0, Math.ceil((remainingAtArrivalRef.current - elapsed) / 1000));
-        setCountdown(remaining);
-        if (remaining === 0) {
-          remainingAtArrivalRef.current = 0;
-          setQr(null);
-          setError('现场码已过期，正在等待重新签发；请勿使用旧码。');
-        }
-      }
-    }, 500);
-    return () => window.clearInterval(interval);
-  }, []);
-
-  const venueLabel = venueOptions.find((option) => option.venueVersionId === venueVersionId);
-
-  return (
-    <Dialog open onOpenChange={(open) => {
-      if (!open) onClose();
-    }}>
-      <DialogContent className="max-w-xl text-center">
-        <DialogHeader>
-          <DialogTitle>{activity.title}</DialogTitle>
-          <DialogDescription>
-            {venueLabel
-              ? `${venueLabel.venueVersion.venue.name} ${venueLabel.venueVersion.building ?? ''} ${venueLabel.venueVersion.room ?? ''}`
-              : '未绑定地点'}
-            {' · '}
-            {checkpoint === 'IN' ? '签到 IN' : '签退 OUT'}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="flex flex-wrap justify-center gap-2">
-          <Select value={venueVersionId} onValueChange={setVenueVersionId}>
-            <SelectTrigger className="w-56" aria-label="地点版本">
-              <SelectValue placeholder="选择地点版本" />
-            </SelectTrigger>
-            <SelectContent>
-              {venueOptions.map((option) => (
-                <SelectItem key={option.venueVersionId} value={option.venueVersionId}>
-                  {option.venueVersion.venue.name} {option.venueVersion.room ?? ''}（
-                  {option.venueVersionId.slice(0, 8)}）
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Select
-            value={checkpoint}
-            onValueChange={(value) => setCheckpoint(value === 'OUT' ? 'OUT' : 'IN')}
-          >
-            <SelectTrigger className="w-32" aria-label="检查点">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="IN">签到 IN</SelectItem>
-              <SelectItem value="OUT">签退 OUT</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-
-        {ended ? (
-          <p className="py-10 text-sm text-muted-foreground">
-            活动已结束（{formatDateTime(activity.endAt)}），现场码已停止。
-          </p>
-        ) : error ? (
-          <div className="flex flex-col items-center gap-3 py-8">
-            <p className="text-sm text-destructive">{error}</p>
-            <Button variant="outline" size="sm" onClick={() => void issue()}>
-              重试
-            </Button>
-          </div>
-        ) : qr ? (
-          <div className="flex flex-col items-center gap-3">
-            <img
-              src={qr.dataUrl}
-              alt="现场活动码"
-              width={320}
-              height={320}
-              className="h-[min(320px,calc(100vw-80px))] w-[min(320px,calc(100vw-80px))] rounded-xl border border-border bg-white p-2"
-            />
-            <p className="text-sm text-muted-foreground tabular-nums">
-              剩余有效 {countdown ?? '—'} 秒 · 每 {qr.rotateSeconds} 秒自动换码
-            </p>
-          </div>
-        ) : (
-          <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
-            <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" />
-            正在签发现场码…
-          </div>
-        )}
-
-        <p className="text-xs text-muted-foreground">
-          黑白码不加 logo；有效期内多位成员可同扫一码。
-          {online ? '' : '（当前网络离线：恢复后将自动重试）'}
-        </p>
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -2456,6 +2286,10 @@ function ActivityFormDialog({
             </label>
           </div>
         </div>
+        <div className="flex justify-end gap-2">
+        <Button variant="outline" disabled={mutation.isPending} onClick={() => onOpenChange(false)}>
+          取消
+        </Button>
         <Button
           onClick={() => mutation.mutate()}
           disabled={
@@ -2472,6 +2306,7 @@ function ActivityFormDialog({
           {mutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
           {draft ? '保存草稿' : '创建草稿'}
         </Button>
+        </div>
       </DialogContent>
     </Dialog>
   );

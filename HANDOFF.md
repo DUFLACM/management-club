@@ -82,15 +82,6 @@ pnpm --filter @acm/web exec node scripts/sidebar-layout-check.mjs
 
 关键位置为 `apps/web/src/workspaces/member/panels/ContestsPanel.tsx`、`apps/api/src/modules/activities/activity.service.ts`、`apps/api/src/modules/attendance/attendance.admin.controller.ts`、`apps/worker/src/handlers.ts` 与 `packages/scoring-core/src/award-score.ts`。以上是需要补开发的软件缺口，与校方白名单、真实实例和 R01–R13 制度未决分别记录；本轮只做只读审计，未擅自实现新的制度解释或竞赛流程。
 
-### 外部条件与仍未执行的验收
-
-1. **校园 CAS**：已配置真实模式并完成只读接口连通性检查；仍需校方 service 白名单、有效票据成功属性、学生登录/邀请注册全链路。不得写成端到端校园成功。
-2. **教职工 CAS 与实际地点**：软件已支持 `register-staff` 受控预登记，首次 CAS 登录按校园编号和姓名匹配并绑定稳定 subject；仍需用校方有效教职工账号验证 `id_number/user_name/user_id` 契约和 service 白名单。真实地点须采样、独立认证与现场验收，不将开发坐标视为真实认证。
-3. **Hydro/Mongo**：准备真实实例、安装插件、核验实际集合/版本/权限/签名投递与重放；当前 connector 保持 disabled。
-4. **制度 R01–R13**：由协会确认口径并发布规则版本；不写死任意解释，不取消阻塞来制造通过。
-5. **真机与性能**：iOS Safari、Android Chrome、微信/QQ 内置浏览器、定位/相机权限与弱网；目标服务器读/签到 p95、RUM 的 LCP/INP/CLS 仍未执行。
-6. **头像完整链路**：本轮未重跑 HTTP 上传→Worker 处理→设置头像；不能将代码存在或历史说明写成本轮验收通过。
-
 ## 4. 已踩过的坑
 
 1. 数据库会话必须 UTC。新库执行 `ALTER DATABASE <db> SET timezone TO 'UTC';`，避免 CAS flow 等过期判断偏移 8 小时。

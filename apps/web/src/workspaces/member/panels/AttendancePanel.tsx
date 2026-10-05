@@ -226,7 +226,7 @@ function AttendanceBody({ principalId }: { principalId: string }) {
 
   const refresh = useCallback(() => {
     void queryClient.invalidateQueries({
-      queryKey: ['principal', principalId, 'activities', 'attendance-context'],
+      queryKey: ['principal', principalId, 'activities'],
     });
     void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me'] });
   }, [principalId, queryClient]);

@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common'
 import { z } from 'zod'
 import { SessionGuard, CurrentUser, RequireAction, ActionGuard, PermissionsGuard, ok } from '../../common/guards.js'
-import { ActivityService, activityInputSchema, activityUpdateSchema } from './activity.service.js'
+import { ActivityError, ActivityService, activityInputSchema, activityUpdateSchema } from './activity.service.js'
 import { AttendanceService, checkpointSubmitSchema, challengeRequestSchema } from '../attendance/attendance.service.js'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { monthKey } from '../../common/utils.js'
@@ -118,8 +118,9 @@ export class ActivityAdminController {
   @Post()
   @RequireAction('activity.manage')
   async create(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
-    const input = activityInputSchema.parse(body)
-    return ok(await this.activities.createActivity(actor, input))
+    const parsed = activityInputSchema.safeParse(body)
+    if (!parsed.success) throw new ActivityError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.activities.createActivity(actor, parsed.data))
   }
 
   /** 管理详情使用主体权限，不要求关联学生账号。 */
@@ -132,7 +133,9 @@ export class ActivityAdminController {
   @Patch(':id')
   @RequireAction('activity.manage')
   async update(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
-    return ok(await this.activities.updateDraft(actor, id, activityUpdateSchema.parse(body)))
+    const parsed = activityUpdateSchema.safeParse(body)
+    if (!parsed.success) throw new ActivityError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.activities.updateDraft(actor, id, parsed.data))
   }
 
   @Post('import-contest')
@@ -184,9 +187,11 @@ export class ActivityAdminController {
     const cpByUser = new Map(checkpoints.map((c) => [`${c.userId}:${c.checkpoint}`, c]))
     const resultByUser = new Map(results.map((r) => [r.userId, r]))
     const leaveByUser = new Map(leaves.map((l) => [l.userId, l]))
+    const registrationByUser = new Map(registrations.map((registration) => [registration.userId, registration]))
+    const participantByUser = new Map(participants.map((participant) => [participant.userId, participant]))
     const rows = [
-      ...participants.map((p) => ({ userId: p.user.id, name: p.user.verifiedRealName, studentNo: p.user.studentNo, required: p.required, regStatus: 'required_list' as const })),
-      ...registrations.map((r) => ({ userId: r.user.id, name: r.user.verifiedRealName, studentNo: r.user.studentNo, required: false, regStatus: r.status })),
+      ...participants.map((p) => ({ userId: p.user.id, name: p.user.verifiedRealName, studentNo: p.user.studentNo, required: p.required, regStatus: registrationByUser.get(p.user.id)?.status ?? 'required_list' })),
+      ...registrations.map((r) => ({ userId: r.user.id, name: r.user.verifiedRealName, studentNo: r.user.studentNo, required: participantByUser.get(r.user.id)?.required ?? false, regStatus: r.status })),
     ].filter((row, i, arr) => arr.findIndex((x) => x.userId === row.userId) === i)
     const withStatus = rows.map((row) => ({
       ...row,

@@ -7,13 +7,13 @@ import { VenueService } from '../venues/venue.service.js'
 import { newId } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { z } from 'zod'
-import { Prisma } from '@acm/db'
+import { Prisma, attendanceDeadline } from '@acm/db'
 
 /**
  * 活动模块（01/02/03 方案）：
  * - 三种来源：导入平台赛事（202+job 建草稿）、自定义比赛、普通活动。
  * - 发布前固定策略快照（policyVersion/scoringConfig/围栏快照）；发布校验地点认证覆盖窗口与能力。
- * - 报名：最后名额原子分配（活动行锁 + 唯一约束兜底）；候补按公告递补；必到名单独立。
+ * - 报名：最后名额原子分配（活动行锁 + 唯一约束兜底）；候补按公告递补；必到成员现场签到成功后自动报名。
  */
 
 export class ActivityError extends DomainError {
@@ -332,6 +332,7 @@ export class ActivityService {
         where: { activityId, required: true, frozenAt: null },
         data: { frozenAt: new Date() },
       })
+      await this.scheduleAttendanceSettlement(tx, activityId, attendanceDeadline(activity))
       return activity.title
     })
     await this.audit.log({
@@ -347,7 +348,7 @@ export class ActivityService {
    * 报名（02 方案 6.1 / 03 方案 5）：
    * - 活动行锁下检查截止/资格/容量 → 写入 enrolled/waitlisted/pending_approval。
    * - 重复提交幂等返回原状态；不重复占名额。
-   * - 扫码不能自动报名：本接口是唯一报名入口。
+   * - 必到成员现场签到成功后自动确认报名，其他成员须先取得报名资格。
    */
   async register(userId: string, activityId: string, idempotencyKey?: string): Promise<{ status: string; waitlistSeq: number | null; message: string }> {
     return this.db.$transaction(async (tx) => {
@@ -415,6 +416,8 @@ export class ActivityService {
       await tx.$executeRaw`SELECT id FROM activities WHERE id = ${activityId}::uuid FOR UPDATE`
       const activity = await tx.activity.findUnique({ where: { id: activityId } })
       if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
+      const participant = await tx.activityParticipant.findUnique({ where: { activityId_userId: { activityId, userId } } })
+      if (participant?.required) throw new ActivityError('必到成员无法取消报名；如需缺席请提交请假申请', 'REQUIRED_PARTICIPANT')
       const reg = await tx.activityRegistration.findUnique({ where: { activityId_userId: { activityId, userId } } })
       if (!reg || !['enrolled', 'waitlisted', 'pending_approval'].includes(reg.status)) {
         throw new ActivityError('没有可取消的报名', 'NO_REGISTRATION')
@@ -430,7 +433,8 @@ export class ActivityService {
 
       // 候补递补：未截止 + 按顺序第一位 + 容量允许
       let promoted: string | undefined
-      if (reg.status === 'enrolled' && (!activity.registerDeadline || activity.registerDeadline >= now)) {
+      const enrolledCount = await tx.activityRegistration.count({ where: { activityId, status: 'enrolled' } })
+      if (reg.status === 'enrolled' && (activity.capacity == null || enrolledCount < activity.capacity) && (!activity.registerDeadline || activity.registerDeadline >= now)) {
         const next = await tx.activityRegistration.findFirst({
           where: { activityId, status: 'waitlisted' },
           orderBy: [{ waitlistSeq: 'asc' }, { createdAt: 'asc' }],
@@ -459,26 +463,38 @@ export class ActivityService {
     })
   }
 
-  /** 必到名单（独立于自愿报名） */
+  /** 必到名单独立保存；加入名单不报名，发布时冻结，现场签到成功才自动报名。 */
   async setRequiredParticipants(actor: SessionActor, activityId: string, userIds: string[]): Promise<void> {
     await this.db.$transaction(async (tx) => {
-      const activity = await tx.activity.findUnique({ where: { id: activityId } })
+      await tx.$executeRaw`SELECT id FROM activities WHERE id = ${activityId}::uuid FOR UPDATE`
+      const activity = await tx.activity.findUnique({ where: { id: activityId }, include: { policy: true } })
       if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
-      for (const userId of userIds) {
+      if (!['draft', 'published'].includes(activity.status)) throw new ActivityError('已取消或归档的活动不能设置必到名单', 'STATE_INVALID')
+      for (const userId of new Set(userIds)) {
         await tx.activityParticipant.upsert({
           where: { activityId_userId: { activityId, userId } },
-          create: { id: newId(), activityId, userId, required: true },
-          update: { required: true },
+          create: { id: newId(), activityId, userId, required: true, frozenAt: activity.status === 'published' ? new Date() : null },
+          update: { required: true, ...(activity.status === 'published' ? { frozenAt: new Date() } : {}) },
         })
       }
+      if (activity.status === 'published') await this.scheduleAttendanceSettlement(tx, activityId, attendanceDeadline(activity))
     })
     await this.audit.log({
       actorPrincipalId: actor.principalId,
       action: 'activity.set_required',
       resourceType: 'activity',
       resourceId: activityId,
-      summary: `设置必到名单 ${userIds.length} 人`,
+      summary: `设置必到名单 ${new Set(userIds).size} 人`,
     })
+  }
+
+  private async scheduleAttendanceSettlement(tx: Prisma.TransactionClient, activityId: string, deadline: Date) {
+    const dedupeKey = `attendance-settle:${activityId}`
+    const queued = await tx.job.findFirst({ where: { dedupeKey, status: { in: ['queued', 'running'] } } })
+    if (!queued) await tx.job.create({ data: {
+      id: newId(), type: 'activity.settle_attendance', payload: { activityId }, dedupeKey,
+      runAfter: new Date(deadline.getTime() + 1), priority: 6,
+    } })
   }
 
   /** 请假申请 */

@@ -546,13 +546,21 @@ function ActivityDetail({
                     </span>
                   )}
               </div>
-            ) : query.data.participants[0]?.required ? (
-              <StatusBadge kind="registration" value="必到名单" />
-            ) : (
+            ) : !query.data.participants[0]?.required ? (
               <p className="text-sm text-muted-foreground">当前未报名。</p>
+            ) : null}
+            {query.data.participants[0]?.required && (
+              <div className="flex flex-wrap items-center gap-2">
+                <StatusBadge kind="registration" value="必到名单" />
+                <p className="text-sm text-muted-foreground">
+                  {query.data.registrations[0]?.status === 'enrolled'
+                    ? '已报名，如需缺席请提交请假申请。'
+                    : '现场签到成功后自动报名；如需缺席请提交请假申请。出勤截止无操作将记为缺勤。'}
+                </p>
+              </div>
             )}
             <div className="flex flex-wrap gap-2">
-              {(!query.data.registrations[0] ||
+              {!query.data.participants[0]?.required && (!query.data.registrations[0] ||
                 !['enrolled', 'waitlisted', 'pending_approval'].includes(
                   query.data.registrations[0].status,
                 )) && (
@@ -566,7 +574,7 @@ function ActivityDetail({
                   报名
                 </Button>
               )}
-              {query.data.registrations[0] &&
+              {!query.data.participants[0]?.required && query.data.registrations[0] &&
                 ['enrolled', 'waitlisted', 'pending_approval'].includes(
                   query.data.registrations[0].status,
                 ) && (

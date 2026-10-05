@@ -2,19 +2,20 @@ import { beforeAll, afterAll, describe, expect, it } from 'vitest'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { ActivityService } from '../../modules/activities/activity.service.js'
-import { ActivityUserController } from '../../modules/activities/activity.controller.js'
+import { ActivityAdminController, ActivityUserController } from '../../modules/activities/activity.controller.js'
 import { AttendanceService } from '../../modules/attendance/attendance.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { VenueService } from '../../modules/venues/venue.service.js'
 import { createTestUser, makeActor, createApprovedVenue, minutesFromNow } from './helpers.js'
+import { activityUpdateSchema } from '../../modules/activities/activity.service.js'
 
 /**
  * 活动报名并发（真实 PostgreSQL）：
  * - 最后名额并发只一人 enrolled，另一人按公告候补
  * - 重复报名幂等返回原状态不重复占名额
  * - 取消释放名额→候补按顺序递补
- * - 必到名单独立于自愿报名
+ * - 必到名单不自动报名，缺席必须走请假流程
  */
 
 process.env.DATABASE_URL = TEST_URL
@@ -30,6 +31,100 @@ beforeAll(async () => {
   const jobs = new JobsService(db)
   venueService = new VenueService(db, audit)
   activities = new ActivityService(db, audit, jobs, venueService)
+})
+
+async function createEditableDraft() {
+  const actor = makeActor({ principalKind: 'system' })
+  const { versionId } = await createApprovedVenue(venueService, actor, makeActor(), { name: `编辑地点-${crypto.randomUUID().slice(0, 6)}` })
+  const input = {
+    type: 'training' as const, title: '可编辑草稿', announcement: '草稿原始公告内容',
+    startAt: minutesFromNow(60).toISOString(), endAt: minutesFromNow(180).toISOString(),
+    venueVersionIds: [versionId], primaryVenueVersionId: versionId,
+    attendancePolicy: { policy: 'QR_ONLY' as const, checkinOpenAt: minutesFromNow(45).toISOString(), checkinCloseAt: minutesFromNow(75).toISOString(), qrTtlSeconds: 90 },
+    scoringConfig: { category: 'activity', customParameter: 7 },
+    contestMeta: { preserved: true },
+  }
+  const { activityId } = await activities.createActivity(actor, input)
+  return { actor, activityId, input, versionId }
+}
+
+describe('活动草稿编辑与必填地点', () => {
+  it('所有签到策略创建时都要求选择地点，空地点数组也被校验拒绝', async () => {
+    for (const policy of ['QR_ONLY', 'GEO_OR_QR'] as const) {
+      await expect(activities.createActivity(makeActor(), {
+        type: 'training', title: '无地点草稿', announcement: '创建应当直接拒绝',
+        startAt: minutesFromNow(60).toISOString(), endAt: minutesFromNow(180).toISOString(),
+        attendancePolicy: { policy, checkinOpenAt: minutesFromNow(45).toISOString(), checkinCloseAt: minutesFromNow(75).toISOString() },
+      })).rejects.toMatchObject({ code: 'NO_VENUE' })
+    }
+    expect(activityUpdateSchema.safeParse({ expectedRevision: 1, venueVersionIds: [] }).success).toBe(false)
+  })
+
+  it('保存公告、签到策略与地点为同一事务，保留未编辑配置和毫秒时间', async () => {
+    const { actor, activityId, input } = await createEditableDraft()
+    const { versionId: replacement } = await createApprovedVenue(venueService, actor, makeActor(), { name: '编辑替换地点' })
+    const saved = await activities.updateDraft(actor, activityId, {
+      expectedRevision: 1, title: '更新后的标题', announcement: '更新后的公告内容', joinNotes: '编辑后的参加须知',
+      venueVersionIds: [replacement], primaryVenueVersionId: replacement,
+      attendancePolicy: { ...input.attendancePolicy, qrRotateSeconds: 30 },
+    })
+    expect(saved.revision).toBe(2)
+    const detail = await activities.detailForAdmin(activityId)
+    expect(detail).toMatchObject({ title: '更新后的标题', status: 'draft', scoringConfig: input.scoringConfig, contestMeta: input.contestMeta, venueVersionId: replacement })
+    expect(detail.startAt.toISOString()).toBe(input.startAt)
+    expect(detail.venueBindings.map((binding) => binding.venueVersionId)).toEqual([replacement])
+    expect(detail.policy).toMatchObject({ qrRotateSeconds: 30, qrTtlSeconds: 90, version: 2 })
+    expect(await db.auditLog.count({ where: { action: 'activity.update', resourceId: activityId, actorPrincipalId: actor.principalId } })).toBe(1)
+  })
+
+  it('同一版本并发保存仅一个成功，过期版本不会覆盖别人修改', async () => {
+    const { actor, activityId } = await createEditableDraft()
+    const results = await Promise.allSettled([
+      activities.updateDraft(actor, activityId, { expectedRevision: 1, title: '并发修改甲' }),
+      activities.updateDraft(actor, activityId, { expectedRevision: 1, title: '并发修改乙' }),
+    ])
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
+    expect((results.find((result) => result.status === 'rejected') as PromiseRejectedResult).reason.code).toBe('REVISION_CONFLICT')
+    expect((await activities.detailForAdmin(activityId)).revision).toBe(2)
+  })
+
+  it('非法时间或主地点不属于绑定集合时回滚；非草稿禁止编辑', async () => {
+    const { actor, activityId } = await createEditableDraft()
+    await expect(activities.updateDraft(actor, activityId, { expectedRevision: 1, title: '不得部分保存', endAt: minutesFromNow(10).toISOString() })).rejects.toMatchObject({ code: 'TIME_ORDER' })
+    await expect(activities.updateDraft(actor, activityId, { expectedRevision: 1, primaryVenueVersionId: crypto.randomUUID() })).rejects.toMatchObject({ code: 'VENUE_MISMATCH' })
+    expect((await activities.detailForAdmin(activityId))).toMatchObject({ title: '可编辑草稿', revision: 1 })
+    for (const status of ['published', 'cancelled', 'archived']) {
+      await db.activity.update({ where: { id: activityId }, data: { status } })
+      await expect(activities.updateDraft(actor, activityId, { expectedRevision: 1, title: '不得修改' })).rejects.toMatchObject({ code: 'NOT_DRAFT' })
+    }
+  })
+
+  it('保存与发布共用锁，发布快照匹配最终绑定地点', async () => {
+    const { actor, activityId, versionId } = await createEditableDraft()
+    const { versionId: replacement } = await createApprovedVenue(venueService, actor, makeActor(), { name: '并发发布替换地点' })
+    const [edit, publication] = await Promise.allSettled([
+      activities.updateDraft(actor, activityId, { expectedRevision: 1, venueVersionIds: [replacement], primaryVenueVersionId: replacement }),
+      activities.publish(actor, activityId),
+    ])
+    expect(publication.status).toBe('fulfilled')
+    const detail = await activities.detailForAdmin(activityId)
+    expect(detail.status).toBe('published')
+    expect(detail.venueBindings).toHaveLength(1)
+    expect(detail.venueBindings[0].venueVersionId).toBe(edit.status === 'fulfilled' ? replacement : versionId)
+    expect(detail.venueBindings[0].fenceSnapshot).toBeTruthy()
+    if (edit.status === 'rejected') expect(edit.reason.code).toBe('NOT_DRAFT')
+  })
+
+  it('旧的无地点草稿不能发布，编辑补地点后可发布，包括纯二维码策略', async () => {
+    const { actor, activityId, versionId } = await createEditableDraft()
+    await db.activityVenueBinding.deleteMany({ where: { activityId } })
+    await db.activity.update({ where: { id: activityId }, data: { venueVersionId: null } })
+    await expect(activities.publish(actor, activityId)).rejects.toMatchObject({ code: 'NO_VENUE' })
+    await expect(activities.updateDraft(actor, activityId, { expectedRevision: 1, title: '仍缺地点' })).rejects.toMatchObject({ code: 'NO_VENUE' })
+    await activities.updateDraft(actor, activityId, { expectedRevision: 1, venueVersionIds: [versionId], primaryVenueVersionId: versionId })
+    await activities.publish(actor, activityId)
+    expect((await activities.detailForAdmin(activityId)).status).toBe('published')
+  })
 })
 
 afterAll(async () => {
@@ -130,15 +225,46 @@ describe('报名并发与候补', () => {
     await expect(activities.register(u.userId, activityId)).rejects.toMatchObject({ code: 'REG_CLOSED' })
   })
 
-  it('必到名单独立：未报名的必到成员不产生报名记录，但可设 required', async () => {
+  it('设置必到名单不自动报名；重复设置幂等，必到成员可直接请假', async () => {
     const activityId = await createPublishedActivity({ capacity: 1 })
     const u = await createTestUser(db, { studentNo: '202602007' })
     const manager = makeActor()
     await activities.setRequiredParticipants(manager, activityId, [u.userId])
+    await activities.setRequiredParticipants(manager, activityId, [u.userId, u.userId])
     const participant = await db.activityParticipant.findUnique({ where: { activityId_userId: { activityId, userId: u.userId } } })
     expect(participant!.required).toBe(true)
-    const regCount = await db.activityRegistration.count({ where: { activityId, userId: u.userId } })
-    expect(regCount).toBe(0) // 名单不等于报名
+    expect(participant!.frozenAt).not.toBeNull()
+    expect(await db.activityParticipant.count({ where: { activityId } })).toBe(1)
+    expect(await db.activityRegistration.count({ where: { activityId, userId: u.userId } })).toBe(0)
+    await activities.requestLeave(u.userId, activityId, '课程冲突')
+    expect(await db.leaveRequest.findUnique({ where: { activityId_userId: { activityId, userId: u.userId } } })).toMatchObject({ status: 'pending' })
+    await activities.register(u.userId, activityId)
+    await expect(activities.cancelRegistration(u.userId, activityId)).rejects.toMatchObject({ code: 'REQUIRED_PARTICIPANT' })
+    expect(await db.activityRegistration.findUnique({ where: { activityId_userId: { activityId, userId: u.userId } } })).toMatchObject({ status: 'enrolled' })
+    const attendance = await new ActivityAdminController(activities, db).attendanceList(activityId)
+    expect(attendance.data.items).toHaveLength(1)
+    expect(attendance.data.items[0]).toMatchObject({ userId: u.userId, required: true, regStatus: 'enrolled' })
+  })
+
+  it('草稿设置名单和发布只冻结出勤义务，不产生报名记录', async () => {
+    const { actor, activityId } = await createEditableDraft()
+    const user = await createTestUser(db, { studentNo: crypto.randomUUID() })
+    await activities.setRequiredParticipants(actor, activityId, [user.userId])
+    expect(await db.activityParticipant.findUnique({ where: { activityId_userId: { activityId, userId: user.userId } } })).toMatchObject({ frozenAt: null })
+    await activities.publish(actor, activityId)
+    expect(await db.activityRegistration.count({ where: { activityId } })).toBe(0)
+    expect(await db.activityParticipant.count({ where: { activityId, required: true, frozenAt: { not: null } } })).toBe(1)
+  })
+
+  it('名单包含不存在的成员时全部回滚；取消或归档活动不能设置名单', async () => {
+    const activityId = await createPublishedActivity({ capacity: 1 })
+    const user = await createTestUser(db, { studentNo: crypto.randomUUID() })
+    await expect(activities.setRequiredParticipants(makeActor(), activityId, [user.userId, crypto.randomUUID()])).rejects.toThrow()
+    expect(await db.activityParticipant.count({ where: { activityId } })).toBe(0)
+    for (const status of ['cancelled', 'archived']) {
+      await db.activity.update({ where: { id: activityId }, data: { status } })
+      await expect(activities.setRequiredParticipants(makeActor(), activityId, [user.userId])).rejects.toMatchObject({ code: 'STATE_INVALID' })
+    }
   })
 
   it('用户活动目录与详情仅返回本人报名状态，mine 排除其他成员的活动', async () => {
