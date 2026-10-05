@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowLeftIcon, CheckIcon, ExpandIcon, LoaderCircleIcon, MinimizeIcon, RefreshCwIcon, ScanLineIcon } from 'lucide-react';
+import { ArrowLeftIcon, CheckIcon, ClockIcon, ExpandIcon, LoaderCircleIcon, MinimizeIcon, RefreshCwIcon, ScanLineIcon } from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
@@ -26,6 +26,9 @@ interface BoardActivity {
 interface BoardAttendance {
   checkedIn: number;
   checkedOut: number;
+  registeredTotal: number;
+  pendingTotal: number;
+  pendingCheckins: Array<{ userId: string; name: string; studentNo: string }>;
   recentCheckins: Array<{ userId: string; name: string; acceptedAt: string }>;
   updatedAt: string;
 }
@@ -211,39 +214,69 @@ export function AttendanceQrBoard({ activity, principalId, wasFullscreen, onClos
               <time dateTime={clock.toISOString()} className="qr-board-clock block font-medium tracking-tight tabular-nums">{timeFormatter.format(clock)}</time>
               <p className="mt-2 text-sm tracking-wider text-slate-500">{dateFormatter.format(clock)} · 北京时间</p>
             </div>
-            <div className="grid grid-cols-2 gap-3" aria-label="现场出勤统计">
-              <div className="rounded-lg border border-slate-200 bg-white p-5">
-                <p className="text-sm text-slate-600">已签到</p>
-                <p className="mt-3 text-4xl font-semibold text-blue-700 tabular-nums xl:text-5xl" data-slot="board-checked-in">{attendance.data?.checkedIn ?? '—'}<span className="ml-2 text-sm font-normal text-slate-500">人</span></p>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3" aria-label="现场出勤统计">
+              <div className="rounded-lg border border-slate-200 bg-white p-4 sm:p-5">
+                <p className="text-sm text-slate-600">报名</p>
+                <p className="mt-3 text-3xl font-semibold text-slate-900 tabular-nums xl:text-4xl" data-slot="board-registered">{attendance.data?.registeredTotal ?? '—'}<span className="ml-2 text-sm font-normal text-slate-500">人</span></p>
               </div>
-              <div className="rounded-lg border border-slate-200 bg-white p-5">
+              <div className="rounded-lg border border-slate-200 bg-white p-4 sm:p-5">
+                <p className="text-sm text-slate-600">已签到</p>
+                <p className="mt-3 text-3xl font-semibold text-blue-700 tabular-nums xl:text-4xl" data-slot="board-checked-in">{attendance.data?.checkedIn ?? '—'}<span className="ml-2 text-sm font-normal text-slate-500">人</span></p>
+              </div>
+              <div className="rounded-lg border border-slate-200 bg-white p-4 sm:p-5">
                 <p className="text-sm text-slate-600">已签退</p>
-                <p className="mt-3 text-4xl font-semibold text-slate-900 tabular-nums xl:text-5xl" data-slot="board-checked-out">{attendance.data?.checkedOut ?? '—'}<span className="ml-2 text-sm font-normal text-slate-500">人</span></p>
+                <p className="mt-3 text-3xl font-semibold text-slate-900 tabular-nums xl:text-4xl" data-slot="board-checked-out">{attendance.data?.checkedOut ?? '—'}<span className="ml-2 text-sm font-normal text-slate-500">人</span></p>
               </div>
             </div>
-            <section className="flex min-h-0 flex-1 flex-col rounded-lg border border-slate-200 bg-white" aria-label="已签到成员">
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-4">
-                <h2 className="text-base font-medium">已签到成员 <span className="ml-1 text-xs font-normal text-slate-500">最近 24 位</span></h2>
-                <span className={`flex items-center gap-2 text-xs ${syncStale ? 'text-amber-700' : 'text-blue-700'}`} role="status"><span className={`size-1.5 rounded-full ${syncStale ? 'bg-amber-600' : 'bg-blue-700'}`} />{syncStale ? '更新暂停' : attendance.isPending ? '正在连接' : '每 3 秒更新'}</span>
-              </div>
-              <div className="qr-board-members min-h-0 flex-1 overflow-y-auto p-3">
-                {attendance.data?.recentCheckins.length ? (
-                  <ul className="divide-y divide-slate-100">
-                    {attendance.data.recentCheckins.map(member => (
-                      <li key={member.userId} className="flex items-center gap-3 px-2 py-3.5">
-                        <CheckIcon className="size-4 shrink-0 text-blue-700" aria-hidden="true" />
-                        <span className="min-w-0 flex-1 truncate text-base text-slate-900">{member.name}</span>
-                        <time dateTime={member.acceptedAt} className="shrink-0 text-sm text-slate-500 tabular-nums">{timeFormatter.format(new Date(member.acceptedAt))}</time>
-                      </li>
-                    ))}
-                  </ul>
-                ) : <p className="px-3 py-10 text-center text-sm text-slate-500" role={attendance.isError ? 'alert' : undefined}>{!online ? attendanceError : attendance.isPending ? '正在加载签到名单…' : attendance.isError ? attendanceError : '等待第一位成员签到'}</p>}
-              </div>
-              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-5 py-3 text-xs text-slate-500">
-                <span>{!online ? '网络恢复后自动重试' : attendance.isError ? attendanceError : syncStale ? '正在重新获取签到记录' : attendance.data ? `更新于 ${timeFormatter.format(new Date(attendance.data.updatedAt))}` : '正在获取现场记录'}</span>
-                <button type="button" className="flex items-center gap-1.5 text-slate-600 hover:text-slate-900 disabled:opacity-50" disabled={attendance.isFetching || !online} onClick={() => void attendance.refetch()}><RefreshCwIcon className={`size-3.5 ${attendance.isFetching ? 'animate-spin' : ''}`} aria-hidden="true" />刷新名单</button>
-              </div>
-            </section>
+            <div className="flex min-h-0 flex-1 flex-col gap-3 xl:flex-row">
+              <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-lg border border-slate-200 bg-white" aria-label="已签到成员">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-4">
+                  <h2 className="text-base font-medium">已签到成员 <span className="ml-1 text-xs font-normal text-slate-500">最近 24 位</span></h2>
+                  <span className={`flex items-center gap-2 text-xs ${syncStale ? 'text-amber-700' : 'text-blue-700'}`} role="status"><span className={`size-1.5 rounded-full ${syncStale ? 'bg-amber-600' : 'bg-blue-700'}`} />{syncStale ? '更新暂停' : attendance.isPending ? '正在连接' : '每 3 秒更新'}</span>
+                </div>
+                <div className="qr-board-members min-h-0 flex-1 overflow-y-auto p-3">
+                  {attendance.data?.recentCheckins.length ? (
+                    <ul className="divide-y divide-slate-100">
+                      {attendance.data.recentCheckins.map(member => (
+                        <li key={member.userId} className="flex items-center gap-3 px-2 py-3.5">
+                          <CheckIcon className="size-4 shrink-0 text-blue-700" aria-hidden="true" />
+                          <span className="min-w-0 flex-1 truncate text-base text-slate-900">{member.name}</span>
+                          <time dateTime={member.acceptedAt} className="shrink-0 text-sm text-slate-500 tabular-nums">{timeFormatter.format(new Date(member.acceptedAt))}</time>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : <p className="px-3 py-10 text-center text-sm text-slate-500" role={attendance.isError ? 'alert' : undefined}>{!online ? attendanceError : attendance.isPending ? '正在加载签到名单…' : attendance.isError ? attendanceError : '等待第一位成员签到'}</p>}
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-200 px-5 py-3 text-xs text-slate-500">
+                  <span>{!online ? '网络恢复后自动重试' : attendance.isError ? attendanceError : syncStale ? '正在重新获取签到记录' : attendance.data ? `更新于 ${timeFormatter.format(new Date(attendance.data.updatedAt))}` : '正在获取现场记录'}</span>
+                  <button type="button" className="flex items-center gap-1.5 text-slate-600 hover:text-slate-900 disabled:opacity-50" disabled={attendance.isFetching || !online} onClick={() => void attendance.refetch()}><RefreshCwIcon className={`size-3.5 ${attendance.isFetching ? 'animate-spin' : ''}`} aria-hidden="true" />刷新名单</button>
+                </div>
+              </section>
+              <section className="flex min-h-0 min-w-0 flex-1 flex-col rounded-lg border border-slate-200 bg-white" aria-label="报名未到成员">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-4">
+                  <h2 className="text-base font-medium" title="报名与必到名单，已排除获批请假/远程参赛">报名未到 <span className="ml-1 text-xs font-normal text-slate-500">{(attendance.data?.pendingTotal ?? 0) > (attendance.data?.pendingCheckins?.length ?? 0) ? '前 48 位' : '按学号排序'}</span></h2>
+                  <span className="text-sm font-medium text-amber-700 tabular-nums" data-slot="board-pending">{attendance.data?.pendingTotal ?? '—'} 人</span>
+                </div>
+                <div className="qr-board-members min-h-0 flex-1 overflow-y-auto p-3">
+                  {attendance.data?.pendingCheckins?.length ? (
+                    <ul className="divide-y divide-slate-100">
+                      {attendance.data.pendingCheckins.map(member => (
+                        <li key={member.userId} className="flex items-center gap-3 px-2 py-3.5">
+                          <ClockIcon className="size-4 shrink-0 text-amber-600" aria-hidden="true" />
+                          <span className="min-w-0 flex-1 truncate text-base text-slate-900">{member.name}</span>
+                          <span className="shrink-0 text-sm text-slate-500 tabular-nums">{member.studentNo}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : <p className="px-3 py-10 text-center text-sm text-slate-500" role={attendance.isError ? 'alert' : undefined}>{!online ? attendanceError : attendance.isPending ? '正在加载应到名单…' : attendance.isError ? attendanceError : '应到成员均已到场'}</p>}
+                </div>
+                {(attendance.data?.pendingTotal ?? 0) > (attendance.data?.pendingCheckins?.length ?? 0) && (
+                  <div className="border-t border-slate-200 px-5 py-3 text-xs text-slate-500">
+                    共 {attendance.data?.pendingTotal} 人未到，仅展示前 48 位
+                  </div>
+                )}
+              </section>
+            </div>
           </aside>
         </main>
         {fullscreenError && <p role="status" className="relative px-4 pb-3 text-center text-xs text-amber-700">{fullscreenError}</p>}

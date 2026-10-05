@@ -43,7 +43,7 @@ async function checkViewport(width, height, fullChecks = false) {
     else if (path.endsWith('/attendance/board')) {
       boardRequests++;
       if (failBoard) return route.fulfill({ status: failBoardStatus, json: { error: { code: 'UNAVAILABLE', message: '名单更新暂时失败' } } });
-      data = { checkedIn: arrivals, checkedOut: 3, updatedAt: new Date().toISOString(), recentCheckins: Array.from({ length: arrivals }, (_, i) => ({ userId: `member-${i}`, name: i === 0 && arrivals === 13 ? '新签到成员' : ['林同学', '陈同学', '王同学', '李同学'][i % 4] + (Math.floor(i / 4) || ''), acceptedAt: new Date(instant - i * 10_000).toISOString() })) };
+      data = { checkedIn: arrivals, checkedOut: 3, registeredTotal: 15, pendingTotal: 15 - arrivals, updatedAt: new Date().toISOString(), recentCheckins: Array.from({ length: arrivals }, (_, i) => ({ userId: `member-${i}`, name: i === 0 && arrivals === 13 ? '新签到成员' : ['林同学', '陈同学', '王同学', '李同学'][i % 4] + (Math.floor(i / 4) || ''), acceptedAt: new Date(instant - i * 10_000).toISOString() })), pendingCheckins: [{ userId: 'pending-1', name: '赵同学', studentNo: '202600021' }, { userId: 'pending-2', name: '钱同学', studentNo: '202600022' }] };
     } else if (path.endsWith('/attendance/qr')) {
       qrRequests++;
       const input = route.request().postDataJSON();
@@ -76,6 +76,9 @@ async function checkViewport(width, height, fullChecks = false) {
       arrivals = 13;
       await board.getByText('新签到成员', { exact: true }).waitFor({ timeout: 6000 });
       assert.match(await board.locator('[data-slot="board-checked-in"]').textContent(), /^13/);
+      assert.match(await board.locator('[data-slot="board-registered"]').textContent(), /^15/);
+      assert.match(await board.locator('[data-slot="board-pending"]').textContent(), /^2/);
+      await board.getByText('赵同学', { exact: true }).waitFor();
       assert.notEqual(await board.locator('time').first().textContent(), originalClock, 'clock ticks');
       assert.ok(qrRequests > 1, 'QR automatically rotates');
 

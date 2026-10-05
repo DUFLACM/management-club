@@ -5,6 +5,7 @@ import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newInvitationSecret } from '../auth/auth.service.js'
 import { newId, sha256Hex, monthKey } from '../../common/utils.js'
 import { computeEffectiveScore, formalQuota, graceMonths } from '@acm/scoring-core'
+import type { Prisma } from '@acm/db'
 import type { SessionActor } from '../auth/session.service.js'
 
 /**
@@ -15,6 +16,22 @@ export class MembersError extends DomainError {
   constructor(message: string, readonly code: string) {
     super(message, code)
   }
+}
+
+/** MembershipTerm.membershipStatus 全集（直接调整身份用） */
+export const MEMBERSHIP_STATUSES = [
+  'applicant', 'observing', 'provisional', 'formal', 'honorary_retired', 'withdrawn', 'dismissed', 'vetoed',
+] as const
+export type MembershipStatus = (typeof MEMBERSHIP_STATUSES)[number]
+
+/** 与 MembershipTransition.decision 取值对齐：降/退/除名类走对应 decision，其余视为晋升 */
+function transitionDecision(status: MembershipStatus): string {
+  if (status === 'withdrawn') return 'withdraw'
+  if (status === 'dismissed') return 'dismiss'
+  if (status === 'vetoed') return 'veto'
+  if (status === 'honorary_retired') return 'retire'
+  if (status === 'applicant') return 'demote'
+  return 'promote'
 }
 
 @Injectable()
@@ -252,6 +269,80 @@ export class MembersService {
     void nextStatus
   }
 
+  /** 直接调整身份（members.manage）：记录 transition 与审计；无 term 时按当前学期补建 */
+  async setMembership(actor: SessionActor, userId: string, status: MembershipStatus, reason: string): Promise<void> {
+    if (actor.userId === userId) throw new MembersError('不能调整本人身份', 'RECUSED')
+    const term = await this.db.membershipTerm.findFirst({ where: { userId }, orderBy: { createdAt: 'desc' } })
+    if (term?.membershipStatus === status) throw new MembersError('当前已是该身份，无需调整', 'STATE_INVALID')
+    const now = new Date()
+    await this.db.$transaction(async (tx) => {
+      if (term) {
+        await tx.membershipTerm.update({ where: { id: term.id }, data: { membershipStatus: status, basis: reason, effectiveFrom: now } })
+      } else {
+        await tx.membershipTerm.create({
+          data: { id: newId(), userId, semesterId: await currentSemesterId(tx), membershipStatus: status, basis: reason, effectiveFrom: now },
+        })
+      }
+      await tx.membershipTransition.create({
+        data: {
+          id: newId(), userId, fromStatus: term?.membershipStatus ?? null, toStatus: status,
+          decision: transitionDecision(status), reason, effectiveFrom: now, decidedBy: actor.principalId,
+        },
+      })
+      await tx.auditLog.create({
+        data: {
+          id: newId(), actorPrincipalId: actor.principalId, action: 'members.membership_set', resourceType: 'user', resourceId: userId,
+          summary: `直接调整身份为 ${status}：${reason.slice(0, 200)}`,
+        },
+      })
+    })
+  }
+
+  /** 管理端更改成员平台绑定账号：换绑账号后持有关系未证，回到待核验 */
+  async updateMemberPlatformAccount(actor: SessionActor, userId: string, accountId: string, input: { externalId: string; displayHandle?: string }): Promise<void> {
+    const account = await this.db.platformAccount.findUnique({ where: { id: accountId } })
+    if (!account || account.userId !== userId) throw new MembersError('绑定不存在', 'NOT_FOUND')
+    if (account.status === 'revoked') throw new MembersError('该绑定已解绑，请让成员重新提交绑定申请', 'STATE_INVALID')
+    const canonical = input.externalId.trim()
+    if (!/^[A-Za-z0-9_.-]{2,64}$/.test(canonical)) throw new MembersError('仅接受平台 UID/handle 字符（2-64 位）', 'INVALID_EXTERNAL_ID')
+    const changed = canonical !== account.externalId
+    const displayHandle = input.displayHandle?.trim() || canonical
+    try {
+      await this.db.platformAccount.update({
+        where: { id: accountId },
+        data: {
+          externalId: canonical,
+          displayHandle,
+          ...(changed ? { status: 'pending_review', verifiedBy: null, verifiedAt: null, proofSummary: `管理端更改绑定账号（原 ${account.externalId}），待重新核验持有` } : {}),
+        },
+      })
+    } catch {
+      throw new MembersError('该平台账号已绑定其他成员（活跃绑定唯一）', 'ALREADY_BOUND_OTHER')
+    }
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'members.platform_account_update',
+      resourceType: 'platform_account',
+      resourceId: accountId,
+      summary: `更改成员平台绑定：${account.platform} ${account.externalId} → ${canonical}${changed ? '（回到待核验）' : '（仅改显示名）'}`,
+    })
+  }
+
+  /** 管理端解绑（软删除）成员平台账号：保留历史成绩与 rating 序列 */
+  async revokeMemberPlatformAccount(actor: SessionActor, userId: string, accountId: string): Promise<void> {
+    const account = await this.db.platformAccount.findUnique({ where: { id: accountId } })
+    if (!account || account.userId !== userId) throw new MembersError('绑定不存在', 'NOT_FOUND')
+    if (account.status === 'revoked') throw new MembersError('该绑定已解绑', 'STATE_INVALID')
+    await this.db.platformAccount.update({ where: { id: accountId }, data: { status: 'revoked', validUntil: new Date() } })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'members.platform_account_revoke',
+      resourceType: 'platform_account',
+      resourceId: accountId,
+      summary: `解绑成员平台账号：${account.platform} ${account.externalId}`,
+    })
+  }
+
   /** 月度身份评定预览（候选，不自动改身份；04 方案 7） */
   async monthlyEvaluationPreview(month: string) {
     const users = await this.db.user.findMany({
@@ -428,4 +519,15 @@ export class MembersService {
     const nextCursor = rows.length > 50 ? rows.pop()!.id : undefined
     return { items: rows, nextCursor }
   }
+}
+
+/** 无任何 term 的存量用户直接设身份时，落当前学期（与注册流程一致） */
+async function currentSemesterId(tx: Prisma.TransactionClient): Promise<string> {
+  const now = new Date()
+  const semester = await tx.semester.findFirst({ where: { startsOn: { lte: now } }, orderBy: { startsOn: 'desc' } })
+  if (semester) return semester.id
+  const created = await tx.semester.create({
+    data: { id: newId(), code: 'DEFAULT', name: '默认学期（初始化）', startsOn: new Date('2026-01-01'), endsOn: new Date('2027-01-01') },
+  })
+  return created.id
 }

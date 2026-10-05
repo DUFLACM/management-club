@@ -145,6 +145,8 @@ export const MEMBERSHIP_LABELS: Record<string, string> = {
   applicant: '申请中',
   rejected_input: '已驳回',
   withdrawn: '已退出',
+  dismissed: '已除名',
+  vetoed: '一票否决',
   honorary_retired: '荣誉退役',
   unknown: '未知',
 };

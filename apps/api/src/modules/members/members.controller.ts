@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
 import { z } from 'zod'
 import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentUser, CurrentActor, ok } from '../../common/guards.js'
-import { MembersService } from './members.service.js'
+import { MembersService, MembersError, MEMBERSHIP_STATUSES } from './members.service.js'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import type { SessionActor } from '../auth/session.service.js'
 
@@ -89,6 +89,46 @@ export class MembersAdminController {
     const parsed = z.object({ decision: z.enum(['admit', 'reject']), reason: z.string().min(3).max(500) }).parse(body)
     await this.members.reviewMembership(actor, id, parsed.decision, parsed.reason)
     return ok({ decided: true })
+  }
+
+  /** 直接调整身份（presidium）：记录流转与审计，不能操作本人 */
+  @Post('members/:id/membership')
+  @RequireAction('members.manage')
+  async setMembership(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ status: z.enum(MEMBERSHIP_STATUSES), reason: z.string().min(3).max(500) }).safeParse(body)
+    if (!parsed.success) throw new MembersError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    await this.members.setMembership(actor, id, parsed.data.status, parsed.data.reason)
+    return ok({ updated: true })
+  }
+
+  /** 更改成员平台绑定账号（换绑账号回到待核验；仅改显示名保持原状态） */
+  @Post('members/:id/platform-accounts/:accountId')
+  @RequireAction('members.manage')
+  async updatePlatformAccount(
+    @CurrentActor() actor: SessionActor,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('accountId', ParseUUIDPipe) accountId: string,
+    @Body() body: unknown,
+  ) {
+    const parsed = z.object({
+      externalId: z.string().min(2).max(64),
+      displayHandle: z.string().max(64).optional(),
+    }).safeParse(body)
+    if (!parsed.success) throw new MembersError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    await this.members.updateMemberPlatformAccount(actor, id, accountId, parsed.data)
+    return ok({ updated: true })
+  }
+
+  /** 解绑（软删除）成员平台账号：保留历史成绩，可重新绑定 */
+  @Post('members/:id/platform-accounts/:accountId/revoke')
+  @RequireAction('members.manage')
+  async revokePlatformAccount(
+    @CurrentActor() actor: SessionActor,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Param('accountId', ParseUUIDPipe) accountId: string,
+  ) {
+    await this.members.revokeMemberPlatformAccount(actor, id, accountId)
+    return ok({ revoked: true })
   }
 
   @Get('membership-evaluation')

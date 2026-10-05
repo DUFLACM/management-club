@@ -80,7 +80,9 @@ pnpm --filter @acm/web exec node scripts/sidebar-layout-check.mjs
 | 完赛材料、晋级资格与自动积分 | 材料核验、有效提交/参赛、晋级队员资格及自动入账链未接；networkQualifierScore 有纯函数测试，但 API /Worker 未调用 |
 | Hydro pull Worker | `apps/worker/src/handlers.ts` 中拉取处理器仍为占位；插件可构建/协议测试通过不代表拉取链完成 |
 
-关键位置为 `apps/web/src/workspaces/member/panels/ContestsPanel.tsx`、`apps/api/src/modules/activities/activity.service.ts`、`apps/api/src/modules/attendance/attendance.admin.controller.ts`、`apps/worker/src/handlers.ts` 与 `packages/scoring-core/src/award-score.ts`。以上是需要补开发的软件缺口，与校方白名单、真实实例和 R01–R13 制度未决分别记录；本轮只做只读审计，未擅自实现新的制度解释或竞赛流程。
+关键位置为 `apps/web/src/workspaces/member/panels/ContestsPanel.tsx`、`apps/api/src/modules/activities/activity.service.ts`、`apps/api/src/modules/attendance/attendance.admin.controller.ts`、`apps/worker/src/handlers.ts` 与 `packages/scoring-core/src/award-score.ts`。
+
+注意一下那个活动也要有可以选择牛客 cf atcoder /学校 oj 竞赛的选项，活动然后活动详情页面我觉得需要做出改变首页页面不适配活动详情怎么敢做全屏覆盖的，然后你的活动详情里面应该有文件功能来上传本次讲题的文件题解 然后比赛名字牛客 cf atcoder /学校 oj  这些做一个卡片可以直接跳到对应比赛页面 然后签入签出那个状态页面可以直接整合到这里 不需要那个冗杂页面 这个详情页面样式建议全部重构
 
 ## 4. 已踩过的坑
 

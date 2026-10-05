@@ -20,13 +20,13 @@ export class AttendanceAdminController {
     private readonly audit: AuditService,
   ) {}
 
-  /** 大屏统计直接读取已接受检查点，最近名单有界，人数不受名单长度影响。 */
+  /** 大屏统计直接读取已接受检查点与报名/必到名单，最近名单有界，人数不受名单长度影响。 */
   @Get('activities/:id/attendance/board')
   @RequireAction('attendance.qr')
   async board(@Param('id', ParseUUIDPipe) id: string) {
     const activity = await this.db.activity.findUnique({ where: { id }, select: { id: true } })
     if (!activity) throw new AttendanceError('活动不存在', 'NOT_FOUND')
-    const [checkedIn, checkedOut, recent] = await this.db.$transaction([
+    const [checkedIn, checkedOut, recent, allCheckins, enrolled, required, leaves, remotes] = await this.db.$transaction([
       this.db.attendanceCheckpoint.count({ where: { activityId: id, checkpoint: 'IN' } }),
       this.db.attendanceCheckpoint.count({ where: { activityId: id, checkpoint: 'OUT' } }),
       this.db.attendanceCheckpoint.findMany({
@@ -35,10 +35,35 @@ export class AttendanceAdminController {
         take: 24,
         select: { userId: true, acceptedAt: true, user: { select: { verifiedRealName: true } } },
       }),
+      this.db.attendanceCheckpoint.findMany({ where: { activityId: id, checkpoint: 'IN' }, select: { userId: true } }),
+      this.db.activityRegistration.findMany({
+        where: { activityId: id, status: 'enrolled' },
+        select: { userId: true, user: { select: { verifiedRealName: true, studentNo: true } } },
+      }),
+      this.db.activityParticipant.findMany({
+        where: { activityId: id, required: true },
+        select: { userId: true, user: { select: { verifiedRealName: true, studentNo: true } } },
+      }),
+      this.db.leaveRequest.findMany({ where: { activityId: id, status: 'approved' }, select: { userId: true } }),
+      this.db.remotePermission.findMany({ where: { activityId: id, status: 'approved' }, select: { userId: true } }),
     ], { isolationLevel: 'RepeatableRead' })
+    // 应到 = 已报名（enrolled）∪ 必到名单；未到 = 应到中无 IN 检查点且无已批请假/远程
+    const checkedInSet = new Set(allCheckins.map((row) => row.userId))
+    const excused = new Set([...leaves, ...remotes].map((row) => row.userId))
+    const roster = new Map<string, { name: string; studentNo: string }>()
+    for (const row of enrolled) roster.set(row.userId, { name: row.user.verifiedRealName ?? '成员', studentNo: row.user.studentNo })
+    for (const row of required) {
+      if (!roster.has(row.userId)) roster.set(row.userId, { name: row.user.verifiedRealName ?? '成员', studentNo: row.user.studentNo })
+    }
+    const pendingAll = [...roster.entries()]
+      .filter(([userId]) => !checkedInSet.has(userId) && !excused.has(userId))
+      .sort((a, b) => a[1].studentNo.localeCompare(b[1].studentNo))
     return ok({
       checkedIn,
       checkedOut,
+      registeredTotal: roster.size,
+      pendingTotal: pendingAll.length,
+      pendingCheckins: pendingAll.slice(0, 48).map(([userId, info]) => ({ userId, name: info.name, studentNo: info.studentNo })),
       recentCheckins: recent.map((row) => ({
         userId: row.userId, name: row.user.verifiedRealName ?? '成员', acceptedAt: row.acceptedAt.toISOString(),
       })),

@@ -1,7 +1,8 @@
 /**
  * 管理端 · 成员：GET /admin/members?q=&status=&cursor=（members.read）。
  * 表头 40px、行 56px 约 7 列；详情 Sheet GET /admin/members/:id；
- * 入社审批 POST membership-decision；月评预览 GET /admin/membership-evaluation。
+ * 入社审批 POST membership-decision；直接调整身份 POST membership（members.manage）；
+ * 平台绑定更改/解绑 POST platform-accounts/:accountId(/revoke)；月评预览 GET /admin/membership-evaluation。
  */
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
@@ -63,7 +64,13 @@ interface MemberDetailDto {
     createdAt: string;
   }>;
   restrictions: Array<{ id: string; type: string; reason: string | null; endsAt: string | null; revokedAt: string | null }>;
-  platformAccounts: Array<{ id: string; platform: string; displayHandle: string | null; status: string }>;
+  platformAccounts: Array<{
+    id: string;
+    platform: string;
+    externalId: string;
+    displayHandle: string | null;
+    status: string;
+  }>;
   registrations: Array<{
     id: string;
     status: string;
@@ -93,6 +100,15 @@ const STATUS_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'observing', label: '考察成员' },
   { value: 'applicant', label: '申请中' },
   { value: 'withdrawn', label: '已退出' },
+];
+
+/** 直接调整身份的可选目标（含低频终态） */
+const ADJUST_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  ...STATUS_OPTIONS.slice(0, 4),
+  { value: 'honorary_retired', label: '荣誉退役' },
+  { value: 'withdrawn', label: '已退出' },
+  { value: 'dismissed', label: '已除名' },
+  { value: 'vetoed', label: '一票否决' },
 ];
 
 function MembershipBadge({ status }: { status: string }) {
@@ -312,6 +328,14 @@ function MemberDetail({
   const queryClient = useQueryClient();
   const [reason, setReason] = useState('');
   const [actionError, setActionError] = useState<string | null>(null);
+  const [adjustStatus, setAdjustStatus] = useState('');
+  const [adjustReason, setAdjustReason] = useState('');
+  const [editingAccount, setEditingAccount] = useState<{
+    id: string;
+    externalId: string;
+    displayHandle: string;
+  } | null>(null);
+  const [armedRevokeId, setArmedRevokeId] = useState<string | null>(null);
 
   const query = usePrivateQuery<MemberDetailDto, ApiError>(
     principalId,
@@ -334,8 +358,48 @@ function MemberDetail({
     onError: (error: ApiError) => setActionError(error.message),
   });
 
+  const membershipMutation = useMutation({
+    mutationFn: async (input: { status: string; reason: string }) => {
+      await api.post(`/admin/members/${memberId}/membership`, input);
+    },
+    onSuccess: () => {
+      setActionError(null);
+      setAdjustReason('');
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (error: ApiError) => setActionError(error.message),
+  });
+
+  const platformUpdateMutation = useMutation({
+    mutationFn: async (input: { id: string; externalId: string; displayHandle: string }) => {
+      await api.post(`/admin/members/${memberId}/platform-accounts/${input.id}`, {
+        externalId: input.externalId.trim(),
+        displayHandle: input.displayHandle.trim() || undefined,
+      });
+    },
+    onSuccess: () => {
+      setActionError(null);
+      setEditingAccount(null);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (error: ApiError) => setActionError(error.message),
+  });
+
+  const platformRevokeMutation = useMutation({
+    mutationFn: async (accountId: string) => {
+      await api.post(`/admin/members/${memberId}/platform-accounts/${accountId}/revoke`);
+    },
+    onSuccess: () => {
+      setActionError(null);
+      setArmedRevokeId(null);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (error: ApiError) => setActionError(error.message),
+  });
+
   const term = query.data?.membershipTerms[0];
   const isApplicant = term?.membershipStatus === 'applicant';
+  const currentMembership = term?.membershipStatus ?? 'applicant';
 
   return (
     <ResponsiveDetail
@@ -401,6 +465,50 @@ function MemberDetail({
             </ul>
           </section>
 
+          <section className="flex flex-col gap-2 rounded-xl border border-border p-3">
+            <h3 className="text-sm font-semibold text-foreground">身份调整</h3>
+            <p className="text-xs text-muted-foreground">
+              直接设置该成员的身份（记入身份流转与审计，不能操作本人）。申请中的成员建议优先使用入社审批。
+            </p>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="adjust-status">目标身份</Label>
+              <Select value={adjustStatus || currentMembership} onValueChange={setAdjustStatus}>
+                <SelectTrigger id="adjust-status" aria-label="目标身份">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ADJUST_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="adjust-reason">调整原因（3-500 字，必填）</Label>
+              <Textarea
+                id="adjust-reason"
+                value={adjustReason}
+                onChange={(event) => setAdjustReason(event.target.value)}
+                rows={2}
+                maxLength={500}
+              />
+            </div>
+            <div className="flex justify-end">
+              <Button
+                size="sm"
+                disabled={membershipMutation.isPending || adjustReason.trim().length < 3}
+                onClick={() =>
+                  membershipMutation.mutate({ status: adjustStatus || currentMembership, reason: adjustReason.trim() })
+                }
+              >
+                {membershipMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+                保存身份
+              </Button>
+            </div>
+          </section>
+
           {(query.data.restrictions?.length ?? 0) > 0 && (
             <section className="flex flex-col gap-2">
               <h3 className="text-sm font-semibold text-foreground">在效限制</h3>
@@ -423,25 +531,113 @@ function MemberDetail({
             {query.data.platformAccounts.length === 0 ? (
               <p className="text-sm text-muted-foreground">未绑定平台账号。</p>
             ) : (
-              <ul className="flex flex-wrap gap-2">
-                {query.data.platformAccounts.map((account) => (
-                  <li
-                    key={account.id}
-                    className="flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-sm"
-                  >
-                    {account.platform} · {account.displayHandle ?? '—'}
-                    <StatusBadge
-                      kind="sync"
-                      value={
-                        account.status === 'verified'
-                          ? '已核验'
-                          : account.status === 'pending_review'
-                            ? '待持有核验'
-                            : '已解绑'
-                      }
-                    />
-                  </li>
-                ))}
+              <ul className="flex flex-col gap-2">
+                {query.data.platformAccounts.map((account) => {
+                  const editing = editingAccount?.id === account.id;
+                  const armed = armedRevokeId === account.id;
+                  return (
+                    <li key={account.id} className="flex flex-col gap-2 rounded-lg border border-border p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="min-w-0 truncate text-sm">
+                          {account.platform} · {account.displayHandle ?? account.externalId}
+                          {account.displayHandle && account.displayHandle !== account.externalId ? (
+                            <span className="text-muted-foreground">（{account.externalId}）</span>
+                          ) : null}
+                        </span>
+                        <StatusBadge
+                          kind="sync"
+                          value={
+                            account.status === 'verified'
+                              ? '已核验'
+                              : account.status === 'pending_review'
+                                ? '待持有核验'
+                                : '已解绑'
+                          }
+                        />
+                      </div>
+                      {account.status !== 'revoked' && !editing && (
+                        <div className="flex flex-wrap justify-end gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              setArmedRevokeId(null);
+                              setEditingAccount({
+                                id: account.id,
+                                externalId: account.externalId,
+                                displayHandle: account.displayHandle ?? '',
+                              });
+                            }}
+                          >
+                            更改账号
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant={armed ? 'destructive' : 'outline'}
+                            disabled={platformRevokeMutation.isPending}
+                            onClick={() => {
+                              if (armed) platformRevokeMutation.mutate(account.id);
+                              else setArmedRevokeId(account.id);
+                            }}
+                          >
+                            {platformRevokeMutation.isPending && platformRevokeMutation.variables === account.id && (
+                              <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                            )}
+                            {armed ? '确认解绑' : '解绑'}
+                          </Button>
+                        </div>
+                      )}
+                      {editing && editingAccount && (
+                        <div className="flex flex-col gap-2">
+                          <div className="grid gap-2 sm:grid-cols-2">
+                            <div className="flex flex-col gap-1.5">
+                              <Label htmlFor={`edit-external-${account.id}`}>平台账号（UID / handle）</Label>
+                              <Input
+                                id={`edit-external-${account.id}`}
+                                value={editingAccount.externalId}
+                                onChange={(event) =>
+                                  setEditingAccount({ ...editingAccount, externalId: event.target.value })
+                                }
+                                maxLength={64}
+                              />
+                            </div>
+                            <div className="flex flex-col gap-1.5">
+                              <Label htmlFor={`edit-handle-${account.id}`}>显示名（可选）</Label>
+                              <Input
+                                id={`edit-handle-${account.id}`}
+                                value={editingAccount.displayHandle}
+                                onChange={(event) =>
+                                  setEditingAccount({ ...editingAccount, displayHandle: event.target.value })
+                                }
+                                maxLength={64}
+                              />
+                            </div>
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            更换绑定账号后将回到「待持有核验」，需重新审核；解绑为软删除，保留历史成绩。
+                          </p>
+                          <div className="flex justify-end gap-2">
+                            <Button size="sm" variant="outline" onClick={() => setEditingAccount(null)}>
+                              取消
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={
+                                platformUpdateMutation.isPending || editingAccount.externalId.trim().length < 2
+                              }
+                              onClick={() => platformUpdateMutation.mutate(editingAccount)}
+                            >
+                              {platformUpdateMutation.isPending && (
+                                <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                              )}
+                              保存绑定
+                            </Button>
+                          </div>
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </section>
