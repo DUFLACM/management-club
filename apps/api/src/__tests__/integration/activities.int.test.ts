@@ -4,6 +4,7 @@ import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { ActivityService } from '../../modules/activities/activity.service.js'
 import { ActivityAdminController, ActivityUserController } from '../../modules/activities/activity.controller.js'
 import { AttendanceService } from '../../modules/attendance/attendance.service.js'
+import type { ContestStandingsService } from '../../modules/activities/contest-standings.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { VenueService } from '../../modules/venues/venue.service.js'
@@ -275,16 +276,110 @@ describe('报名并发与候补', () => {
     await activities.register(user.userId, ownActivity)
     await activities.register(other.userId, ownActivity)
     await activities.register(other.userId, otherActivity)
-    const controller = new ActivityUserController(activities, {} as AttendanceService)
+    const controller = new ActivityUserController(activities, {} as AttendanceService, {} as ContestStandingsService)
 
     const mine = await controller.list({ userId: user.userId }, 'mine')
     expect(mine.data.items.map((item) => item.id)).toEqual([ownActivity])
     expect(mine.data.items[0].myRegistration?.status).toBe('enrolled')
 
-    const detail = await controller.detail({ userId: user.userId }, ownActivity)
+    const viewer = makeActor({ userId: user.userId })
+    const detail = await controller.detail(viewer, { userId: user.userId }, ownActivity)
     expect(detail.data.registrations).toHaveLength(1)
     expect(detail.data.registrations[0]).toMatchObject({ userId: user.userId, status: 'enrolled' })
-    const unregistered = await controller.detail({ userId: user.userId }, otherActivity)
+    const unregistered = await controller.detail(viewer, { userId: user.userId }, otherActivity)
     expect(unregistered.data.registrations).toEqual([])
+  })
+})
+
+describe('讲题申请、活动材料与平台榜单', () => {
+  it('申请讲题 → 审批 → 上传材料 → 下载/删除；未获批或类型不符被拒绝', async () => {
+    const actor = makeActor({ principalKind: 'system' })
+    const { activityId } = await createEditableDraft()
+    await activities.publish(actor, activityId)
+    const { userId } = await createTestUser(db, { studentNo: '202603001' })
+
+    await expect(activities.createMaterial(undefined, userId, activityId,
+      { buffer: Buffer.from('x'), mimetype: 'text/plain', size: 1, originalname: 'a.txt' },
+      { title: 'T', kind: 'solution' })).rejects.toMatchObject({ code: 'FORBIDDEN' })
+
+    await activities.submitLectureRequest(userId, activityId, '最短路专题')
+    await expect(activities.submitLectureRequest(userId, activityId)).rejects.toMatchObject({ code: 'STATE_INVALID' })
+
+    const requests = await activities.listLectureRequests(activityId)
+    const request = requests.find((row) => row.userId === userId)!
+    expect(request).toMatchObject({ status: 'pending', topic: '最短路专题' })
+    await activities.decideLectureRequest(actor, activityId, request.id, 'approve', '主题合适')
+    expect(await activities.canUploadMaterials(undefined, userId, activityId)).toBe(true)
+
+    // 类型白名单外拒绝
+    await expect(activities.createMaterial(undefined, userId, activityId,
+      { buffer: Buffer.from('<html/>'), mimetype: 'text/html', size: 10, originalname: 'x.html' },
+      { title: 'T', kind: 'solution' })).rejects.toMatchObject({ code: 'UNSUPPORTED_MEDIA' })
+
+    const content = '# 题解内容'
+    const { materialId } = await activities.createMaterial(undefined, userId, activityId,
+      { buffer: Buffer.from(content), mimetype: 'text/markdown', size: Buffer.byteLength(content), originalname: 'sol.md' },
+      { title: '题解', kind: 'solution' })
+    const dl = await activities.materialForDownload(activityId, materialId)
+    expect(dl.material.fileName).toBe('sol.md')
+    const fs = await import('node:fs')
+    expect(fs.existsSync(dl.filePath)).toBe(true)
+
+    const detail = await activities.detailForUser(userId, activityId)
+    expect(detail.materials).toHaveLength(1)
+    expect(detail.materials[0]).toMatchObject({ title: '题解', kind: 'solution' })
+    expect(detail.lectureRequests[0]).toMatchObject({ status: 'approved' })
+
+    await activities.deleteMaterial(makeActor({ userId }), activityId, materialId)
+    expect(await db.activityMaterial.count({ where: { activityId } })).toBe(0)
+    expect(fs.existsSync(dl.filePath)).toBe(false)
+  })
+
+  it('活动结束后不能再申请讲题；榜单按绑定映射社团成员并输出对题数排名', async () => {
+    const { userId } = await createTestUser(db, { studentNo: '202603003' })
+    const rival = await createTestUser(db, { studentNo: '202603004' })
+    const activityId = crypto.randomUUID()
+    await db.activity.create({ data: {
+      id: activityId, type: 'weekly_contest', sourceType: 'platform', platform: 'nowcoder', platformContestId: '140235',
+      title: '平台赛榜单测试', announcement: '榜单映射测试', status: 'published', createdBy: crypto.randomUUID(),
+      startAt: new Date(Date.now() - 7200_000), endAt: new Date(Date.now() - 3600_000),
+    } })
+    await expect(activities.submitLectureRequest(userId, activityId)).rejects.toMatchObject({ code: 'STATE_INVALID' })
+
+    await db.platformAccount.createMany({ data: [
+      { id: crypto.randomUUID(), userId, platform: 'nowcoder', externalId: 'club-a', displayHandle: 'club-a', status: 'verified' },
+      { id: crypto.randomUUID(), userId: rival.userId, platform: 'nowcoder', externalId: 'club-b', displayHandle: 'club-b', status: 'verified' },
+    ] })
+
+    const standings = {
+      fetch: async () => ({
+        platform: 'nowcoder', contestId: '140235', available: true as const,
+        problems: [
+          { index: 'A', name: 'A', fullScore: 100, url: 'https://ac.nowcoder.com/acm/contest/140235/A' },
+          { index: 'B', name: 'B', fullScore: 100, url: 'https://ac.nowcoder.com/acm/contest/140235/B' },
+        ],
+        entries: [
+          { handle: 'outsider', rank: 1, score: 200, solvedCount: 2, cells: [
+            { index: 'A', score: 100, solved: true, failedCount: 0 }, { index: 'B', score: 100, solved: true, failedCount: 0 }] },
+          { handle: 'club-a', rank: 5, score: 150, solvedCount: 2, cells: [
+            { index: 'A', score: 100, solved: true, failedCount: 0 }, { index: 'B', score: 50, solved: true, failedCount: 1 }] },
+          { handle: 'club-b', rank: 9, score: 100, solvedCount: 1, cells: [
+            { index: 'A', score: 100, solved: true, failedCount: 0 }, { index: 'B', score: 0, solved: false, failedCount: 2 }] },
+        ],
+        fetchedAt: new Date().toISOString(), note: 'fixture',
+      }),
+    } as unknown as ContestStandingsService
+
+    const result = await activities.activityStandings(userId, activityId, standings)
+    if (!result.available) throw new Error('fixture 应返回可用榜单')
+    expect(result.ended).toBe(true)
+    expect(result.contestUrl).toBe('https://ac.nowcoder.com/acm/contest/140235')
+    expect(result.clubRanking.map((row) => row.handle)).toEqual(['club-a', 'club-b'])
+    expect(result.clubRanking[0]).toMatchObject({ clubRank: 1, solvedCount: 2, platformRank: 5 })
+    expect(result.me).toMatchObject({ handle: 'club-a', solvedCount: 2, score: 150 })
+    expect(result.problems.find((problem) => problem.index === 'A')?.clubSolved).toBe(2)
+    expect(result.problems.find((problem) => problem.index === 'B')?.clubSolved).toBe(1)
+    expect(result.totalEntries).toBe(3)
+    expect((result as { entries?: unknown }).entries).toBeUndefined()
   })
 })

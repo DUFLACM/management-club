@@ -1,0 +1,10 @@
+{
+  "msg": "OK",
+  "code": 0,
+  "data": [
+    { "contestId": 119664, "rating": 573.0, "rank": 1114, "changeValue": -427.0, "time": 1760698800000, "contestName": "牛客小白月赛122", "colorLevel": 1 },
+    { "contestId": 119273, "rating": 659.0, "rank": 920, "changeValue": 86.0, "time": 1760871600000, "contestName": "牛客周赛 Round 114", "colorLevel": 1 },
+    { "contestId": 120553, "rating": 773.0, "rank": 732, "changeValue": 114.0, "time": 1762081200000, "contestName": "牛客周赛 Round 116", "colorLevel": 2 },
+    { "contestId": 120562, "rating": 846.0, "rank": 2714, "changeValue": 74.0, "time": 1770271200000, "contestName": "2026牛客寒假算法基础集训营2", "colorLevel": 2 }
+  ]
+}

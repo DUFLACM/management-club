@@ -7,7 +7,12 @@ const SCRYPT_KEY_LENGTH = 32
 const SCRYPT_MAX_MEMORY = 64 * 1024 * 1024
 
 export const ADMIN_PASSWORD_MIN_LENGTH = 16
-export const ADMIN_SECRET_MIN_LENGTH = 16
+/**
+ * 入口密语是管理端登录的第一道门，不是第二个密码：真正的身份校验在用户名+密码+一次性验证码。
+ * 短密语的暴力破解风险由 IP/账号维度限流兜底（15 分钟窗口内 5 次失败即封禁 15 分钟），
+ * 因此下限取便于口头转交的 5 位；管理员密码的 16 位下限不受此影响。
+ */
+export const ADMIN_SECRET_MIN_LENGTH = 5
 
 function derive(value: string, salt: Buffer): Promise<Buffer> {
   return new Promise((resolve, reject) => {

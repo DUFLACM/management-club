@@ -81,12 +81,25 @@ export function classifyAttendance(facts: AttendanceFacts, params: RuleParams): 
     return { status: 'ok', value: new Decimal(0), decisions }
   }
 
-  // 同时迟到且早退（两项 -2 如何合计、分钟是否合并）属 R03 未决：转人工复核，不擅自叠加
-  if (params.lateEarlyPolicy === 'pending' && lateOver15 && earlyOver15) {
+  // 同时迟到且早退（R03 已拍板）：按次独立叠加，同场最多 -4；参与分 +1 仍只发一次
+  if (lateOver15 && earlyOver15) {
+    if (params.lateEarlyPolicy === 'pending') {
+      return {
+        status: 'pending',
+        gap: 'R03',
+        pendingReason: '同时迟到与早退的参与分档与扣分合计口径未确认（R03），转人工复核',
+        decisions,
+      }
+    }
+    const cfg = params.lateEarlyConfig
+    const per = Math.abs(cfg.penaltyPerViolation)
+    const cap = Math.abs(cfg.maxPenaltyPerSession)
+    const penalty = -Math.min(cap, cfg.stackViolations ? per * 2 : per)
+    push('late-early-both', `同时迟到与早退超 15 分钟：参与分 +${cfg.participationPoints}（每场一次）；扣分按次叠加 ${penalty}`)
     return {
-      status: 'pending',
-      gap: 'R03',
-      pendingReason: '同时迟到与早退的参与分档与扣分合计口径未确认（R03），转人工复核',
+      status: 'ok',
+      value: new Decimal(cfg.participationPoints),
+      penaltyDraft: { amount: new Decimal(penalty), reason: '迟到与早退均超过 15 分钟（按次叠加）' },
       decisions,
     }
   }

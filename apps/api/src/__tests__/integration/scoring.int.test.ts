@@ -4,6 +4,7 @@ import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { ScoringService, ledgerEntrySchema } from '../../modules/scoring/scoring.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { createTestUser, makeActor } from './helpers.js'
+import { monthKey } from '../../common/utils.js'
 
 /**
  * 积分账本/公示/冻结/复核（真实 PostgreSQL）：
@@ -22,7 +23,7 @@ let scoring: ScoringService
 beforeAll(async () => {
   const url = ensureTestDatabase()
   db = new PrismaService(url)
-  scoring = new ScoringService(db, new AuditService(db))
+  scoring = new ScoringService(db, new AuditService(db), {} as never, {} as never)
   await db.ruleVersion
     .create({
       data: {
@@ -97,50 +98,12 @@ describe('账本幂等与冲正', () => {
   })
 })
 
-describe('公示与冻结', () => {
+describe('公示', () => {
   it('公示期 <48 小时被拒绝', async () => {
     const now = new Date()
     await expect(
       scoring.publishMonthlyDisclosure(makeActor(), '2026-09', now, new Date(now.getTime() + 24 * 3600_000)),
     ).rejects.toMatchObject({ code: 'DISCLOSURE_TOO_SHORT' })
-  })
-
-  it('冻结后回填积分不改变冻结名单（水位）', async () => {
-    const u1 = await createTestUser(db, { studentNo: '202604010' })
-    const u2 = await createTestUser(db, { studentNo: '202604011' })
-    const reviewer = makeActor()
-    await scoring.postLedgerEntry(reviewer, ledgerEntrySchema.parse({ userId: u1.userId, sourceKey: 'fz:a:W', category: 'contest', amount: '30', scoreMonth: '2026-09' }))
-    await scoring.postLedgerEntry(reviewer, ledgerEntrySchema.parse({ userId: u2.userId, sourceKey: 'fz:b:W', category: 'contest', amount: '20', scoreMonth: '2026-09' }))
-    // 冻结（通过 worker handler 的核心逻辑直接验证水位语义）
-    const freezeId = crypto.randomUUID()
-    const rule = await db.ruleVersion.findFirst({ orderBy: { version: 'desc' } })
-    const watermark = new Date() // 冻结时点：晚于已入账的两笔
-    await db.rankingFreeze.create({
-      data: { id: freezeId, contestKey: 'test-contest', title: '冻结测试', freezeAt: watermark, ruleVersionId: rule!.id, status: 'scheduled' },
-    })
-    await expect(scoring.leaderboard('frozen', freezeId, u1.userId)).rejects.toMatchObject({ code: 'FREEZE_PENDING' })
-    const { computeEffectiveScore } = await import('@acm/scoring-core')
-    const entries = await db.pointsLedgerEntry.findMany({ where: { status: 'approved', recordedAt: { lte: watermark } }, select: { userId: true, amount: true, scoreMonth: true } })
-    const byUser = new Map<string, Record<string, number>>()
-    for (const e of entries) {
-      byUser.set(e.userId, { ...(byUser.get(e.userId) ?? {}), [e.scoreMonth]: (byUser.get(e.userId)?.[e.scoreMonth] ?? 0) + Number(e.amount) })
-    }
-    const rowsBefore = [...byUser.entries()].map(([userId, ms]) => {
-      const eff = computeEffectiveScore({ monthlyScores: ms, currentMonth: '2026-09' }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
-      return { userId, e: Number(eff.e) }
-    }).sort((a, b) => b.e - a.e)
-    for (const [i, row] of rowsBefore.entries()) {
-      await db.frozenRankingRow.create({ data: { id: crypto.randomUUID(), freezeId, userId: row.userId, position: i + 1, eSnapshot: row.e.toFixed(4) } })
-    }
-    await db.rankingFreeze.update({ where: { id: freezeId }, data: { status: 'frozen' } })
-    const leaderboard = await scoring.leaderboard('frozen', freezeId, u1.userId)
-    expect(leaderboard.kind).toBe('frozen')
-    // 冻结后回填一笔（recordedAt 晚于水位）
-    await scoring.postLedgerEntry(reviewer, ledgerEntrySchema.parse({ userId: u2.userId, sourceKey: 'fz:b2:W', category: 'contest', amount: '50', scoreMonth: '2026-09' }))
-    const frozenRows = await db.frozenRankingRow.findMany({ where: { freezeId }, orderBy: { position: 'asc' } })
-    expect(frozenRows[0].userId).toBe(u1.userId) // 名单不变
-    const u2Row = frozenRows.find((r) => r.userId === u2.userId)!
-    expect(Number(u2Row.eSnapshot)).toBeLessThan(50) // 回填不进入冻结快照
   })
 })
 
@@ -165,5 +128,69 @@ describe('双人复核', () => {
     expect(v2.approvals).toBe(2)
     const updated = await db.reviewCase.findUnique({ where: { id: caseRow.id } })
     expect(updated!.status).toBe('resolved')
+  })
+})
+
+/**
+ * 当前有效榜口径（首页「当前有效榜排名」与榜单页共用 rankEligibleMembers）：
+ * 全集是在册正式/预备/考察成员，不是「有账本记录的人」——
+ * 新入社、尚无任何已生效记录的成员必须在榜上（E=0），否则首页会错误显示「未参与当前榜」。
+ */
+type CurrentBoardRow = { rank: number; userId: string; e: string; isMe: boolean }
+
+/** leaderboard 的返回是 current/disclosure 联合类型，测试里按 current 形状取行 */
+async function currentBoardRows(viewerId: string | null): Promise<CurrentBoardRow[]> {
+  const board = await scoring.leaderboard('current', undefined, viewerId)
+  return board.rows as CurrentBoardRow[]
+}
+
+describe('当前有效榜包含零积分成员', () => {
+  it('无账本记录的正式成员仍在榜上且 E 为 0.0', async () => {
+    const zero = await createTestUser(db, { studentNo: '202606001', name: '零分成员', membership: 'formal' })
+    const scored = await createTestUser(db, { studentNo: '202606002', name: '有分成员', membership: 'formal' })
+    await scoring.postLedgerEntry(
+      makeActor(),
+      ledgerEntrySchema.parse({
+        userId: scored.userId,
+        sourceKey: 'manual:board-current:202606002',
+        category: 'activity',
+        amount: '12',
+        scoreMonth: monthKey(new Date()),
+      }),
+    )
+
+    const rows = await currentBoardRows(zero.userId)
+    const zeroRow = rows.find((r) => r.userId === zero.userId)
+    const scoredRow = rows.find((r) => r.userId === scored.userId)
+
+    expect(zeroRow, '零积分的正式成员必须在当前有效榜上').toBeDefined()
+    expect(zeroRow!.e).toBe('0.0')
+    expect(zeroRow!.isMe).toBe(true)
+    expect(scoredRow).toBeDefined()
+    // 有分的排在零分之前
+    expect(scoredRow!.rank).toBeLessThan(zeroRow!.rank)
+  })
+
+  it('申请中成员即使有账本记录也不在榜上', async () => {
+    const applicant = await createTestUser(db, { studentNo: '202606003', name: '申请中', membership: 'applicant' })
+    await scoring.postLedgerEntry(
+      makeActor(),
+      ledgerEntrySchema.parse({
+        userId: applicant.userId,
+        sourceKey: 'manual:board-current:202606003',
+        category: 'activity',
+        amount: '50',
+        scoreMonth: monthKey(new Date()),
+      }),
+    )
+    const rows = await currentBoardRows(null)
+    expect(rows.find((r) => r.userId === applicant.userId)).toBeUndefined()
+  })
+
+  it('名次连续且同分名次稳定（两次查询结果一致）', async () => {
+    const first = await currentBoardRows(null)
+    const second = await currentBoardRows(null)
+    expect(first.map((r) => r.rank)).toEqual(first.map((_, i) => i + 1))
+    expect(second.map((r) => r.userId)).toEqual(first.map((r) => r.userId))
   })
 })

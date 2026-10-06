@@ -48,6 +48,12 @@ const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
 
+  // 综评建议折算测试口：开启后允许对未结束的学期生成批次，产物强制标记为测试数据
+  EVALUATION_TEST_MODE: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+
   STORAGE_DRIVER: z.enum(['local']).default('local'),
   STORAGE_LOCAL_DIR: z.string().default('./storage'),
 })
@@ -66,10 +72,19 @@ export function loadEnv(): AppEnv {
     // 生产强制禁用模拟认证：宁可启动失败也不静默放行
     throw new Error('AUTH_DEV_SIMULATOR must be false in production')
   }
+  if (cached.NODE_ENV === 'production' && cached.EVALUATION_TEST_MODE) {
+    // 生产禁用综评测试口：建议分值一旦被当成正式结果上报，影响真实学生综评
+    throw new Error('EVALUATION_TEST_MODE must be false in production')
+  }
   return cached
 }
 
 /** 是否处于 CAS 模拟模式（启动日志与页面都会标记） */
 export function isDevSimulatorEnabled(env: AppEnv): boolean {
   return env.AUTH_DEV_SIMULATOR && env.NODE_ENV !== 'production'
+}
+
+/** 综评测试口：允许学期未结束就生成批次（仅非生产；产物标记 isTest） */
+export function isEvaluationTestModeEnabled(env: AppEnv): boolean {
+  return env.EVALUATION_TEST_MODE && env.NODE_ENV !== 'production'
 }

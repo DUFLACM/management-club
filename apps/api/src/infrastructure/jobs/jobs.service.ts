@@ -16,7 +16,6 @@ export type JobType =
   | 'hydro.repair'
   | 'scoring.recalc_user'
   | 'scoring.monthly_batch'
-  | 'disclosure.freeze_ranking'
   | 'disclosure.publish_rows'
   | 'activity.import_contest'
   | 'activity.settle_attendance'

@@ -10,6 +10,8 @@ import { ProfilesModule } from './modules/profiles/profiles.module.js'
 import { SettingsModule } from './modules/settings/settings.module.js'
 import { MembersModule } from './modules/members/members.module.js'
 import { FilesModule } from './modules/files/files.module.js'
+import { CompetitionsModule } from './modules/competitions/competitions.module.js'
+import { EvaluationModule } from './modules/evaluation/evaluation.module.js'
 
 @Module({
   imports: [
@@ -24,6 +26,8 @@ import { FilesModule } from './modules/files/files.module.js'
     SettingsModule,
     MembersModule,
     FilesModule,
+    CompetitionsModule,
+    EvaluationModule,
   ],
 })
 export class AppModule {}

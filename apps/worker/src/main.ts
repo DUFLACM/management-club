@@ -49,6 +49,26 @@ async function main(): Promise<void> {
     }
   }, 30_000)
 
+  // 每日平台账号自动刷新（24h 一次；04:37 Asia/Shanghai 后触发，dedupeKey 保证全天只排一次）
+  const ensureDailyRefresh = async (): Promise<void> => {
+    try {
+      const shanghai = new Date(Date.now() + 8 * 3600_000)
+      const dateKey = shanghai.toISOString().slice(0, 10)
+      const dedupeKey = `platform-refresh-all:${dateKey}`
+      const existing = await db.job.findFirst({ where: { dedupeKey } })
+      if (existing) return
+      const minuteOfDay = shanghai.getUTCHours() * 60 + shanghai.getUTCMinutes()
+      if (minuteOfDay < 4 * 60 + 37) return
+      await db.job.create({ data: { id: randomUUID(), type: 'platform.refresh_all', payload: {}, dedupeKey, priority: 8 } })
+      // eslint-disable-next-line no-console
+      console.log(`[${WORKER_ID}] 已排入每日平台账号刷新（${dateKey}）`)
+    } catch {
+      // 调度失败不影响主循环；下个检查窗口重试
+    }
+  }
+  void ensureDailyRefresh()
+  const dailyRefresh = setInterval(() => void ensureDailyRefresh(), 10 * 60_000)
+
   let shutdown = false
   process.on('SIGINT', () => {
     shutdown = true
@@ -115,6 +135,7 @@ async function main(): Promise<void> {
 
   clearInterval(heartbeat)
   clearInterval(reclaimer)
+  clearInterval(dailyRefresh)
   await db.$disconnect()
   // eslint-disable-next-line no-console
   console.log(`[${WORKER_ID}] Worker 已停止`)

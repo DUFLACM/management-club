@@ -8,7 +8,7 @@ import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newId } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { enrollRequiredAfterCheckin } from './checkin-registration.js'
-import { attendanceDeadline, settleRequiredAbsences } from '@acm/db'
+import { attendanceDeadline, applyAutoCheckout, settleRequiredAbsences } from '@acm/db'
 
 /** 现场码 / 补签 / 复核（/admin?section=activities&tab=attendance） */
 @Controller('/api/v1/admin')
@@ -95,6 +95,87 @@ export class AttendanceAdminController {
       color: { dark: '#000000', light: '#FFFFFF' },
     })
     return ok({ token, expiresAt, rotateSeconds, dataUrl, note: '现场码在有效期内可被多位成员使用；黑白码不加 logo，保留 4 模块 quiet zone' })
+  }
+
+  /**
+   * 人工复核/补签（无既有结果行也可操作）：到场类状态补建 MANUAL 签到检查点，
+   * 必到成员自动补报名；结果 upsert 为 corrected 并追加更正记录；利益关联回避。
+   */
+  @Post('activities/:id/attendance/manual')
+  @RequireAction('attendance.review')
+  async manualAttendance(
+    @CurrentActor() actor: SessionActor,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: unknown,
+  ) {
+    const parsed = z.object({
+      userId: z.string().uuid(),
+      newStatus: z.enum(['ontime', 'late', 'early_leave', 'late_and_early', 'absent', 'leave_approved', 'remote_approved']),
+      lateMinutes: z.number().int().min(0).max(600).optional(),
+      earlyMinutes: z.number().int().min(0).max(600).optional(),
+      reason: z.string().min(3).max(1000),
+      evidenceRef: z.string().max(500).optional(),
+    }).safeParse(body)
+    if (!parsed.success) throw new AttendanceError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    const input = parsed.data
+    const user = await this.db.user.findUnique({ where: { id: input.userId }, select: { principalId: true } })
+    if (!user) throw new AttendanceError('成员不存在', 'NOT_FOUND')
+    if (user.principalId === actor.principalId) throw new AttendanceError('不能复核本人出勤（利益回避）', 'RECUSED')
+    const activity = await this.db.activity.findUnique({ where: { id }, select: { id: true } })
+    if (!activity) throw new AttendanceError('活动不存在', 'NOT_FOUND')
+
+    const presenceStatus = ['ontime', 'late', 'early_leave', 'late_and_early'].includes(input.newStatus)
+    const resultId = await this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM activities WHERE id = ${id}::uuid FOR UPDATE`
+      if (presenceStatus) {
+        // 补建 MANUAL 检查点（保留既有真实签到不覆盖）并触发必到自动报名
+        const existingIn = await tx.attendanceCheckpoint.findUnique({
+          where: { activityId_userId_checkpoint: { activityId: id, userId: input.userId, checkpoint: 'IN' } },
+        })
+        if (!existingIn) {
+          const checkpointId = newId()
+          await tx.attendanceCheckpoint.create({
+            data: { id: checkpointId, activityId: id, userId: input.userId, checkpoint: 'IN', method: 'MANUAL', acceptedAt: new Date() },
+          })
+        }
+        await enrollRequiredAfterCheckin(tx, id, input.userId, new Date(), actor.principalId)
+      }
+      const existing = await tx.attendanceAttendanceResult.findUnique({
+        where: { activityId_userId: { activityId: id, userId: input.userId } },
+      })
+      const result = await tx.attendanceAttendanceResult.upsert({
+        where: { activityId_userId: { activityId: id, userId: input.userId } },
+        create: { id: newId(), activityId: id, userId: input.userId, status: input.newStatus, lateMinutes: input.lateMinutes ?? 0, earlyMinutes: input.earlyMinutes ?? 0 },
+        update: { status: input.newStatus, lateMinutes: input.lateMinutes ?? 0, earlyMinutes: input.earlyMinutes ?? 0 },
+      })
+      await tx.attendanceAttendanceResult.update({
+        where: { id: result.id },
+        data: { reviewStatus: 'corrected', reviewNote: input.reason, decidedBy: actor.principalId, revision: { increment: 1 } },
+      })
+      await tx.attendanceCorrection.create({
+        data: {
+          id: newId(),
+          resultId: result.id,
+          originalValue: { status: existing?.status ?? 'pending', lateMinutes: existing?.lateMinutes ?? 0, earlyMinutes: existing?.earlyMinutes ?? 0 } as never,
+          correctedValue: { status: input.newStatus, lateMinutes: input.lateMinutes ?? 0, earlyMinutes: input.earlyMinutes ?? 0 } as never,
+          reason: input.reason,
+          evidenceRef: input.evidenceRef,
+          operatorId: actor.principalId,
+        },
+      })
+      await tx.auditLog.create({
+        data: {
+          id: newId(),
+          actorPrincipalId: actor.principalId,
+          action: 'attendance.manual_review',
+          resourceType: 'attendance_result',
+          resourceId: result.id,
+          summary: `人工复核为 ${input.newStatus}：${input.reason.slice(0, 200)}`,
+        },
+      })
+      return result.id
+    })
+    return ok({ resultId, corrected: true })
   }
 
   /** 人工补签/更正：原值+认定值+原因+证据，追加式；利益关联回避 */
@@ -215,8 +296,13 @@ export class AttendanceAdminController {
     if (!activity) throw new AttendanceError('活动不存在', 'NOT_FOUND')
     const now = new Date()
     if (attendanceDeadline(activity) >= now) throw new AttendanceError('活动及出勤窗口尚未结束，不能提前认定缺勤', 'ATTENDANCE_NOT_ENDED')
+    // 策略开启自动签退：先为已签到未签退者按结束时间补记 OUT，再重载检查点计算结果
+    const autoCheckedOut = await applyAutoCheckout(this.db, id)
+    const checkpoints = autoCheckedOut > 0
+      ? await this.db.attendanceCheckpoint.findMany({ where: { activityId: id } })
+      : activity.checkpoints
     const checkpointsByUser = new Map<string, Map<string, Date>>()
-    for (const c of activity.checkpoints) {
+    for (const c of checkpoints) {
       if (!checkpointsByUser.has(c.userId)) checkpointsByUser.set(c.userId, new Map())
       checkpointsByUser.get(c.userId)!.set(c.checkpoint, c.acceptedAt)
     }

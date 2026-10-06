@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Post, Query, Req, Res, UseGuards } from '@nestjs/common'
+import { Body, Controller, Get, HttpCode, Inject, Post, Query, Req, Res, UseGuards } from '@nestjs/common'
 import type { Request, Response } from 'express'
 import { z } from 'zod'
 import { AuthService, AuthFlowError } from './auth.service.js'
@@ -6,6 +6,7 @@ import { SessionService, type SessionActor } from './session.service.js'
 import { SessionGuard, CurrentActor, ok } from '../../common/guards.js'
 import { buildCasLogoutUrl } from './cas.client.js'
 import { loadEnv } from '../../config/env.js'
+import { PrismaService } from '../../infrastructure/database/database.module.js'
 
 /**
  * 认证 API（03 方案 11）。认证与出勤相关响应一律 private,no-store。
@@ -16,6 +17,7 @@ export class AuthController {
   constructor(
     private readonly auth: AuthService,
     private readonly sessions: SessionService,
+    @Inject(PrismaService) private readonly db: PrismaService,
   ) {}
 
   /** 未登录匿名绑定或已有会话的 CSRF token */
@@ -112,6 +114,13 @@ export class AuthController {
   @Get('session')
   @UseGuards(SessionGuard)
   async session(@CurrentActor() actor: SessionActor) {
+    // 外壳侧栏头像用：展示名与头像资产随资料更新，不进会话快照，按需读一次
+    const profile = actor.userId
+      ? await this.db.userProfile.findUnique({
+          where: { userId: actor.userId },
+          select: { displayName: true, avatarAssetId: true },
+        })
+      : null
     return ok({
       principalId: actor.principalId,
       principalKind: actor.principalKind,
@@ -120,6 +129,8 @@ export class AuthController {
       staffNo: actor.staffNo,
       campusId: actor.campusId,
       realName: actor.realName,
+      displayName: profile?.displayName ?? actor.realName ?? null,
+      avatarAssetId: profile?.avatarAssetId ?? null,
       roles: actor.roles,
     })
   }

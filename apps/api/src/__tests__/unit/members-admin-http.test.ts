@@ -16,7 +16,8 @@ const db = {}
 const setMembership = vi.fn()
 const updateMemberPlatformAccount = vi.fn()
 const revokeMemberPlatformAccount = vi.fn()
-const members = { setMembership, updateMemberPlatformAccount, revokeMemberPlatformAccount }
+const batchDeleteMembers = vi.fn()
+const members = { setMembership, updateMemberPlatformAccount, revokeMemberPlatformAccount, batchDeleteMembers }
 let actor: SessionActor | null
 let app: INestApplication
 
@@ -38,6 +39,7 @@ beforeEach(() => {
   setMembership.mockReset().mockResolvedValue(undefined)
   updateMemberPlatformAccount.mockReset().mockResolvedValue(undefined)
   revokeMemberPlatformAccount.mockReset().mockResolvedValue(undefined)
+  batchDeleteMembers.mockReset().mockResolvedValue({ deletedCount: 2, skipped: [{ id: 'u-x', label: '张三（202600010）', reason: '该成员已有报名/出勤/积分/绑定等记录，删除会破坏社团数据；请改用「禁用账号」' }] })
 })
 afterAll(async () => { await app?.close() })
 
@@ -98,4 +100,19 @@ it('匿名请求返回 401，非法成员编号返回 400', async () => {
   actor = { principalKind: 'staff', principalId: crypto.randomUUID(), sessionId: crypto.randomUUID(), authzVersion: 1, roles: ['presidium'] }
   await request(app.getHttpServer()).post('/api/v1/admin/members/not-a-uuid/membership').send({ status: 'formal', reason: '原因长度足够的测试文案' }).expect(400)
   expect(setMembership).not.toHaveBeenCalled()
+})
+
+it('批量删除：校验数组长度与 UUID，返回删除数与跳过原因', async () => {
+  const other = '8f31e3aa-3333-4333-8333-333333333333'
+  const response = await request(app.getHttpServer())
+    .post('/api/v1/admin/members/batch-delete')
+    .send({ userIds: [userId, other] })
+    .expect(201)
+  expect(response.body.data).toEqual({ deletedCount: 2, skipped: [{ id: 'u-x', label: '张三（202600010）', reason: '该成员已有报名/出勤/积分/绑定等记录，删除会破坏社团数据；请改用「禁用账号」' }] })
+  expect(batchDeleteMembers).toHaveBeenCalledTimes(1)
+  expect(batchDeleteMembers).toHaveBeenCalledWith(actor, [userId, other])
+  await request(app.getHttpServer()).post('/api/v1/admin/members/batch-delete').send({ userIds: [] }).expect(400)
+  await request(app.getHttpServer()).post('/api/v1/admin/members/batch-delete').send({ userIds: ['not-a-uuid'] }).expect(400)
+  await request(app.getHttpServer()).post('/api/v1/admin/members/batch-delete').send({ userIds: Array.from({ length: 101 }, () => userId) }).expect(400)
+  expect(batchDeleteMembers).toHaveBeenCalledTimes(1)
 })

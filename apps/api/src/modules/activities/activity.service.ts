@@ -5,6 +5,8 @@ import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { VenueService } from '../venues/venue.service.js'
 import { newId } from '../../common/utils.js'
+import { actorCan } from '../../common/guards.js'
+import { ContestStandingsService, contestExternalUrl } from './contest-standings.service.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { z } from 'zod'
 import { Prisma, attendanceDeadline } from '@acm/db'
@@ -58,6 +60,8 @@ export const activityInputSchema = z.object({
       qrRotateSeconds: z.number().int().min(10).max(120).optional(),
       qrTtlSeconds: z.number().int().min(20).max(300).optional(),
       selfCheckout: z.boolean().optional(),
+      /** 活动结束时为已签到未签退者自动补记签退（按结束时间，method=AUTO） */
+      autoCheckout: z.boolean().optional(),
     })
     .nullable()
     .optional(),
@@ -76,6 +80,49 @@ export const activityUpdateSchema = activityInputSchema
 export type ActivityUpdate = z.infer<typeof activityUpdateSchema>
 
 const CONTEST_TYPES = new Set(['weekly_contest', 'monthly_contest', 'custom_contest'])
+
+export const lectureRatingSchema = z.object({
+  score: z.number().int().min(1).max(5),
+  comment: z.string().max(500).nullable().optional(),
+})
+export type LectureRatingInput = z.infer<typeof lectureRatingSchema>
+
+/** 到场口径：缺席/请假/待定不具备讲题评价资格 */
+const PRESENT_ATTENDANCE = ['ontime', 'late', 'early_leave', 'late_and_early', 'remote_approved']
+/** 匿名留言对讲题人的最小样本量：样本过少时逐条留言等于点名，仅活动负责人可见 */
+const RATING_COMMENT_REVEAL_MIN = 3
+
+/** 评分汇总：均值保留 1 位小数，distribution 为 1–5 星各自人数 */
+function summarizeRatings(ratings: Array<{ score: number }>): { count: number; average: number; distribution: number[] } {
+  const scores = ratings.map((r) => r.score)
+  const sum = scores.reduce((acc, v) => acc + v, 0)
+  return {
+    count: scores.length,
+    average: scores.length > 0 ? Math.round((sum / scores.length) * 10) / 10 : 0,
+    distribution: [1, 2, 3, 4, 5].map((s) => scores.filter((v) => v === s).length),
+  }
+}
+
+/** 讲题满意度聚合：评价人身份不出现在任何字段里 */
+export interface LectureRatingView {
+  lectureRequestId: string
+  lecturerUserId: string
+  lecturerName: string
+  topic: string | null
+  /** 本人是否即讲题人（讲题人不自评） */
+  isLecturer: boolean
+  canRate: boolean
+  /** 不可评价时的原因文案，前端直接展示 */
+  blockedReason: string | null
+  myScore: number | null
+  myComment: string | null
+  /** 聚合值仅讲题人本人与 activity.manage 可见，其余人为 null */
+  stats: { count: number; average: number; distribution: number[] } | null
+  /** 匿名留言：负责人始终可见，讲题人需样本达到 RATING_COMMENT_REVEAL_MIN */
+  comments: Array<{ id: string; score: number; comment: string; createdAt: string }> | null
+  /** 留言因样本不足而暂不展示的条数（讲题人视角） */
+  hiddenComments: number
+}
 
 @Injectable()
 export class ActivityService {
@@ -136,6 +183,7 @@ export class ActivityService {
             qrRotateSeconds: input.attendancePolicy.qrRotateSeconds ?? 25,
             qrTtlSeconds: input.attendancePolicy.qrTtlSeconds ?? 60,
             selfCheckout: input.attendancePolicy.selfCheckout ?? true,
+            autoCheckout: input.attendancePolicy.autoCheckout ?? false,
           },
         })
       }
@@ -281,6 +329,52 @@ export class ActivityService {
   }
 
   /** 发布：校验地点绑定全部 approved/active/有效期覆盖 IN/OUT 窗口 + 策略能力匹配，固化围栏快照 */
+  /** 删除活动：仅草稿且无任何报名/参与/出勤/材料数据（已发布活动走取消/归档，保留记录） */
+  async deleteDraft(actor: SessionActor, activityId: string): Promise<void> {
+    const activity = await this.db.activity.findUnique({
+      where: { id: activityId },
+      include: {
+        policy: true,
+        _count: { select: { registrations: true, participants: true, checkpoints: true, materials: true, lectureRequests: true, leaveRequests: true, remotePermissions: true } },
+      },
+    })
+    if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
+    if (activity.status !== 'draft') throw new ActivityError('仅草稿可删除；已发布活动请取消或归档以保留报名与出勤记录', 'STATE_INVALID')
+    const used = activity._count.registrations + activity._count.participants + activity._count.checkpoints
+      + activity._count.materials + activity._count.lectureRequests + activity._count.leaveRequests + activity._count.remotePermissions
+    if (used > 0) throw new ActivityError('已有报名/参与/出勤/材料数据，不能删除；请改用取消或归档', 'STATE_INVALID')
+    await this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM activities WHERE id = ${activityId}::uuid FOR UPDATE`
+      await tx.activityVenueBinding.deleteMany({ where: { activityId } })
+      await tx.attendancePolicy.deleteMany({ where: { activityId } })
+      await tx.activity.delete({ where: { id: activityId } })
+    })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'activity.delete',
+      resourceType: 'activity',
+      resourceId: activityId,
+      summary: `删除草稿活动：${activity.title}`,
+    })
+  }
+
+  /** 批量删除草稿活动：逐项走删除校验，失败项跳过并汇总原因（部分成功） */
+  async batchDeleteDrafts(actor: SessionActor, activityIds: string[]): Promise<{ deletedCount: number; skipped: Array<{ id: string; label: string; reason: string }> }> {
+    const skipped: Array<{ id: string; label: string; reason: string }> = []
+    let deletedCount = 0
+    for (const activityId of activityIds) {
+      const activity = await this.db.activity.findUnique({ where: { id: activityId }, select: { title: true } })
+      const label = activity?.title ?? activityId.slice(0, 8)
+      try {
+        await this.deleteDraft(actor, activityId)
+        deletedCount++
+      } catch (error) {
+        skipped.push({ id: activityId, label, reason: error instanceof ActivityError ? error.message : '删除失败' })
+      }
+    }
+    return { deletedCount, skipped }
+  }
+
   async publish(actor: SessionActor, activityId: string): Promise<void> {
     const title = await this.db.$transaction(async (tx) => {
       // 与草稿保存共用行锁，校验和快照始终来自同一版配置。
@@ -592,14 +686,61 @@ export class ActivityService {
     }
   }
 
-  /** 活动详情（用户） */
-  async detailForUser(userId: string | null, activityId: string) {
-    return this.loadDetail(userId, activityId)
+  /** 活动详情（用户）：附加平台赛事名、讲题/材料区数据与本次活动积分（手动入账带 activityId 的流水） */
+  async detailForUser(userId: string | null, activityId: string, actor?: SessionActor) {
+    const activity = await this.withContestMeta(await this.loadDetail(userId, activityId))
+    if (!userId) return activity
+    const lectureRatings = await this.lectureRatings(userId, activityId, actor)
+    const points = await this.db.pointsLedgerEntry.findMany({
+      where: { status: 'approved', detail: { path: ['activityId'], equals: activityId } },
+      orderBy: [{ recordedAt: 'desc' }, { id: 'desc' }],
+      include: { user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true } } } } },
+    })
+    const byUser = new Map<string, { userId: string; name: string; total: number; count: number }>()
+    for (const entry of points) {
+      const name = entry.user.profile?.displayName ?? entry.user.verifiedRealName
+      const current = byUser.get(entry.userId) ?? { userId: entry.userId, name, total: 0, count: 0 }
+      current.total += Number(entry.amount)
+      current.count += 1
+      byUser.set(entry.userId, current)
+    }
+    const board = [...byUser.values()].sort((a, b) => b.total - a.total || a.name.localeCompare(b.name))
+    const mine = points.filter((entry) => entry.userId === userId)
+    return Object.assign(activity, {
+      lectureRatings,
+      activityPoints: {
+        mine: mine.map((entry) => ({
+          amount: Number(entry.amount),
+          category: entry.category,
+          scoreMonth: entry.scoreMonth,
+          note: ((entry.detail ?? {}) as { note?: string }).note ?? null,
+          recordedAt: entry.recordedAt.toISOString(),
+        })),
+        myTotal: mine.reduce((sum, entry) => sum + Number(entry.amount), 0),
+        board: board.map((row, index) => ({ ...row, rank: index + 1 })),
+        totalAwarded: points.reduce((sum, entry) => sum + Number(entry.amount), 0),
+      },
+    })
   }
 
   /** 管理详情只读取配置；报名与出勤名单由各自授权接口提供。 */
   async detailForAdmin(activityId: string) {
-    return this.loadDetail(null, activityId)
+    const activity = await this.loadDetail(null, activityId)
+    return this.withContestMeta(activity)
+  }
+
+  private async withContestMeta<T extends { platform: string | null; platformContestId: string | null }>(
+    activity: T,
+  ): Promise<T & { contest: { name: string; sourceUrl: string | null; startTime: Date } | null }> {
+    let contest: { name: string; sourceUrl: string | null; startTime: Date } | null = null
+    if (activity.platform && activity.platformContestId) {
+      const row = await this.db.platformContest.findUnique({
+        where: { platform_externalContestId: { platform: activity.platform, externalContestId: activity.platformContestId } },
+      })
+      contest = row ? { name: row.name, sourceUrl: row.sourceUrl, startTime: row.startTime } : null
+    }
+    // Object.assign 保持泛型 T 的完整形状（对象展开会丢 include 字段的类型）
+    return Object.assign(activity, { contest })
   }
 
   private async loadDetail(userId: string | null, activityId: string) {
@@ -612,11 +753,385 @@ export class ActivityService {
         leaveRequests: userId ? { where: { userId } } : false,
         remotePermissions: userId ? { where: { userId } } : false,
         checkpoints: userId ? { where: { userId } } : false,
+        lectureRequests: userId ? { where: { userId }, orderBy: { createdAt: 'desc' }, take: 1 } : false,
+        materials: { orderBy: { createdAt: 'desc' }, include: { user: { select: { verifiedRealName: true, profile: { select: { displayName: true } } } } } },
         venueBindings: { include: { venueVersion: { include: { venue: true } } } },
         venueVersion: { include: { venue: true } },
       },
     })
     if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
     return activity
+  }
+
+  // ---------------- 讲题申请与活动材料（参与者详情页） ----------------
+
+  /** 申请讲题：活动发布且未结束前可提交；被驳回后可重新提交 */
+  async submitLectureRequest(userId: string, activityId: string, topic?: string): Promise<{ status: string }> {
+    const activity = await this.db.activity.findUnique({ where: { id: activityId }, select: { status: true, endAt: true } })
+    if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
+    if (activity.status !== 'published') throw new ActivityError('活动未发布，暂不能申请讲题', 'STATE_INVALID')
+    if (activity.endAt.getTime() <= Date.now()) throw new ActivityError('活动已结束，不能再申请讲题', 'STATE_INVALID')
+    const existing = await this.db.lectureRequest.findUnique({ where: { activityId_userId: { activityId, userId } } })
+    if (existing?.status === 'approved') throw new ActivityError('你已获得本活动的材料上传权限', 'ALREADY_GRANTED')
+    if (existing?.status === 'pending') throw new ActivityError('申请审核中，请等待负责人审批', 'STATE_INVALID')
+    const data = { topic: topic ?? null, status: 'pending', reviewNote: null, reviewedBy: null, reviewedAt: null }
+    if (existing) {
+      await this.db.lectureRequest.update({ where: { id: existing.id }, data })
+    } else {
+      await this.db.lectureRequest.create({ data: { id: newId(), activityId, userId, ...data } })
+    }
+    return { status: 'pending' }
+  }
+
+  /** 讲题审批队列（activity.manage） */
+  async listLectureRequests(activityId: string) {
+    return this.db.lectureRequest.findMany({
+      where: { activityId },
+      orderBy: [{ status: 'desc' }, { createdAt: 'asc' }],
+      include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } } } },
+    })
+  }
+
+  async decideLectureRequest(actor: SessionActor, activityId: string, requestId: string, decision: 'approve' | 'reject', note?: string): Promise<void> {
+    const request = await this.db.lectureRequest.findUnique({ where: { id: requestId } })
+    if (!request || request.activityId !== activityId) throw new ActivityError('讲题申请不存在', 'NOT_FOUND')
+    if (request.status !== 'pending') throw new ActivityError('该申请已处理过', 'STATE_INVALID')
+    await this.db.lectureRequest.update({
+      where: { id: requestId },
+      data: { status: decision === 'approve' ? 'approved' : 'rejected', reviewNote: note ?? null, reviewedBy: actor.principalId, reviewedAt: new Date() },
+    })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: decision === 'approve' ? 'activity.lecture_approve' : 'activity.lecture_reject',
+      resourceType: 'lecture_request',
+      resourceId: requestId,
+      summary: `${decision === 'approve' ? '批准' : '驳回'}讲题申请（活动 ${activityId}）${note ? `：${note.slice(0, 180)}` : ''}`,
+    })
+  }
+
+  // ---------------- 讲题满意度评价 ----------------
+
+  /**
+   * 讲题满意度区块：列出本活动所有获批讲题人的评价状态。
+   * 聚合值与留言按身份收敛（见 LectureRatingView）；评价人身份一律不出接口。
+   */
+  async lectureRatings(userId: string, activityId: string, actor?: SessionActor): Promise<LectureRatingView[]> {
+    const activity = await this.db.activity.findUnique({
+      where: { id: activityId },
+      select: { endAt: true, policy: { select: { id: true } } },
+    })
+    if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
+    const lectures = await this.db.lectureRequest.findMany({
+      where: { activityId, status: 'approved' },
+      orderBy: [{ reviewedAt: 'asc' }, { createdAt: 'asc' }],
+      include: {
+        user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
+        ratings: { orderBy: { createdAt: 'desc' } },
+      },
+    })
+    if (lectures.length === 0) return []
+    const canManage = Boolean(actor && actorCan(actor, 'activity.manage'))
+    const ended = activity.endAt.getTime() <= Date.now()
+    const attended = await this.attendedForRating(userId, activityId, Boolean(activity.policy))
+    return lectures.map((lecture) => {
+      const isLecturer = lecture.userId === userId
+      const mine = isLecturer ? null : lecture.ratings.find((r) => r.raterUserId === userId) ?? null
+      const stats = summarizeRatings(lecture.ratings)
+      const withComment = lecture.ratings.filter((r) => (r.comment ?? '').trim().length > 0)
+      const commentsVisible = canManage || (isLecturer && stats.count >= RATING_COMMENT_REVEAL_MIN)
+      let blockedReason: string | null = null
+      if (isLecturer) blockedReason = '讲题人不对本人讲题评分'
+      else if (!ended) blockedReason = '活动结束后开放满意度评分'
+      else if (!attended) blockedReason = '仅本次活动的到场成员可以评分'
+      return {
+        lectureRequestId: lecture.id,
+        lecturerUserId: lecture.userId,
+        lecturerName: lecture.user.profile?.displayName ?? lecture.user.verifiedRealName,
+        topic: lecture.topic,
+        isLecturer,
+        canRate: blockedReason === null,
+        blockedReason,
+        myScore: mine?.score ?? null,
+        myComment: mine?.comment ?? null,
+        stats: canManage || isLecturer ? stats : null,
+        comments: commentsVisible
+          ? withComment.map((r) => ({
+              id: r.id,
+              score: r.score,
+              comment: (r.comment ?? '').trim(),
+              createdAt: r.createdAt.toISOString(),
+            }))
+          : null,
+        hiddenComments: commentsVisible ? 0 : withComment.length,
+      }
+    })
+  }
+
+  /**
+   * 管理侧讲题满意度汇总（activity.manage）：供无学生账号的指导教师/负责人查看。
+   * 同样不返回评价人身份；负责人需要据此跟进讲题质量，故匿名评语不设样本门槛。
+   */
+  async lectureRatingsForAdmin(activityId: string) {
+    const lectures = await this.db.lectureRequest.findMany({
+      where: { activityId, status: 'approved' },
+      orderBy: [{ reviewedAt: 'asc' }, { createdAt: 'asc' }],
+      include: {
+        user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
+        ratings: { orderBy: { createdAt: 'desc' } },
+      },
+    })
+    return lectures.map((lecture) => ({
+      lectureRequestId: lecture.id,
+      lecturerUserId: lecture.userId,
+      lecturerName: lecture.user.profile?.displayName ?? lecture.user.verifiedRealName,
+      studentNo: lecture.user.studentNo,
+      topic: lecture.topic,
+      stats: summarizeRatings(lecture.ratings),
+      comments: lecture.ratings
+        .filter((r) => (r.comment ?? '').trim().length > 0)
+        .map((r) => ({
+          id: r.id,
+          score: r.score,
+          comment: (r.comment ?? '').trim(),
+          createdAt: r.createdAt.toISOString(),
+        })),
+    }))
+  }
+
+  /**
+   * 评价资格：有入场打点或出勤认定为到场即可。
+   * 活动未设签到环节时退回「已报名」口径，否则没有出勤结论的讲座会无人可评。
+   */
+  private async attendedForRating(userId: string, activityId: string, hasPolicy: boolean): Promise<boolean> {
+    const [checkin, result] = await Promise.all([
+      this.db.attendanceCheckpoint.findUnique({
+        where: { activityId_userId_checkpoint: { activityId, userId, checkpoint: 'IN' } },
+        select: { id: true },
+      }),
+      this.db.attendanceAttendanceResult.findUnique({
+        where: { activityId_userId: { activityId, userId } },
+        select: { status: true },
+      }),
+    ])
+    if (checkin) return true
+    if (result && PRESENT_ATTENDANCE.includes(result.status)) return true
+    if (hasPolicy) return false
+    const registration = await this.db.activityRegistration.findUnique({
+      where: { activityId_userId: { activityId, userId } },
+      select: { status: true },
+    })
+    return registration?.status === 'enrolled'
+  }
+
+  /** 提交或修改讲题评分：到场成员、活动结束后、每位讲题人一条，可改分改评语 */
+  async submitLectureRating(
+    userId: string, activityId: string, lectureRequestId: string, input: LectureRatingInput,
+  ): Promise<{ score: number }> {
+    const lecture = await this.loadRatableLecture(userId, activityId, lectureRequestId)
+    const comment = input.comment?.trim() ? input.comment.trim() : null
+    const existing = await this.db.lectureRating.findUnique({
+      where: { lectureRequestId_raterUserId: { lectureRequestId: lecture.id, raterUserId: userId } },
+      select: { id: true },
+    })
+    if (existing) {
+      await this.db.lectureRating.update({ where: { id: existing.id }, data: { score: input.score, comment } })
+    } else {
+      await this.db.lectureRating.create({
+        data: { id: newId(), lectureRequestId: lecture.id, raterUserId: userId, score: input.score, comment },
+      })
+    }
+    await this.logRatingAudit(existing ? 'update' : 'create', lecture.id, activityId)
+    return { score: input.score }
+  }
+
+  /** 撤销本人提交的讲题评分 */
+  async deleteLectureRating(userId: string, activityId: string, lectureRequestId: string): Promise<void> {
+    const lecture = await this.db.lectureRequest.findUnique({
+      where: { id: lectureRequestId },
+      select: { id: true, activityId: true },
+    })
+    if (!lecture || lecture.activityId !== activityId) throw new ActivityError('讲题不存在', 'NOT_FOUND')
+    const existing = await this.db.lectureRating.findUnique({
+      where: { lectureRequestId_raterUserId: { lectureRequestId: lecture.id, raterUserId: userId } },
+      select: { id: true },
+    })
+    if (!existing) throw new ActivityError('你还没有提交该讲题的评分', 'NOT_FOUND')
+    await this.db.lectureRating.delete({ where: { id: existing.id } })
+    await this.logRatingAudit('delete', lecture.id, activityId)
+  }
+
+  private async loadRatableLecture(userId: string, activityId: string, lectureRequestId: string) {
+    const lecture = await this.db.lectureRequest.findUnique({
+      where: { id: lectureRequestId },
+      select: {
+        id: true, activityId: true, userId: true, status: true,
+        activity: { select: { endAt: true, policy: { select: { id: true } } } },
+      },
+    })
+    if (!lecture || lecture.activityId !== activityId) throw new ActivityError('讲题不存在', 'NOT_FOUND')
+    if (lecture.status !== 'approved') throw new ActivityError('该讲题申请未获批准，暂不能评分', 'STATE_INVALID')
+    if (lecture.userId === userId) throw new ActivityError('讲题人不对本人讲题评分', 'RECUSED')
+    if (lecture.activity.endAt.getTime() > Date.now()) throw new ActivityError('活动结束后才能提交满意度评分', 'STATE_INVALID')
+    const attended = await this.attendedForRating(userId, activityId, Boolean(lecture.activity.policy))
+    if (!attended) throw new ActivityError('仅本次活动的到场成员可以评分', 'FORBIDDEN')
+    return lecture
+  }
+
+  /** 审计只落讲题维度：写入评价人主体会把匿名评价反查出来 */
+  private async logRatingAudit(kind: 'create' | 'update' | 'delete', lectureRequestId: string, activityId: string): Promise<void> {
+    const label = kind === 'create' ? '提交' : kind === 'update' ? '修改' : '撤销'
+    await this.audit.log({
+      action: `activity.lecture_rating_${kind}`,
+      resourceType: 'lecture_request',
+      resourceId: lectureRequestId,
+      summary: `${label}讲题满意度评分（活动 ${activityId}）`,
+    })
+  }
+
+  /** 材料上传权限：讲题申请已批，或具备 activity.manage */
+  async canUploadMaterials(actor: SessionActor | undefined, userId: string, activityId: string): Promise<boolean> {
+    if (actor && actorCan(actor, 'activity.manage')) return true
+    const request = await this.db.lectureRequest.findUnique({ where: { activityId_userId: { activityId, userId } } })
+    return request?.status === 'approved'
+  }
+
+  private static readonly MATERIAL_MIME_WHITELIST = new Set([
+    'application/pdf',
+    'application/zip',
+    'application/x-zip-compressed',
+    'text/markdown',
+    'text/plain',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'image/png',
+    'image/jpeg',
+  ])
+
+  /** 上传活动材料（讲题幻灯片/题解）：≤20MiB，白名单类型，受控本地存储 */
+  async createMaterial(
+    actor: SessionActor | undefined,
+    userId: string,
+    activityId: string,
+    file: { buffer: Buffer; mimetype: string; size: number; originalname?: string },
+    input: { title: string; kind: string },
+  ): Promise<{ materialId: string }> {
+    const activity = await this.db.activity.findUnique({ where: { id: activityId }, select: { status: true, endAt: true } })
+    if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
+    if (!(await this.canUploadMaterials(actor, userId, activityId))) {
+      throw new ActivityError('讲题申请获批后才能上传本活动材料', 'FORBIDDEN')
+    }
+    if (activity.endAt.getTime() + 14 * 24 * 3600_000 < Date.now()) throw new ActivityError('活动结束超过 14 天，材料上传已关闭', 'STATE_INVALID')
+    if (file.size > 20 * 1024 * 1024) throw new ActivityError('单个材料不超过 20 MiB', 'PAYLOAD_TOO_LARGE')
+    if (!ActivityService.MATERIAL_MIME_WHITELIST.has(file.mimetype)) throw new ActivityError('仅支持 PDF / Markdown / 文本 / Office 文档 / 图片 / ZIP', 'UNSUPPORTED_MEDIA')
+    const fileName = (file.originalname ?? 'material').replace(/[/\\?%*:|"<>]/g, '_').slice(0, 180)
+    const id = newId()
+    const storageKey = `materials/${activityId}/${id}/source.bin`
+    const fs = await import('node:fs/promises')
+    const path = await import('node:path')
+    const target = path.join(process.env.STORAGE_LOCAL_DIR ?? './storage', storageKey)
+    await fs.mkdir(path.dirname(target), { recursive: true })
+    await fs.writeFile(target, file.buffer)
+    await this.db.activityMaterial.create({
+      data: {
+        id, activityId, uploaderUserId: userId,
+        title: input.title, kind: input.kind, fileName,
+        mimeType: file.mimetype, sizeBytes: file.size, storageKey,
+      },
+    })
+    return { materialId: id }
+  }
+
+  /** 材料元数据 + 绝对路径（下载授权：任意登录成员可见社团内部材料） */
+  async materialForDownload(activityId: string, materialId: string): Promise<{ material: { fileName: string; mimeType: string | null; storageKey: string }; filePath: string }> {
+    const material = await this.db.activityMaterial.findUnique({ where: { id: materialId } })
+    if (!material || material.activityId !== activityId) throw new ActivityError('材料不存在', 'NOT_FOUND')
+    const path = await import('node:path')
+    return {
+      material: { fileName: material.fileName, mimeType: material.mimeType, storageKey: material.storageKey },
+      filePath: path.join(process.env.STORAGE_LOCAL_DIR ?? './storage', material.storageKey),
+    }
+  }
+
+  async deleteMaterial(actor: SessionActor, activityId: string, materialId: string): Promise<void> {
+    const material = await this.db.activityMaterial.findUnique({ where: { id: materialId } })
+    if (!material || material.activityId !== activityId) throw new ActivityError('材料不存在', 'NOT_FOUND')
+    if (material.uploaderUserId !== actor.userId && !actorCan(actor, 'activity.manage')) {
+      throw new ActivityError('只能删除本人上传的材料', 'FORBIDDEN')
+    }
+    await this.db.activityMaterial.delete({ where: { id: materialId } })
+    const fs = await import('node:fs/promises')
+    await fs.rm(`${process.env.STORAGE_LOCAL_DIR ?? './storage'}/${material.storageKey}`, { force: true }).catch(() => undefined)
+  }
+
+  /**
+   * 平台榜社团映射（成员/管理端共用）：抓取平台榜 + 按绑定账号映射成员，
+   * 返回题目、社团排行（含逐题明细）与有效参赛集合。
+   */
+  async platformClubRows(activityId: string, standings: ContestStandingsService) {
+    const activity = await this.db.activity.findUnique({
+      where: { id: activityId },
+      select: { id: true, title: true, platform: true, platformContestId: true, endAt: true },
+    })
+    if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
+    if (!activity.platform || !activity.platformContestId) throw new ActivityError('本活动未关联平台赛事', 'NOT_CONTEST')
+    const contestUrl = contestExternalUrl(activity.platform, activity.platformContestId)
+    const ended = activity.endAt.getTime() <= Date.now()
+    const result = await standings.fetch(activity.platform, activity.platformContestId)
+    if (!result.available) return { activity, contestUrl, ended, result, clubRows: [], clubRanking: [], problems: [], totalEntries: 0 }
+    const accounts = await this.db.platformAccount.findMany({
+      where: { platform: activity.platform, status: { not: 'revoked' } },
+      select: {
+        externalId: true, displayHandle: true, userId: true,
+        user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
+      },
+    })
+    const entryByHandle = new Map(result.entries.map((entry) => [entry.handle, entry]))
+    const clubRows = accounts
+      .map((account) => {
+        const entry = entryByHandle.get(account.externalId) ?? (account.displayHandle ? entryByHandle.get(account.displayHandle) : undefined)
+        if (!entry) return null
+        return {
+          userId: account.userId,
+          name: account.user.profile?.displayName ?? account.user.verifiedRealName,
+          handle: entry.handle,
+          displayName: entry.displayName,
+          platformRank: entry.rank,
+          score: entry.score,
+          solvedCount: entry.solvedCount,
+          cells: entry.cells,
+        }
+      })
+      .filter((row): row is NonNullable<typeof row> => row !== null)
+      .sort((a, b) => b.solvedCount - a.solvedCount || b.score - a.score || a.name.localeCompare(b.name))
+    let clubRank = 0
+    const clubRanking = clubRows.map((row) => ({ ...row, cells: undefined, clubRank: (clubRank += 1) }))
+    const problems = result.problems.map((problem) => ({
+      ...problem,
+      clubSolved: clubRows.filter((row) => row.cells.some((cell) => cell.index === problem.index && cell.solved)).length,
+    }))
+    return { activity, contestUrl, ended, result, clubRows, clubRanking, problems, totalEntries: result.entries.length }
+  }
+
+  /**
+   * 平台榜单（社团视角）：抓取平台榜 + 按平台账号绑定映射成员，
+   * 输出题目（含外链与社团通过数）、我的成绩、社团对题数排名。
+   */
+  async activityStandings(userId: string, activityId: string, standings: ContestStandingsService) {
+    const { activity, contestUrl, ended, result, clubRows, clubRanking, problems, totalEntries } = await this.platformClubRows(activityId, standings)
+    if (!result.available) {
+      return { ...result, contestUrl, ended }
+    }
+    const mine = clubRanking.find((row) => row.userId === userId)
+    return {
+      ...result,
+      contestUrl,
+      ended,
+      problems,
+      clubRanking,
+      totalEntries,
+      me: mine ? { ...mine, cells: mine.cells } : null,
+      // entries 不外发（含非成员个人信息），只保留社团映射与统计
+      entries: undefined,
+    }
   }
 }

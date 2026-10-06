@@ -9,7 +9,7 @@
  */
 import { useCallback, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { BookOpenIcon, CoinsIcon, LoaderCircleIcon, RotateCcwIcon } from 'lucide-react';
+import { BookOpenIcon, ClipboardListIcon, CoinsIcon, LoaderCircleIcon, RotateCcwIcon } from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
@@ -23,6 +23,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -55,7 +56,14 @@ interface ClaimDto {
   status: string;
   scoreMonth: string;
   createdAt: string;
+  evidenceNote: string | null;
+  assets: Array<{ assetId: string }>;
   user: { verifiedRealName: string | null; studentNo: string | null } | null;
+}
+
+/** 佐证图读取入口：thumb 供列表缩略，full 为原图（已剥除 EXIF/GPS） */
+function evidenceUrl(assetId: string, size: 'thumb' | 'full'): string {
+  return `/api/v1/me/claim-evidence/${assetId}?size=${size}`;
 }
 
 interface AppealDto {
@@ -98,6 +106,7 @@ function PointsBody({ principalId }: { principalId: string }) {
   const [tab, setTab] = useState('claims');
   const [entryOpen, setEntryOpen] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
+  const [batchImportOpen, setBatchImportOpen] = useState(false);
   const [disclosureOpen, setDisclosureOpen] = useState(false);
   const queryClient = useQueryClient();
   const [queueNotice, setQueueNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
@@ -118,6 +127,35 @@ function PointsBody({ principalId }: { principalId: string }) {
     async () => (await api.get<DisclosureRowDto[]>('/admin/disclosures')).data,
   );
 
+  const [disclosureActionError, setDisclosureActionError] = useState<string | null>(null);
+  const [confirmDeleteDisclosure, setConfirmDeleteDisclosure] = useState<string | null>(null);
+  const closeDisclosureMutation = useMutation({
+    mutationFn: async (id: string) => {
+      await api.post(`/admin/disclosures/${id}/close`);
+      return true;
+    },
+    onSuccess: () => {
+      setDisclosureActionError(null);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'disclosures'] });
+    },
+    onError: (cause: ApiError) => setDisclosureActionError(cause.message),
+  });
+  const deleteDisclosureMutation = useMutation({
+    mutationFn: async (id: string) => {
+      await api.delete(`/admin/disclosures/${id}`);
+      return true;
+    },
+    onSuccess: () => {
+      setDisclosureActionError(null);
+      setConfirmDeleteDisclosure(null);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'disclosures'] });
+    },
+    onError: (cause: ApiError) => {
+      setDisclosureActionError(cause.message);
+      setConfirmDeleteDisclosure(null);
+    },
+  });
+
   const invalidateQueue = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'reviews'] });
     void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'disclosures'] });
@@ -133,6 +171,10 @@ function PointsBody({ principalId }: { principalId: string }) {
             <Button variant="outline" onClick={() => setEntryOpen(true)}>
               <CoinsIcon aria-hidden="true" />
               入账
+            </Button>
+            <Button variant="outline" onClick={() => setBatchImportOpen(true)}>
+              <ClipboardListIcon aria-hidden="true" />
+              批量加分
             </Button>
             <Button variant="outline" onClick={() => setBatchOpen(true)}>
               <BookOpenIcon aria-hidden="true" />
@@ -185,26 +227,56 @@ function PointsBody({ principalId }: { principalId: string }) {
             skeleton={<div className="h-16 animate-pulse rounded-lg bg-muted" />}
           >
             {(rows) => (
-              <ul className="flex flex-col divide-y divide-border">
-                {rows.map((row) => (
-                  <li key={row.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm">
-                    <span className="tabular-nums">{row.monthKey} 月度公示</span>
-                    <span className="flex items-center gap-2">
-                      <StatusBadge kind="disclosure" value={row.status === 'published' ? '公示中' : '已结束'} />
-                      <span className="text-xs text-muted-foreground tabular-nums">
-                        {row.startsAt ? formatDateTime(row.startsAt) : ''} ~{' '}
-                        {row.endsAt ? formatDateTime(row.endsAt) : ''}
+              <>
+                {disclosureActionError && (
+                  <Alert variant="destructive" className="mb-2">
+                    <AlertDescription>{disclosureActionError}</AlertDescription>
+                  </Alert>
+                )}
+                <ul className="flex flex-col divide-y divide-border">
+                  {rows.map((row) => (
+                    <li key={row.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm">
+                      <span className="tabular-nums">{row.monthKey} 月度公示</span>
+                      <span className="flex flex-wrap items-center gap-2">
+                        <StatusBadge kind="disclosure" value={row.status === 'published' ? '公示中' : '已结束'} />
+                        <span className="text-xs text-muted-foreground tabular-nums">
+                          {row.startsAt ? formatDateTime(row.startsAt) : ''} ~{' '}
+                          {row.endsAt ? formatDateTime(row.endsAt) : ''}
+                        </span>
+                        {row.status === 'published' && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={closeDisclosureMutation.isPending}
+                            onClick={() => closeDisclosureMutation.mutate(row.id)}
+                          >
+                            提前结束
+                          </Button>
+                        )}
+                        <Button
+                          size="sm"
+                          variant={confirmDeleteDisclosure === row.id ? 'destructive' : 'ghost'}
+                          className={confirmDeleteDisclosure === row.id ? undefined : 'text-destructive hover:text-destructive'}
+                          disabled={deleteDisclosureMutation.isPending}
+                          onClick={() => {
+                            if (confirmDeleteDisclosure === row.id) deleteDisclosureMutation.mutate(row.id);
+                            else setConfirmDeleteDisclosure(row.id);
+                          }}
+                        >
+                          {confirmDeleteDisclosure === row.id ? '确认删除' : '删除'}
+                        </Button>
                       </span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
           </QueryBoundary>
         </CardContent>
       </Card>
 
       <LedgerEntryDialog open={entryOpen} onOpenChange={setEntryOpen} />
+      <BatchLedgerDialog open={batchImportOpen} onOpenChange={setBatchImportOpen} />
       <MonthlyBatchDialog open={batchOpen} onOpenChange={setBatchOpen} />
       <DisclosureDialog open={disclosureOpen} onOpenChange={setDisclosureOpen} />
     </div>
@@ -272,6 +344,11 @@ function ClaimsQueue({
                   <span className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium text-foreground">{claim.title}</span>
                     <BadgeOfCategory category={claim.category} />
+                    {claim.assets.length > 0 && (
+                      <span className="rounded-sm bg-muted px-1.5 py-0.5 text-xs text-foreground/80 tabular-nums">
+                        {claim.assets.length} 图
+                      </span>
+                    )}
                   </span>
                   <span className="text-xs text-muted-foreground">
                     {claim.user?.verifiedRealName ?? '—'} · {claim.user?.studentNo ?? '—'} ·{' '}
@@ -294,6 +371,38 @@ function ClaimsQueue({
               {CATEGORY_LABELS[selected.category] ?? selected.category} · 记分月份{' '}
               <span className="tabular-nums">{selected.scoreMonth}</span>
             </p>
+            {selected.evidenceNote && (
+              <p className="text-sm leading-[22px] break-words text-foreground/90">
+                <span className="text-muted-foreground">佐证说明：</span>
+                {selected.evidenceNote}
+              </p>
+            )}
+            {selected.assets.length > 0 && (
+              <div className="flex flex-col gap-1.5">
+                <p className="text-xs text-muted-foreground">
+                  佐证图片（{selected.assets.length} 张，点击查看原图）
+                </p>
+                <ul className="grid grid-cols-3 gap-2 sm:grid-cols-4">
+                  {selected.assets.map((asset, index) => (
+                    <li key={asset.assetId}>
+                      <a
+                        href={evidenceUrl(asset.assetId, 'full')}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block aspect-square overflow-hidden rounded-xl border border-border bg-muted outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <img
+                          src={evidenceUrl(asset.assetId, 'thumb')}
+                          alt={`佐证图 ${index + 1}`}
+                          loading="lazy"
+                          className="size-full object-cover"
+                        />
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="grid gap-1.5">
               <Label htmlFor="claim-note">审核备注（可选）</Label>
               <Textarea
@@ -529,6 +638,234 @@ function CasesQueue({
         </Card>
       )}
     </div>
+  );
+}
+
+interface ParsedBatchRow {
+  studentNo: string;
+  amount: string;
+  note?: string;
+  error?: string;
+}
+
+/** 解析粘贴/CSV 行：`学号 分数 备注`，分隔符支持逗号（中英）、Tab、空白 */
+function parseBatchRows(text: string): ParsedBatchRow[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .slice(0, 200)
+    .map((line) => {
+      const parts = line.split(/[\t,，;；]+|\s+/).filter((part) => part !== '');
+      const studentNo = parts[0] ?? '';
+      const amount = parts[1] ?? '';
+      const note = parts.slice(2).join(' ') || undefined;
+      if (studentNo.length < 3) return { studentNo, amount, note, error: '学号无效' };
+      if (!/^-?\d+(\.\d+)?$/.test(amount)) return { studentNo, amount, note, error: '分数需为十进制数字（可负）' };
+      return { studentNo, amount, note };
+    });
+}
+
+/** 批量加分：粘贴或导入 CSV（学号,分数,备注），可选关联活动（成员端活动详情展示积分） */
+function BatchLedgerDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const principal = usePrincipal();
+  const principalId = principal?.principalId ?? null;
+  const queryClient = useQueryClient();
+  const [category, setCategory] = useState('activity');
+  const [scoreMonth, setScoreMonth] = useState(currentMonthKey());
+  const [activityId, setActivityId] = useState('none');
+  const [rawText, setRawText] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{ posted: number; deduplicated: number; failed: Array<{ studentNo: string; error: string }> } | null>(null);
+
+  const activitiesQuery = usePrivateQuery<Array<{ id: string; title: string; status: string }>, ApiError>(
+    principalId,
+    ['admin', 'activities', 'for-points'],
+    async () => (await api.get<Array<{ id: string; title: string; status: string }>>('/admin/activities')).data,
+    { enabled: open && principalId != null },
+  );
+  const activityOptions = (activitiesQuery.data ?? []).filter((item) => item.status !== 'draft').slice(0, 30);
+
+  const parsed = parseBatchRows(rawText);
+  const validRows = parsed.filter((row) => !row.error);
+  const invalidRows = parsed.filter((row) => row.error);
+
+  const mutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await api.post<{ batchId: string; posted: number; deduplicated: number; failed: Array<{ studentNo: string; error: string }> }>(
+        '/admin/ledger-entries/batch',
+        {
+          rows: validRows.map((row) => ({ studentNo: row.studentNo, amount: row.amount, note: row.note })),
+          category,
+          scoreMonth,
+          ...(activityId !== 'none' ? { activityId } : {}),
+        },
+      );
+      return data;
+    },
+    onSuccess: (data) => {
+      setResult({ posted: data.posted, deduplicated: data.deduplicated, failed: data.failed });
+      setError(null);
+      setRawText('');
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (cause: ApiError) => {
+      setError(cause.message);
+      setResult(null);
+    },
+  });
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>批量加分</DialogTitle>
+          <DialogDescription>
+            每行一条：`学号 分数 备注`（分隔符支持逗号 / Tab / 空格，最多 200 行）；
+            关联活动后成员端活动详情会显示本次积分。同一批次内按学号幂等，重复提交整批不重复入账。
+          </DialogDescription>
+        </DialogHeader>
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        {result && (
+          <Alert>
+            <AlertDescription>
+              已入账 {result.posted} 条{result.deduplicated > 0 ? `，幂等跳过 ${result.deduplicated} 条` : ''}
+              {result.failed.length > 0 ? `，失败 ${result.failed.length} 条` : ''}。
+              {result.failed.length > 0 && (
+                <ul className="mt-1 flex flex-col gap-0.5 text-xs text-muted-foreground">
+                  {result.failed.map((row, index) => (
+                    <li key={index}>{row.studentNo}：{row.error}</li>
+                  ))}
+                </ul>
+              )}
+            </AlertDescription>
+          </Alert>
+        )}
+        <div className="grid gap-2 sm:grid-cols-3">
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="batch-category">类别</Label>
+            <Select value={category} onValueChange={setCategory}>
+              <SelectTrigger id="batch-category">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="activity">活动</SelectItem>
+                <SelectItem value="contest">比赛</SelectItem>
+                <SelectItem value="remote_contest">远程赛</SelectItem>
+                <SelectItem value="contribution">贡献</SelectItem>
+                <SelectItem value="service">服务</SelectItem>
+                <SelectItem value="award">奖励</SelectItem>
+                <SelectItem value="penalty">扣分</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="batch-month">计分月份</Label>
+            <Input
+              id="batch-month"
+              type="month"
+              value={scoreMonth}
+              onChange={(event) => setScoreMonth(event.target.value || currentMonthKey())}
+            />
+          </div>
+          <div className="flex flex-col gap-1.5">
+            <Label htmlFor="batch-activity">关联活动（可选）</Label>
+            <Select value={activityId} onValueChange={setActivityId}>
+              <SelectTrigger id="batch-activity">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">不关联</SelectItem>
+                {activityOptions.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.title}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="batch-raw">粘贴名单（学号 分数 备注）</Label>
+          <Textarea
+            id="batch-raw"
+            value={rawText}
+            onChange={(event) => {
+              setRawText(event.target.value);
+              setResult(null);
+            }}
+            rows={6}
+            placeholder={'202600001 12 周赛到场\n202600002 8.5 周赛到场'}
+            className="font-mono text-xs"
+          />
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              已解析 <span className="font-medium text-foreground tabular-nums">{validRows.length}</span> 条有效
+              {invalidRows.length > 0 && (
+                <span className="text-destructive">，{invalidRows.length} 条格式有误</span>
+              )}
+            </span>
+            <label className="cursor-pointer underline-offset-2 hover:underline">
+              或上传 CSV 文件
+              <input
+                type="file"
+                accept=".csv,.txt"
+                className="hidden"
+                onChange={async (event) => {
+                  const file = event.target.files?.[0];
+                  if (!file) return;
+                  const text = await file.text();
+                  setRawText(text);
+                  setResult(null);
+                  event.target.value = '';
+                }}
+              />
+            </label>
+          </div>
+          {parsed.length > 0 && (
+            <div className="max-h-40 overflow-y-auto rounded-lg border border-border">
+              <Table>
+                <TableHeader>
+                  <TableRow className="h-8">
+                    <TableHead className="pl-3 text-xs">学号</TableHead>
+                    <TableHead className="text-xs">分数</TableHead>
+                    <TableHead className="pr-3 text-xs">备注 / 问题</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {parsed.map((row, index) => (
+                    <TableRow key={index} className={row.error ? 'bg-destructive-subtle/40' : undefined}>
+                      <TableCell className="py-1.5 pl-3 text-xs tabular-nums">{row.studentNo}</TableCell>
+                      <TableCell className="py-1.5 text-xs tabular-nums">{row.amount}</TableCell>
+                      <TableCell className="py-1.5 pr-3 text-xs text-muted-foreground">
+                        {row.error ? <span className="text-destructive">{row.error}</span> : row.note ?? '—'}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </div>
+        <Button
+          disabled={mutation.isPending || validRows.length === 0}
+          onClick={() => mutation.mutate()}
+        >
+          {mutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+          提交 {validRows.length} 条入账
+        </Button>
+      </DialogContent>
+    </Dialog>
   );
 }
 

@@ -9,6 +9,8 @@ interface SessionDetails {
   principalKind: string;
   userId: string | null;
   realName: string | null;
+  displayName: string | null;
+  avatarAssetId: string | null;
   roles: string[];
 }
 
@@ -28,10 +30,14 @@ export function useWorkspaceSession() {
     : principalKind === 'staff'
       ? '教职工账号'
       : '校园账号';
-  const displayName = details.data?.realName || (principal?.authenticated ? fallbackName : '未登录');
+  // 资料页改过展示名时侧栏同步跟随，没设过则回退真实姓名
+  const displayName =
+    details.data?.displayName || details.data?.realName || (principal?.authenticated ? fallbackName : '未登录');
   const user: WorkspaceUser = {
     displayName,
     avatarText: displayName.slice(0, 1),
+    avatarAssetId: details.data?.avatarAssetId ?? null,
+    principalKind,
     membershipLabel: principal?.authenticated
       ? principalKind === 'system'
         ? '本地管理员'

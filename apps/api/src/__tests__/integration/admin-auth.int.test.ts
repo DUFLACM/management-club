@@ -161,4 +161,18 @@ describe('独立管理员认证', () => {
     const newGateRes = captureRes()
     await expect(adminAuth.openGate(request(fresh.jar, fresh.token), newGateRes, 'replacement-entry-secret-2026', fresh.token)).resolves.toBeTruthy()
   })
+
+  it('密语下限为 5 字符：5 位可用，4 位拒绝', async () => {
+    const actor = { principalId, roles: ['system_admin'], principalKind: 'system' } as never
+    await expect(adminAuth.rotateAccessSecret(actor, PASSWORD, 'abcd')).rejects.toMatchObject({ code: 'ADMIN_SECRET_FORMAT' })
+
+    const rotated = await adminAuth.rotateAccessSecret(actor, PASSWORD, 'acm66')
+    expect(rotated.version).toBeGreaterThan(1)
+
+    // 短密语同样要能真正通过入口校验，不是只放过了长度检查
+    const fresh = await primeCsrf()
+    await expect(
+      adminAuth.openGate(request(fresh.jar, fresh.token), captureRes(), 'acm66', fresh.token),
+    ).resolves.toBeTruthy()
+  })
 })

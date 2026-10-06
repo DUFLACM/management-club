@@ -180,6 +180,46 @@ function nowcoderHistoryUrl(uid: string, page: number): string {
   return `https://${PLATFORM_HOSTS.nowcoder[0]}/acm-heavy/acm/contest/profile/contest-joined-history?${params.toString()}`
 }
 
+export interface NowcoderRatingPoint {
+  contestId: string
+  contestName: string | null
+  /** 赛后 rating；changeValue 为本次变化（old = rating - changeValue，牛客初始 1000） */
+  rating: number
+  changeValue: number | null
+  rank: number | null
+  occurredAt: Date
+}
+
+/** 牛客 rating 历史解析（rating-history?uid= 契约：毫秒时间；按时间升序返回） */
+export function parseNowcoderRatingHistory(body: unknown): NowcoderRatingPoint[] {
+  const envelope = body as { code?: number; msg?: string; data?: unknown[] }
+  if (envelope.code !== 0) {
+    throw new AdapterError(`牛客业务错误 code=${envelope.code} msg=${envelope.msg ?? ''}`, 'BIZ_CODE', false)
+  }
+  return (envelope.data ?? [])
+    .map((item) => {
+      const r = item as Record<string, unknown>
+      return {
+        contestId: String(r.contestId ?? ''),
+        contestName: typeof r.contestName === 'string' ? r.contestName : null,
+        rating: typeof r.rating === 'number' ? r.rating : null,
+        changeValue: typeof r.changeValue === 'number' ? r.changeValue : null,
+        rank: typeof r.rank === 'number' ? r.rank : null,
+        occurredAt: typeof r.time === 'number' ? new Date(r.time) : null, // 毫秒
+      }
+    })
+    .filter((p): p is NowcoderRatingPoint => p.contestId !== '' && p.rating != null && p.occurredAt != null)
+    .sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime())
+}
+
+/** 拉取牛客 rating 历史（公开接口，无需 token；uid 为牛客数字 UID） */
+export async function fetchNowcoderRatingHistory(db: PrismaClient, uid: string): Promise<NowcoderRatingPoint[]> {
+  const host = PLATFORM_HOSTS.nowcoder[0]
+  const url = `https://${host}/acm/contest/rating-history?token=&uid=${encodeURIComponent(uid)}`
+  const body = await fetchJson(db, host, url, { maxBytes: 512 * 1024 })
+  return parseNowcoderRatingHistory(body)
+}
+
 /** 牛客比赛详情导入：读取官方比赛页 HTML 的 window.pageInfo 静态字面量（绝不 eval 页面脚本） */
 export async function fetchNowcoderContestMeta(db: PrismaClient, contestId: string): Promise<{ found: boolean; contest: NormalizedContestRecord | null }> {
   const host = PLATFORM_HOSTS.nowcoder[0]

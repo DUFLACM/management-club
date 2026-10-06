@@ -18,14 +18,24 @@ export function initialPoints(rank: number, total: number): Decimal {
 
 /**
  * 资质优异通道：I = 12 + 0.3 × max(0, 综合评分 - 60)（至少 60 分才可录取）。
- * R02：附录另有的“正式社员中位数 80% 上限”未决，由调用方在 rule params 配置 medianCap 后应用。
+ * R02 已拍板：上限 = floor(正式成员月度 M 中位数 × 0.8)；中位数不足 minimumMedian（默认 15）
+ * 或无正式成员样本时不设上限。显式 medianCap 覆盖计算值。
  */
-export function excellenceInitialPoints(score: number, medianCap: number | null, currentMedianM: Decimal | null): { value: Decimal; pendingR02: boolean } {
-  const base = new Decimal(12).plus(new Decimal(0.3).mul(Decimal.max(0, new Decimal(score).minus(60))))
-  if (medianCap != null && currentMedianM != null) {
-    return { value: Decimal.min(base, currentMedianM.mul(0.8)), pendingR02: false }
+export function excellenceInitialPoints(
+  score: number,
+  initial: RuleParams['initialPoints'],
+  currentMedianM: Decimal | null,
+): { value: Decimal; capped: boolean } {
+  const base = new Decimal(initial.excellenceBase).plus(new Decimal(initial.excellenceFactor).mul(Decimal.max(0, new Decimal(score).minus(60))))
+  let cap: Decimal | null = null
+  if (initial.medianCap != null) {
+    cap = new Decimal(initial.medianCap)
+  } else if (currentMedianM != null && currentMedianM.gte(initial.medianCapMinimumMedian)) {
+    const raw = currentMedianM.mul(initial.medianCapRatio)
+    cap = initial.medianCapRounding === 'floor' ? raw.floor() : raw.toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
   }
-  return { value: base, pendingR02: true }
+  if (cap == null) return { value: base, capped: false }
+  return { value: Decimal.min(base, cap), capped: base.gt(cap) }
 }
 
 /** 基础正式名额 F = min(15, max(8, ceil(0.4 × N)))；N 为上月最后一日在册正式成员数 */

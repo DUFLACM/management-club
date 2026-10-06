@@ -262,8 +262,16 @@ describe('活动参与分与扣分（附录二第五节）', () => {
     expect(r.value!.toNumber()).toBe(0)
   })
 
-  it('同时迟到与早退均超 15 分钟 → R03 pending（不擅自叠加两次 -2）', () => {
+  it('R03 已拍板：同时迟到与早退 → 参与分 +1 一次，扣分按次叠加 -4', () => {
     const r = classifyAttendance({ ...base, durationMinutes: 120, checkinOffsetMinutes: 20, checkoutOffsetMinutes: 20 }, params)
+    expect(r.status).toBe('ok')
+    expect(r.value!.toNumber()).toBe(1)
+    expect(r.penaltyDraft!.amount.toNumber()).toBe(-4)
+  })
+
+  it('R03 显式 pending（未拍板的旧版本）：同时迟到早退仍转人工', () => {
+    const p = { ...params, lateEarlyPolicy: 'pending' as const }
+    const r = classifyAttendance({ ...base, durationMinutes: 120, checkinOffsetMinutes: 20, checkoutOffsetMinutes: 20 }, p)
     expect(r.status).toBe('pending')
     expect(r.gap).toBe('R03')
   })
@@ -298,7 +306,7 @@ describe('贡献分与月上限', () => {
     expect(r.totals.contest.toNumber()).toBe(50)
   })
 
-  it('R01 未决：月度 rollup 只给 rawTotal，不给正式 M', () => {
+  it('R01 已拍板：默认月末四舍五入，rollup 直接给出正式 M', () => {
     const r = rollupMonthly(
       {
         positiveEntries: [{ category: 'contest', amount: 10.5 }],
@@ -307,9 +315,23 @@ describe('贡献分与月上限', () => {
       },
       params,
     )
+    expect(r.m).toBe(9)
+    expect(r.rawTotal.toNumber()).toBe(8.5)
+    expect(r.roundingPolicy).toBe('round_half_up')
+  })
+
+  it('R01 显式 pending（未拍板的旧版本）：只给 rawTotal 并阻塞正式 M', () => {
+    const p = { ...params, monthlyRounding: 'pending' as const }
+    const r = rollupMonthly(
+      {
+        positiveEntries: [{ category: 'contest', amount: 10.5 }],
+        negativeEntries: [{ category: 'penalty', amount: -2 }],
+        params: p,
+      },
+      p,
+    )
     expect(r.m).toBeNull()
     expect(r.blockedReason).toContain('R01')
-    expect(r.rawTotal.toNumber()).toBe(8.5)
   })
 
   it('配置 round_half_up 后 M 四舍五入（模拟值仅用于测试）', () => {

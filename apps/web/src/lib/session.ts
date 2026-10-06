@@ -100,6 +100,7 @@ export function hasAnyAction(roles: string[], actions: string[]): boolean {
       'badges.define',
       'competitions.manage',
       'rooms.approve',
+      'evaluation.manage',
     ],
     advisor: [
       'teacher.approve',
@@ -108,6 +109,7 @@ export function hasAnyAction(roles: string[], actions: string[]): boolean {
       'points.review',
       'disclosure.publish',
       'competitions.manage',
+      'evaluation.manage',
     ],
     system_admin: [
       'settings.manage',

@@ -1,14 +1,14 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect } from 'react';
 import { useSearchParams } from 'react-router';
 import { useWorkspaceSession } from '@/lib/workspace-session';
 import { AuthWorkspaceEntry } from '@/workspaces/shared/AuthWorkspaceEntry';
 import {
   CalendarDaysIcon,
   CoinsIcon,
+  FileSignatureIcon,
   LayoutDashboardIcon,
   LoaderCircleIcon,
   ListOrderedIcon,
-  ScanLineIcon,
   TrophyIcon,
   UserRoundIcon,
 } from 'lucide-react';
@@ -30,14 +30,16 @@ import {
  * - section/tab 均来自 URL query（白名单解析，非法值回 overview）；
  * - 面板内部子标签（tab）由各面板自行读取 searchParams；
  * - 导航通过 setSearchParams 写 URL，浏览器后退/前进由 react-router 统一处理。
+ * - 签到/签出已并入活动详情页（section=attendance 旧链接自动重定向，保留 id 参数）；
+ * - 竞赛与贡献已拆为两个 section（contests&tab=claims 旧链接自动重定向到 contributions）。
  */
 
-/** 成员导航顺序：概览、活动、签到与出勤、竞赛与贡献、积分、榜单、我的 */
+/** 成员导航顺序：概览、活动、竞赛、贡献、积分、榜单、我的 */
 export const MEMBER_SECTIONS: readonly WorkspaceSection[] = [
   { key: 'overview', title: '概览', icon: LayoutDashboardIcon },
   { key: 'activities', title: '活动', icon: CalendarDaysIcon },
-  { key: 'attendance', title: '签到与出勤', icon: ScanLineIcon },
-  { key: 'contests', title: '竞赛与贡献', icon: TrophyIcon },
+  { key: 'contests', title: '竞赛', icon: TrophyIcon },
+  { key: 'contributions', title: '贡献', icon: FileSignatureIcon },
   { key: 'points', title: '积分', icon: CoinsIcon },
   { key: 'ranking', title: '榜单', icon: ListOrderedIcon },
   { key: 'profile', title: '我的', icon: UserRoundIcon },
@@ -62,6 +64,37 @@ export function MemberWorkspace({ user: providedUser, manageAccess }: MemberWork
     MEMBER_SECTION_KEYS,
     MEMBER_DEFAULT_SECTION,
   );
+
+  // 旧「签到与出勤」面板已并入活动详情：section=attendance&id=X → activities&activity=X（保留 #q= 深链）
+  useEffect(() => {
+    if (searchParams.get('section') !== 'attendance') return;
+    setSearchParams(
+      (previous) => {
+        const next = new URLSearchParams(previous);
+        const legacyId = next.get('id');
+        next.delete('id');
+        next.set('section', 'activities');
+        if (legacyId) next.set('activity', legacyId);
+        else next.delete('activity');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [searchParams, setSearchParams]);
+
+  // 贡献申报已拆出独立 section：contests&tab=claims → contributions
+  useEffect(() => {
+    if (searchParams.get('section') !== 'contests' || searchParams.get('tab') !== 'claims') return;
+    setSearchParams(
+      (previous) => {
+        const next = new URLSearchParams(previous);
+        next.delete('tab');
+        next.set('section', 'contributions');
+        return next;
+      },
+      { replace: true },
+    );
+  }, [searchParams, setSearchParams]);
 
   const handleNavigate = useCallback(
     (sectionKey: string) => {

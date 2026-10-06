@@ -5,14 +5,17 @@ import {
   ChevronsLeftIcon,
   ChevronsRightIcon,
   ChevronsUpDownIcon,
+  LogOutIcon,
   MenuIcon,
   ShieldCheckIcon,
   UserRoundIcon,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
+import { api, resetCsrfToken } from '@/lib/api';
+import { SESSION_CHANGED_EVENT } from '@/lib/query';
 import { ClubMark } from '@/components/club/ClubMark';
-import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -37,7 +40,7 @@ import { MobileNavigation } from '@/workspaces/shared/MobileNavigation';
  *
  * - ≥1024px：232px 侧栏 + 64px 顶栏，内容 max-width 1440px、padding 32px；
  * - 768–1023px：72px 图标侧栏，可展开为 232px 浮层，不压缩内容区；
- * - 320–767px：56px 顶栏 + 56px 加安全区的五项底栏（成员端）；
+ * - 320–767px：56px 顶栏 + 56px 加安全区的六项底栏（成员端）；
  *   管理端手机使用顶栏菜单按钮 + 导航 Sheet。
  * - 选中项：淡蓝底、蓝字、左侧 3px 标记、圆角 10px；
  * - 内容容器 min-w-0，避免表格/长字段撑破布局。
@@ -54,6 +57,8 @@ export interface WorkspaceSection {
 export interface WorkspaceUser {
   displayName: string;
   avatarText: string;
+  avatarAssetId: string | null;
+  principalKind: string | null;
   membershipLabel: string;
   roles: string[];
 }
@@ -90,17 +95,23 @@ function roleLabels(roles: string[]): string {
 function navigationGroups(variant: 'member' | 'admin', sections: readonly WorkspaceSection[]) {
   const groups = variant === 'member'
     ? [
-      { label: '训练室', keys: ['overview', 'activities', 'attendance', 'contests'] },
+      { label: '训练室', keys: ['overview', 'activities', 'attendance', 'contests', 'contributions'] },
       { label: '积分与资料', keys: ['points', 'ranking', 'profile'] },
     ]
     : [
-      { label: '业务管理', keys: ['overview', 'members', 'activities', 'contests', 'points', 'rules'] },
+      { label: '业务管理', keys: ['overview', 'members', 'activities', 'contests', 'points', 'evaluation'] },
       { label: '系统与授权', keys: ['invites', 'sync', 'audit', 'settings'] },
     ];
-  return groups.map((group) => ({
+  const grouped = groups.map((group) => ({
     label: group.label,
     sections: sections.filter((section) => group.keys.includes(section.key)),
-  })).filter((group) => group.sections.length > 0);
+  }));
+  // 未列入任何分组的 section 归入最后一组，避免新增 section 在侧边栏静默消失
+  const known = new Set(groups.flatMap((group) => group.keys));
+  const ungrouped = sections.filter((section) => !known.has(section.key));
+  const last = grouped.at(-1);
+  if (last && ungrouped.length > 0) last.sections = [...last.sections, ...ungrouped];
+  return grouped.filter((group) => group.sections.length > 0);
 }
 
 function NavItemLabel({ section, expanded }: { section: WorkspaceSection; expanded: boolean }) {
@@ -177,6 +188,28 @@ function SidebarNavItem({
   );
 }
 
+/**
+ * 退出登录：撤销服务端会话 → 清掉 CSRF 与全部私人查询缓存 → 离开当前工作台。
+ * 本地管理员回 /admin/login；校园账号走 CAS 联动登出（共用机器上必须把 CAS 会话也断掉）。
+ * 接口失败也照常清本地状态并跳走——用户的意图是离开，不能把人卡在已登录界面。
+ */
+async function performLogout(principalKind: string | null): Promise<void> {
+  let casLogoutUrl: string | null = null;
+  try {
+    const { data } = await api.post<{ casLogoutUrl?: string }>('/auth/logout', {});
+    casLogoutUrl = data?.casLogoutUrl ?? null;
+  } catch {
+    // 忽略：会话可能已过期或网络失败，下面仍然清本地状态
+  }
+  resetCsrfToken();
+  window.dispatchEvent(new Event(SESSION_CHANGED_EVENT));
+  if (principalKind === 'system') {
+    window.location.assign('/admin/login');
+    return;
+  }
+  window.location.assign(casLogoutUrl ?? '/login');
+}
+
 function SidebarFooter({
   variant,
   user,
@@ -221,6 +254,12 @@ function SidebarFooter({
             )}
           >
             <Avatar className="size-8 shrink-0 ring-1 ring-sidebar-border">
+              {user.avatarAssetId && (
+                <AvatarImage
+                  src={`/api/v1/me/avatar/${user.avatarAssetId}?size=64`}
+                  alt={`${user.displayName} 的头像`}
+                />
+              )}
               <AvatarFallback>{user.avatarText}</AvatarFallback>
             </Avatar>
             <span className={cn('hidden min-w-0 flex-1 flex-col', expanded ? 'md:flex' : 'md:hidden', 'lg:flex')}>
@@ -268,6 +307,14 @@ function SidebarFooter({
               </a>
             </DropdownMenuItem>
           )}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            variant="destructive"
+            onSelect={() => void performLogout(user.principalKind)}
+          >
+            <LogOutIcon aria-hidden="true" />
+            退出登录
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
@@ -457,7 +504,7 @@ export function WorkspaceShell({
           </div>
         </main>
 
-        {/* 手机五项底栏：仅成员端；管理端用顶栏菜单 + Sheet */}
+        {/* 手机六项底栏：仅成员端；管理端用顶栏菜单 + Sheet */}
         {variant === 'member' && (
           <MobileNavigation currentSection={currentSection} onNavigate={onNavigate} />
         )}

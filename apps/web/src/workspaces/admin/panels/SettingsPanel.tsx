@@ -600,6 +600,9 @@ function GroupEditor({ principalId, group }: { principalId: string; group: strin
   );
 }
 
+/** 入口密语长度下限，与服务端 ADMIN_SECRET_MIN_LENGTH 对齐（标签/输入框/提交按钮共用，避免各写各的） */
+const GATE_SECRET_MIN_LENGTH = 5;
+
 function AdminAuthSecurityEditor() {
   const [currentPassword, setCurrentPassword] = useState('');
   const [newGateSecret, setNewGateSecret] = useState('');
@@ -673,13 +676,13 @@ function AdminAuthSecurityEditor() {
             />
           </div>
           <div className="grid gap-1.5">
-            <Label htmlFor="admin-new-gate-secret">新密语（16–256 个字符）</Label>
+            <Label htmlFor="admin-new-gate-secret">新密语（{GATE_SECRET_MIN_LENGTH}–256 个字符）</Label>
             <Input
               id="admin-new-gate-secret"
               type="password"
               autoComplete="new-password"
               required
-              minLength={16}
+              minLength={GATE_SECRET_MIN_LENGTH}
               maxLength={256}
               value={newGateSecret}
               onChange={(event) => setNewGateSecret(event.target.value)}
@@ -693,7 +696,7 @@ function AdminAuthSecurityEditor() {
               type="password"
               autoComplete="new-password"
               required
-              minLength={16}
+              minLength={GATE_SECRET_MIN_LENGTH}
               maxLength={256}
               value={confirmGateSecret}
               onChange={(event) => setConfirmGateSecret(event.target.value)}
@@ -709,7 +712,13 @@ function AdminAuthSecurityEditor() {
           <div className="border-t border-border pt-3">
             <Button
               type="submit"
-              disabled={updateMutation.isPending || !currentPassword || newGateSecret.length < 16 || !confirmGateSecret || !secretsMatch}
+              disabled={
+                updateMutation.isPending ||
+                !currentPassword ||
+                newGateSecret.length < GATE_SECRET_MIN_LENGTH ||
+                !confirmGateSecret ||
+                !secretsMatch
+              }
             >
               {updateMutation.isPending ? <LoaderCircleIcon className="animate-spin" aria-hidden="true" /> : <KeyRoundIcon aria-hidden="true" />}
               {updateMutation.isPending ? '正在更新…' : '更新管理入口密语'}

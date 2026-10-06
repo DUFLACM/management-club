@@ -46,14 +46,30 @@ export class ProfilesController {
     return ok(await this.profiles.memberRatings(actor, memberId))
   }
 
-  /** 比赛成绩（四平台 + 自定义；分页） */
+  /** 比赛成绩（四平台 + 自定义；按比赛时间倒序，支持平台/时间段筛选，分页） */
   @Get('profiles/:memberId/competition-results')
-  async competitionResults(@CurrentActor() actor: SessionActor, @Param('memberId', ParseUUIDPipe) memberId: string, @Query('platform') platform?: string, @Query('cursor') cursor?: string) {
+  async competitionResults(
+    @CurrentActor() actor: SessionActor,
+    @Param('memberId', ParseUUIDPipe) memberId: string,
+    @Query('platform') platform?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('cursor') cursor?: string,
+  ) {
     const isSelf = actor.userId === memberId
+    const fromAt = from && !Number.isNaN(Date.parse(from)) ? new Date(from) : null
+    const toAt = to && !Number.isNaN(Date.parse(to)) ? new Date(to) : null
     const accounts = await this.db.platformAccount.findMany({ where: { userId: memberId } })
+    const contestFilter = {
+      ...(platform ? { platform } : {}),
+      ...((fromAt || toAt) ? { startTime: { ...(fromAt ? { gte: fromAt } : {}), ...(toAt ? { lte: toAt } : {}) } } : {}),
+    }
     const rows = await this.db.platformResult.findMany({
-      where: { platformAccountId: { in: accounts.map((a) => a.id) }, ...(platform ? { platformContest: { platform } } : {}) },
-      orderBy: { syncedAt: 'desc' },
+      where: {
+        platformAccountId: { in: accounts.map((a) => a.id) },
+        ...(Object.keys(contestFilter).length > 0 ? { platformContest: contestFilter } : {}),
+      },
+      orderBy: [{ platformContest: { startTime: 'desc' } }, { id: 'desc' }],
       take: 26,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       include: { platformContest: true, platformAccount: true },

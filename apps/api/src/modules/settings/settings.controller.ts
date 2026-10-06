@@ -7,6 +7,7 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { SessionService } from '../auth/session.service.js'
 import { AdminAuthError, AdminAuthService } from '../auth/admin-auth.service.js'
+import { ADMIN_SECRET_MIN_LENGTH } from '../auth/admin-auth.crypto.js'
 
 @Controller('/api/v1/admin/settings')
 @UseGuards(SessionGuard, PermissionsGuard, ActionGuard)
@@ -80,7 +81,7 @@ export class SettingsController {
   ) {
     const input = z.object({
       currentPassword: z.string().min(1).max(512),
-      newSecret: z.string().min(16).max(256),
+      newSecret: z.string().min(ADMIN_SECRET_MIN_LENGTH).max(256),
       csrfToken: z.string().optional(),
     }).strict().parse(body)
     if (!(await this.sessions.verifyCsrf(req, input.csrfToken))) {

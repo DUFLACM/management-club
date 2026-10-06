@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
+import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
 import { z } from 'zod'
 import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentUser, CurrentActor, ok } from '../../common/guards.js'
 import { MembersService, MembersError, MEMBERSHIP_STATUSES } from './members.service.js'
@@ -99,6 +99,56 @@ export class MembersAdminController {
     if (!parsed.success) throw new MembersError(parsed.error.issues[0].message, 'INVALID_INPUT')
     await this.members.setMembership(actor, id, parsed.data.status, parsed.data.reason)
     return ok({ updated: true })
+  }
+
+  /** 禁用账号（软删除）：会话立即失效，历史保留 */
+  @Post('members/:id/disable')
+  @RequireAction('members.manage')
+  async disableMember(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ reason: z.string().min(3).max(500) }).safeParse(body)
+    if (!parsed.success) throw new MembersError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    await this.members.disableMember(actor, id, parsed.data.reason)
+    return ok({ disabled: true })
+  }
+
+  @Post('members/:id/enable')
+  @RequireAction('members.manage')
+  async enableMember(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    await this.members.enableMember(actor, id)
+    return ok({ enabled: true })
+  }
+
+  /** 删除空账号成员（无任何业务数据；有记录请禁用） */
+  @Delete('members/:id')
+  @RequireAction('members.manage')
+  async deleteMember(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    await this.members.deleteMember(actor, id)
+    return ok({ deleted: true })
+  }
+
+  /** 批量删除空账号（逐项校验，失败项跳过并返回原因） */
+  @Post('members/batch-delete')
+  @RequireAction('members.manage')
+  async batchDeleteMembers(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
+    const parsed = z.object({ userIds: z.array(z.string().uuid()).min(1).max(100) }).safeParse(body)
+    if (!parsed.success) throw new MembersError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.members.batchDeleteMembers(actor, parsed.data.userIds))
+  }
+
+  /** Excel/表格批量导入成员：管理员确认为已验证成员，跳过 CAS 核验直接建账号 */
+  @Post('members/import')
+  @RequireAction('members.manage')
+  async importMembers(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
+    const rowSchema = z.object({
+      studentNo: z.string().min(1).max(64),
+      realName: z.string().min(1).max(100),
+      grade: z.number().int().optional(),
+      phone: z.string().max(32).optional(),
+      membershipStatus: z.enum(MEMBERSHIP_STATUSES).optional(),
+    })
+    const parsed = z.object({ rows: z.array(rowSchema).min(1).max(500) }).safeParse(body)
+    if (!parsed.success) throw new MembersError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.members.importMembers(actor, parsed.data.rows))
   }
 
   /** 更改成员平台绑定账号（换绑账号回到待核验；仅改显示名保持原状态） */

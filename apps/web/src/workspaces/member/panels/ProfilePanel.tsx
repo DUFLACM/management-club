@@ -1,12 +1,13 @@
 /**
  * 成员端 · 我的：GET /me/profile（?memberId= 时 GET /profiles/:memberId 按权限裁剪）。
- * 首屏头像/展示名/简介/置顶徽标/平台绑定；Tabs 概览/rating/比赛成绩/参加活动/徽标/资料与隐私。
+ * 首屏头像/展示名/简介/置顶徽标/平台绑定；
+ * Tabs 概览/rating/比赛成绩/参加活动/正式赛事/徽标/资料与隐私（后三项仅本人）。
  * rating 图表懒加载且进入可见区才加载；缺失显示「暂无数据」，不补 0。
  */
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router';
+import { Link, useSearchParams } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { LoaderCircleIcon, UploadIcon } from 'lucide-react';
+import { ChevronRightIcon, LoaderCircleIcon, UploadIcon } from 'lucide-react';
 
 import { api, ApiError, fetchCsrfToken, CSRF_HEADER, API_BASE } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
@@ -21,12 +22,18 @@ import {
   platformAccountBadge,
   platformLabel,
 } from '@/lib/format';
+import {
+  competitionsApi,
+  entryStatusLabel,
+  type MemberCompetitionEventDto,
+  type TeamDto,
+} from '@/lib/competitions';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { MemberGate, QueryBoundary } from '@/components/club/QueryBoundary';
 import { EmptyState } from '@/components/club/EmptyState';
 import { StatusBadge } from '@/components/club/StatusBadge';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -147,6 +154,12 @@ function ProfileBody({ principalId }: { principalId: string }) {
               <Card>
                 <CardContent className="flex flex-col gap-4 p-5 sm:flex-row sm:items-start">
                   <Avatar className="size-20 md:size-24">
+                    {profile.avatarAssetId && (
+                      <AvatarImage
+                        src={`/api/v1/me/avatar/${profile.avatarAssetId}?size=256`}
+                        alt={`${displayName} 的头像`}
+                      />
+                    )}
                     <AvatarFallback className="text-2xl">{avatarText}</AvatarFallback>
                   </Avatar>
                   <div className="flex min-w-0 flex-1 flex-col gap-2">
@@ -198,6 +211,7 @@ function ProfileBody({ principalId }: { principalId: string }) {
                   <TabsTrigger value="rating">rating</TabsTrigger>
                   <TabsTrigger value="results">比赛成绩</TabsTrigger>
                   <TabsTrigger value="activities">参加活动</TabsTrigger>
+                  {isSelfProfile && <TabsTrigger value="competitions">正式赛事</TabsTrigger>}
                   {isSelfProfile && <TabsTrigger value="badges">徽标</TabsTrigger>}
                   {isSelfProfile && <TabsTrigger value="edit">资料与隐私</TabsTrigger>}
                 </TabsList>
@@ -214,6 +228,11 @@ function ProfileBody({ principalId }: { principalId: string }) {
                 <TabsContent value="activities" className="mt-4">
                   <ActivitiesSection principalId={principalId} targetId={targetId} />
                 </TabsContent>
+                {isSelfProfile && (
+                  <TabsContent value="competitions" className="mt-4">
+                    <CompetitionsSection principalId={principalId} />
+                  </TabsContent>
+                )}
                 {isSelfProfile && (
                   <TabsContent value="badges" className="mt-4">
                     <BadgesSection
@@ -330,6 +349,14 @@ function RatingSection({ principalId, targetId }: { principalId: string; targetI
   );
 }
 
+/** rating 空态按平台解释原因（CF 需打 rated 场；牛客已接入 rating-history，同步后即有） */
+function ratingEmptyReason(platform: string): string {
+  if (platform === 'codeforces') return '尚未参加 Codeforces rated 比赛；参加后点「申请刷新」同步即出现。';
+  if (platform === 'nowcoder') return '尚未参加牛客 rated 场次；参加 rated 比赛并同步后这里会出现曲线（单场 rating 也可在「比赛成绩」中查看）。';
+  if (platform === 'hydro') return '校内 OJ 暂无 rating 序列；比赛成绩见「比赛成绩」列表。';
+  return '暂无 rated 记录；参加 rated 比赛并同步后即出现。';
+}
+
 function LazyRatingCard({ platform, series }: { platform: string; series: RatingSeries }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
@@ -350,8 +377,10 @@ function LazyRatingCard({ platform, series }: { platform: string; series: Rating
     return () => observer.disconnect();
   }, [visible]);
 
+  const empty = series.points.length === 0;
+
   return (
-    <Card ref={containerRef}>
+    <Card ref={containerRef} className={empty ? 'border-dashed' : undefined}>
       <CardContent className="flex flex-col gap-2 p-5">
         <div className="flex items-center justify-between gap-2">
           <h3 className="text-sm font-semibold text-foreground">{platformLabel(platform)} rating</h3>
@@ -359,9 +388,10 @@ function LazyRatingCard({ platform, series }: { platform: string; series: Rating
             {series.completeness === 'complete' ? '完整序列' : '部分序列（绑定核验中）'}
           </span>
         </div>
-        {series.points.length === 0 ? (
-          <div className="flex h-[240px] items-center justify-center text-sm text-muted-foreground">
-            暂无数据
+        {empty ? (
+          <div className="flex h-[140px] flex-col items-center justify-center gap-1 rounded-xl bg-muted/30 px-4 text-center">
+            <span className="text-sm text-muted-foreground">暂无 rating 数据</span>
+            <span className="text-xs leading-5 text-muted-foreground">{ratingEmptyReason(platform)}</span>
           </div>
         ) : visible ? (
           <Suspense
@@ -496,6 +526,7 @@ function ResultsSection({ principalId, targetId }: { principalId: string; target
 }
 
 function ActivitiesSection({ principalId, targetId }: { principalId: string; targetId: string }) {
+  const [, setSearchParams] = useSearchParams();
   const query = usePrivateInfiniteQuery<
     { items: ActivityHistoryDto[]; nextCursor?: string | null },
     ApiError
@@ -507,6 +538,15 @@ function ActivitiesSection({ principalId, targetId }: { principalId: string; tar
     );
     return data;
   });
+
+  const openDetail = (activityId: string) => {
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous);
+      next.set('section', 'activities');
+      next.set('activity', activityId);
+      return next;
+    });
+  };
 
   const items = query.data?.pages.flatMap((page) => page.items) ?? [];
   return (
@@ -536,48 +576,60 @@ function ActivitiesSection({ principalId, targetId }: { principalId: string; tar
               {items.map((item) => {
                 const resultBadge = attendanceResultBadge(item.attendanceResult);
                 return (
-                  <li key={item.activityId} className="flex flex-col gap-1.5 py-3">
-                    <span className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="text-sm font-medium text-foreground">{item.title}</span>
-                      <span className="text-xs text-muted-foreground tabular-nums">
-                        {formatStartEnd(item.startAt, item.startAt)}
+                  <li key={item.activityId}>
+                    <button
+                      type="button"
+                      onClick={() => openDetail(item.activityId)}
+                      className="group flex w-full flex-col gap-1.5 py-3 text-left"
+                    >
+                      <span className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-sm font-medium text-foreground group-hover:text-primary">
+                          {item.title}
+                          <ChevronRightIcon
+                            className="ml-1 inline size-3.5 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary"
+                            aria-hidden="true"
+                          />
+                        </span>
+                        <span className="text-xs text-muted-foreground tabular-nums">
+                          {formatStartEnd(item.startAt, item.startAt)}
+                        </span>
                       </span>
-                    </span>
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      {item.registration && (
-                        <StatusBadge
-                          kind="registration"
-                          value={
-                            item.registration === 'enrolled'
-                              ? '已报名'
-                              : item.registration === 'waitlisted'
-                                ? '候补中'
-                                : item.registration === 'pending_approval'
-                                  ? '待审核'
-                                  : item.registration === 'cancelled'
-                                    ? '已取消'
-                                    : item.registration === 'participated'
-                                      ? '已参加'
-                                      : item.registration
-                          }
-                        />
-                      )}
-                      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                        签到
-                        <StatusBadge
-                          kind="attendance"
-                          value={item.checkin ? '签到已记录' : '未签到'}
-                        />
+                      <span className="flex flex-wrap items-center gap-1.5">
+                        {item.registration && (
+                          <StatusBadge
+                            kind="registration"
+                            value={
+                              item.registration === 'enrolled'
+                                ? '已报名'
+                                : item.registration === 'waitlisted'
+                                  ? '候补中'
+                                  : item.registration === 'pending_approval'
+                                    ? '待审核'
+                                    : item.registration === 'cancelled'
+                                      ? '已取消'
+                                      : item.registration === 'participated'
+                                        ? '已参加'
+                                        : item.registration
+                            }
+                          />
+                        )}
+                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                          签到
+                          <StatusBadge
+                            kind="attendance"
+                            value={item.checkin ? '签到已记录' : '未签到'}
+                          />
+                        </span>
+                        <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                          签退
+                          <StatusBadge
+                            kind="attendance"
+                            value={item.checkout ? '签到已记录' : '未签到'}
+                          />
+                        </span>
+                        {resultBadge && <StatusBadge kind="attendance" value={resultBadge} />}
                       </span>
-                      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-                        签退
-                        <StatusBadge
-                          kind="attendance"
-                          value={item.checkout ? '签到已记录' : '未签到'}
-                        />
-                      </span>
-                      {resultBadge && <StatusBadge kind="attendance" value={resultBadge} />}
-                    </span>
+                    </button>
                   </li>
                 );
               })}
@@ -731,6 +783,8 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
       ).data,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'profiles'] });
+      // 侧栏头像与展示名取自会话详情，改完要一起失效，否则要刷新页面才更新
+      void queryClient.invalidateQueries({ queryKey: ['session', 'details'] });
     },
   });
 
@@ -747,17 +801,22 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
         body: form,
       });
       const body = (await response.json().catch(() => null)) as
-        | { data?: { assetId: string; jobId: string }; error?: { message?: string } }
+        | { data?: { assetId: string; status?: string; jobId?: string }; error?: { message?: string } }
         | null;
       if (!response.ok || !body?.data) {
         throw new Error(body?.error?.message ?? '上传失败');
       }
-      const { assetId, jobId } = body.data;
+      const { assetId } = body.data;
+      // 处理已内联完成：通常直接 ready，立即设为头像；异常情况轮询资产状态兜底
+      if (body.data.status === 'ready') {
+        await updateMutation.mutateAsync({ avatarAssetId: assetId });
+        setAvatarState({ phase: 'done' });
+        return;
+      }
       setAvatarState({ phase: 'processing' });
-      // 轮询媒体任务，ready 后设为头像
-      for (let attempt = 0; attempt < 30; attempt += 1) {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 2000));
-        const job = await api.get<{ assetId: string; status: string }>(`/me/media-jobs/${jobId}`);
+        const job = await api.get<{ assetId: string; status: string }>(`/me/media-jobs/${body.data.jobId ?? assetId}`);
         if (job.data.status === 'ready') {
           await updateMutation.mutateAsync({ avatarAssetId: assetId });
           setAvatarState({ phase: 'done' });
@@ -882,10 +941,21 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
         <Card>
           <CardContent className="flex flex-col gap-3 p-5">
             <h3 className="text-sm font-semibold text-foreground">头像</h3>
-            <p className="text-xs leading-5 text-muted-foreground">
-              支持 JPEG/PNG/WebP，≤2MiB；上传后自动裁剪并剥离 EXIF，处理完成才设为头像。
-              {profile.avatarAssetId ? '（当前已设置头像）' : ''}
-            </p>
+            <div className="flex items-center gap-3">
+              <Avatar className="size-14">
+                {profile.avatarAssetId && (
+                  <AvatarImage
+                    src={`/api/v1/me/avatar/${profile.avatarAssetId}?size=128`}
+                    alt="当前头像"
+                  />
+                )}
+                <AvatarFallback>{(profile.displayName || '我').slice(0, 1).toUpperCase()}</AvatarFallback>
+              </Avatar>
+              <p className="text-xs leading-5 text-muted-foreground">
+                支持 JPEG/PNG/WebP，≤2MiB；上传后自动裁剪并剥离 EXIF，处理完成才设为头像。
+                {profile.avatarAssetId ? '（当前已设置头像）' : ''}
+              </p>
+            </div>
             <label className="inline-flex w-fit cursor-pointer items-center gap-2 rounded-lg border border-input bg-card px-4 py-2.5 text-sm font-medium text-foreground transition-colors hover:bg-muted">
               <UploadIcon className="size-4" aria-hidden="true" />
               选择图片并上传
@@ -921,6 +991,135 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
           </CardContent>
         </Card>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 正式赛事：我报名中的赛事与常驻小队。
+ * 仅本人可见（数据来自 /me 端点）；详细报名操作在「竞赛 → 正式赛报名」。
+ */
+function CompetitionsSection({ principalId }: { principalId: string }) {
+  const eventsQuery = usePrivateQuery<MemberCompetitionEventDto[], ApiError>(
+    principalId,
+    ['me', 'competition-events'],
+    () => competitionsApi.listOpenEvents(),
+  );
+
+  const teamsQuery = usePrivateQuery<TeamDto[], ApiError>(
+    principalId,
+    ['me', 'teams'],
+    () => competitionsApi.myTeams(),
+  );
+
+  const myEvents = (eventsQuery.data ?? []).filter((event) => event.myStatus != null);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <Card>
+        <CardContent className="flex flex-col gap-3 p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-foreground">我的赛事报名</h3>
+            <Button size="sm" variant="outline" asChild>
+              <Link to="/app?section=contests&tab=entry">前往报名</Link>
+            </Button>
+          </div>
+          {eventsQuery.isPending ? (
+            <Skeleton className="h-16 rounded-xl" />
+          ) : eventsQuery.isError ? (
+            <p className="text-sm text-muted-foreground">{eventsQuery.error.message}</p>
+          ) : myEvents.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              当前没有报名中的正式赛事；开放报名的赛事在「竞赛 → 正式赛报名」查看。
+            </p>
+          ) : (
+            <ul className="flex flex-col divide-y divide-border">
+              {myEvents.map((event) => (
+                <li key={event.id} className="flex flex-wrap items-center gap-2 py-2">
+                  <Badge variant={event.category === 'A' ? 'info' : 'success'}>
+                    {event.category} 类
+                  </Badge>
+                  <span className="min-w-0 flex-1 truncate text-sm text-foreground">
+                    {event.title}
+                  </span>
+                  <span className="text-xs text-muted-foreground tabular-nums">
+                    {formatDateTime(event.startAt)}
+                  </span>
+                  <Badge
+                    variant={
+                      event.myStatus === 'rejected'
+                        ? 'destructive'
+                        : event.myStatus === 'approved' || event.myStatus === 'confirmed'
+                          ? 'success'
+                          : 'warning'
+                    }
+                  >
+                    {entryStatusLabel(event.myStatus)}
+                  </Badge>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="flex flex-col gap-3 p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-foreground">我的小队</h3>
+            <Button size="sm" variant="outline" asChild>
+              <Link to="/app?section=contests&tab=teams">组队广场</Link>
+            </Button>
+          </div>
+          {teamsQuery.isPending ? (
+            <Skeleton className="h-16 rounded-xl" />
+          ) : teamsQuery.isError ? (
+            <p className="text-sm text-muted-foreground">{teamsQuery.error.message}</p>
+          ) : teamsQuery.data.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              还没有小队；团队赛需要先在组队广场建队并邀请队友。
+            </p>
+          ) : (
+            <ul className="flex flex-col gap-2">
+              {teamsQuery.data.map((team) => (
+                <li
+                  key={team.id}
+                  className="flex flex-col gap-1 rounded-xl border border-border p-3"
+                >
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium text-foreground">{team.name}</span>
+                    <Badge
+                      variant={team.members.length >= team.teamSize ? 'success' : 'warning'}
+                    >
+                      {team.members.length}/{team.teamSize} 人
+                    </Badge>
+                    {team.captainUserId === principalId && <Badge variant="info">队长</Badge>}
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    {team.members
+                      .map(
+                        (member) =>
+                          member.user?.profile?.displayName ??
+                          member.user?.verifiedRealName ??
+                          '队员',
+                      )
+                      .join(' · ')}
+                  </span>
+                  {team.entries.length > 0 && (
+                    <ul className="flex flex-wrap gap-x-3 gap-y-1">
+                      {team.entries.map((entry) => (
+                        <li key={entry.id} className="text-xs text-muted-foreground">
+                          {entry.event.title} · {entryStatusLabel(entry.status)}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

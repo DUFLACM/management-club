@@ -249,6 +249,44 @@ export class AuthService {
       return { kind: 'session', token: session.token, expiresAt: session.expiresAt }
     }
 
+    // 预导入学生（Excel 批量导入时跳过 CAS，资料已就位）：首次 CAS 登录按验真校园编号精确绑定稳定 subject。
+    // 仅从登录入口拦截；register 入口命中已存在学号时走下方既有冲突分支（人工核验）。
+    if (studentOwner && attempt.purpose === 'login') {
+      if (!identity.realName || normalizeVerifiedName(identity.realName) !== normalizeVerifiedName(studentOwner.verifiedRealName)) {
+        throw new AuthFlowError('校园认证姓名与预导入资料不一致，需人工核验', 'IDENTITY_CONFLICT')
+      }
+      if (studentOwner.accountStatus !== 'active') throw new AuthFlowError('账号已被停用', 'ACCOUNT_DISABLED')
+      await this.db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${identity.campusId!}, 0))`
+        await tx.$queryRaw`SELECT id FROM users WHERE id = ${studentOwner.id}::uuid FOR UPDATE`
+        const crossKindOwner = await tx.staffProfile.findUnique({ where: { staffNo: identity.campusId! } })
+        if (crossKindOwner) throw new AuthFlowError('校园编号已属于教职工主体，拒绝绑定学生', 'IDENTITY_CONFLICT')
+        const alreadyBound = await tx.authIdentity.findUnique({
+          where: { principalId_provider: { principalId: studentOwner.principalId, provider: 'cas' } },
+        })
+        if (alreadyBound && alreadyBound.subject !== identity.subject) {
+          throw new AuthFlowError('该学生资料已绑定其他 CAS 主体，需人工核验', 'IDENTITY_CONFLICT')
+        }
+        if (!alreadyBound) {
+          await tx.authIdentity.create({
+            data: {
+              id: newId(), principalId: studentOwner.principalId, provider: 'cas', subject: identity.subject,
+              verifiedCampusId: identity.campusId, verifiedRealName: identity.realName,
+            },
+          })
+          await tx.auditLog.create({
+            data: {
+              id: newId(), actorPrincipalId: studentOwner.principalId, action: 'auth.student_identity_bound',
+              resourceType: 'user', resourceId: studentOwner.id,
+              summary: `首次 CAS 登录绑定预导入学生主体（subject ${sha256Hex(identity.subject).slice(0, 8)}）`,
+            },
+          })
+        }
+      })
+      const session = await this.sessions.createSession(studentOwner.principalId)
+      return { kind: 'session', token: session.token, expiresAt: session.expiresAt }
+    }
+
     // 新学生身份：仅注册流程可建立账号（须邀请），普通登录不可绕过邀请。
     if (attempt.purpose !== 'register' || !attempt.registration_intent_id) {
       throw new AuthFlowError('该校园身份尚未注册协会系统，请通过邀请注册', 'NOT_REGISTERED')

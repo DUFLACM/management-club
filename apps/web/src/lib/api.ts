@@ -183,4 +183,42 @@ export const api = {
   async delete<T>(path: string, options?: Omit<RequestOptions, 'method' | 'body'>) {
     return request<T>(path, { ...options, method: 'DELETE' });
   },
+  /** multipart 文件上传：浏览器自动设置 boundary，手动 JSON 序列化会破坏表单 */
+  async upload<T>(path: string, form: FormData): Promise<Envelope<T>> {
+    const headers = new Headers({ Accept: 'application/json' });
+    const token = await fetchCsrfToken();
+    if (token) headers.set(CSRF_HEADER, token);
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE}${path}`, {
+        method: 'POST',
+        credentials: 'include',
+        headers,
+        body: form,
+      });
+    } catch (cause) {
+      throw new ApiError('NETWORK_ERROR', '网络请求失败，请检查网络连接后重试。', { cause });
+    }
+    let body: unknown = null;
+    if ((response.headers.get('content-type') ?? '').includes('application/json')) {
+      body = await response.json().catch(() => null);
+    }
+    if (!response.ok) {
+      const errorEnvelope = (body ?? {}) as ErrorBody;
+      const errorBody = errorEnvelope.error ?? errorEnvelope;
+      if (response.status === 401) {
+        window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+      }
+      throw new ApiError(
+        readErrorCode(errorBody, response.status),
+        errorBody.message ?? '上传失败，请稍后重试。',
+        { status: response.status, requestId: errorBody.requestId ?? errorEnvelope.requestId },
+      );
+    }
+    const envelope = body as Partial<Envelope<T>> | null;
+    return {
+      data: (envelope && 'data' in envelope ? envelope.data : (body as T)) ?? (null as T),
+      meta: (envelope?.meta as ResponseMeta | undefined) ?? null,
+    };
+  },
 };

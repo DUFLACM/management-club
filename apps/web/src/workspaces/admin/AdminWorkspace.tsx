@@ -4,9 +4,9 @@ import { hasAnyAction } from '@/lib/session';
 import { useWorkspaceSession } from '@/lib/workspace-session';
 import { EmptyState } from '@/components/club/EmptyState';
 import {
-  BookOpenIcon,
   CalendarDaysIcon,
   CoinsIcon,
+  GraduationCapIcon,
   LayoutDashboardIcon,
   RefreshCwIcon,
   ScrollTextIcon,
@@ -33,7 +33,7 @@ import {
  * - 顶栏明确“管理工作台”与当前授权角色，避免与成员端混淆；
  * - section/tab 来自 URL query（白名单解析，非法值回 overview）；
  *   面板内子标签（如 activities 的 venues、现场码显示模式）由面板自读 searchParams；
- * - 手机端使用顶部菜单按钮 + 导航 Sheet，不挤入成员五项底栏。
+ * - 手机端使用顶部菜单按钮 + 导航 Sheet，不挤入成员六项底栏。
  */
 
 export const ADMIN_SECTIONS: readonly WorkspaceSection[] = [
@@ -42,7 +42,7 @@ export const ADMIN_SECTIONS: readonly WorkspaceSection[] = [
   { key: 'activities', title: '活动', icon: CalendarDaysIcon },
   { key: 'contests', title: '赛事', icon: TrophyIcon },
   { key: 'points', title: '积分审核', icon: CoinsIcon },
-  { key: 'rules', title: '规则参数', icon: BookOpenIcon },
+  { key: 'evaluation', title: '综评导出', icon: GraduationCapIcon },
   { key: 'invites', title: '邀请码', icon: TicketIcon },
   { key: 'sync', title: '平台同步', icon: RefreshCwIcon },
   { key: 'audit', title: '审计', icon: ScrollTextIcon },
@@ -54,7 +54,7 @@ const SECTION_ACTIONS: Record<string, string[]> = {
   activities: ['activity.manage', 'venue.manage'],
   contests: ['competitions.manage'],
   points: ['points.review'],
-  rules: ['points.review'],
+  evaluation: ['evaluation.manage'],
   invites: ['invitations.manage'],
   sync: ['sync.manage'],
   audit: ['audit.read'],

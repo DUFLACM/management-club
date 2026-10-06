@@ -82,7 +82,11 @@ pnpm --filter @acm/web exec node scripts/sidebar-layout-check.mjs
 
 关键位置为 `apps/web/src/workspaces/member/panels/ContestsPanel.tsx`、`apps/api/src/modules/activities/activity.service.ts`、`apps/api/src/modules/attendance/attendance.admin.controller.ts`、`apps/worker/src/handlers.ts` 与 `packages/scoring-core/src/award-score.ts`。
 
-注意一下那个活动也要有可以选择牛客 cf atcoder /学校 oj 竞赛的选项，活动然后活动详情页面我觉得需要做出改变首页页面不适配活动详情怎么敢做全屏覆盖的，然后你的活动详情里面应该有文件功能来上传本次讲题的文件题解 然后比赛名字牛客 cf atcoder /学校 oj  这些做一个卡片可以直接跳到对应比赛页面 然后签入签出那个状态页面可以直接整合到这里 不需要那个冗杂页面 这个详情页面样式建议全部重构
+注意一下那个活动也要有可以选择牛客 cf atcoder /学校 oj 竞赛的选项，活动然后活动详情页面我觉得需要做出改变首页页面不适配活动详情怎么敢做卡片全屏覆盖的，然后你的活动详情里面应该有文件功能来上传本次讲题的文件题解 ，允许上传题解的人员页面上应该有对应的按钮上传，报名的时候应该有申请讲题的按钮，申请后台审批通过后即可获得本次活动上传权限，然后比赛名字牛客 cf atcoder /学校 oj  这些做一个卡片可以直接跳到对应比赛页面 然后签入签出那个状态页面可以直接整合到这里 不需要那个冗杂页面 这个活动详情页面样式建议全部重构，并集成对应的签入签出功能，让页面好看起来符合整体主题风格。比赛结束后 应该可以在详情页里面看到本次比赛积分 然后本次通过题目,牛客比赛的排行 api 应该是https://ac.nowcoder.com/acm-heavy/acm/contest/real-time-rank-data?token=&id=140235&rankScope=ALL&limit=0&_=1791220115521 id 对应其比赛 id 其他的你自行探索 ,atcoder 是https://atcoder.jp/contests/abc472/standings/json abc472 对应比赛名字,codeforces 你得自行想办法 我没找到可以考虑用 clist 但要在详情页面说明有延迟。从榜单获得过了的题目,以及没过题目的得分 抓到对应的 url 方便快速访问 别忘了手机端支持。然后有一个本次活动对题数排名在活动详情页面就这样吧。
+
+然后加一个社团积分排行榜页面。做的好看就行
+
+以上所有要求都要保证手机端适配和前端 ui 正常，尽量减少审查内容。
 
 ## 4. 已踩过的坑
 
@@ -92,6 +96,9 @@ pnpm --filter @acm/web exec node scripts/sidebar-layout-check.mjs
 4. pnpm 12 的 `allowBuilds` 保持 true/false；业务时区 Asia/Shanghai 在应用层，DB 会话始终 UTC。
 5. R01 `monthlyRounding=pending` 故意阻塞正式月结算，集成测试断言该行为。
 6. 真实 CAS 运行默认与测试模拟分开；修改根 `.env` 后需重启 API，集成测试 setup 显式使用模拟配置，与根 `.env` 的真实模式隔离。
+7. 综评折算（附录三）默认只在学期 `endsOn` 之后开放。本地测试用 `EVALUATION_TEST_MODE=true`（production 开启会直接启动失败）；此时未结束学期也能生成批次，但批次固定 `is_test=true`，页面与导出文件名都带「测试数据」标记，不能当正式结果上报。附录三只规定 H 的结构，竞赛/服务/纪律三项的具体折算由 `evaluation.service.ts` 顶部注释给出口径并可在管理页逐人覆盖；`RoleGrant` 不区分社长/副社长，故干部口径只单列主席团成员、由主席团手工给分。
+
+8. 讲题满意度评分（`lecture_ratings`）只在活动有「已批准」讲题申请时出现在活动详情页。资格口径：活动 `endAt` 已过 + 本人有入场打点或出勤结论为到场（活动未设 `AttendancePolicy` 时退回「已报名」口径，否则没有出勤结论的讲座会无人可评）+ 讲题人不对本人讲题评分。评分匿名：`rater_user_id` 只用于防重与本人撤改，任何读接口都不返回；汇总仅讲题人本人与 `activity.manage` 可见，匿名评语对讲题人需评分达 3 人（避免反推评价人），审计只记 `lecture_request` 维度、不写评价人主体。
 
 ## 5. 范围与关键位置
 
@@ -102,8 +109,9 @@ pnpm --filter @acm/web exec node scripts/sidebar-layout-check.mjs
 | `prisma/schema.prisma`、`prisma/migrations/` | 表结构与迁移、自定义约束 |
 | `packages/scoring-core/src/` | 积分纯函数与 RULE_GAPS |
 | `apps/api/src/modules/auth/` | CAS flow、教职工首次绑定、独立本地管理员、模拟器、邀请注册、会话、CSRF |
-| `apps/api/src/modules/{venues,activities,attendance}/` | 地点、活动、签到与锁顺序 |
+| `apps/api/src/modules/{venues,activities,attendance}/` | 地点、活动、签到与锁顺序；讲题申请/材料与讲题满意度匿名评分 |
 | `apps/api/src/modules/{scoring,members,profiles,settings,platforms}/` | 账本、成员、主页、设置、平台 |
+| `apps/api/src/modules/evaluation/` | 综评建议折算（附录三）：H 计算、A/B/C 定档、逐人覆盖、学号/姓名/加分 CSV 导出 |
 | `apps/worker/src/{main,handlers}.ts` | 队列与处理器 |
 | `packages/integrations/src/`、`packages/hydro-bridge/` | 平台适配、SSRF、Hydro 协议与插件 |
 | `packages/db/src/seed.ts`、`apps/api/src/cli.ts` | 开发种子、`init-local-admin`、`register-staff` 与受控角色初始化 |

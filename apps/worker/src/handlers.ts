@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { settleRequiredAbsences, type PrismaClient } from '@acm/db'
+import { applyAutoCheckout, settleRequiredAbsences, type PrismaClient } from '@acm/db'
 import {
   fetchNowcoderHistory,
+  fetchNowcoderRatingHistory,
   fetchNowcoderContestMeta,
   fetchCfUserInfo,
   fetchCfRatingHistory,
@@ -97,8 +98,38 @@ async function upsertParticipations(db: PrismaClient, accountId: string, platfor
 }
 
 const handlers: Record<string, JobHandler> = {
+  /**
+   * 每日自动刷新：为全部已核验账号排 platform.sync_account 任务。
+   * 频率控制：账号间隔 120 秒错峰 + dedupeKey 每账号每日一次 + 出站主机级限流兜底。
+   */
+  'platform.refresh_all': async (ctx) => {
+    const accounts = await ctx.db.platformAccount.findMany({ where: { status: 'verified' }, select: { id: true, platform: true } })
+    const dateKey = new Date().toISOString().slice(0, 10)
+    let enqueued = 0
+    for (const [index, account] of accounts.entries()) {
+      const dedupeKey = `sync:daily:${account.id}:${dateKey}`
+      const existing = await ctx.db.job.findFirst({ where: { dedupeKey } })
+      if (existing) continue
+      await ctx.db.job.create({
+        data: {
+          id: randomUUID(),
+          type: 'platform.sync_account',
+          payload: { accountId: account.id, source: 'daily' },
+          dedupeKey,
+          runAfter: new Date(Date.now() + index * 120_000),
+          priority: 7,
+        },
+      })
+      enqueued++
+    }
+    return { accounts: accounts.length, enqueued, dateKey, note: '每日自动刷新：账号间隔 120 秒错峰；外呼仍受主机级限流约束' }
+  },
+
   'activity.settle_attendance': async (ctx, payload) => {
-    return settleRequiredAbsences(ctx.db, String(payload.activityId))
+    const activityId = String(payload.activityId)
+    const autoCheckedOut = await applyAutoCheckout(ctx.db, activityId)
+    const absences = await settleRequiredAbsences(ctx.db, activityId)
+    return { ...absences, autoCheckedOut }
   },
   /** 平台账号同步：牛客历史 / CF rating+提交 / AtCoder 历史；结果幂等 upsert */
   'platform.sync_account': async (ctx, payload) => {
@@ -112,7 +143,34 @@ const handlers: Record<string, JobHandler> = {
       const { records, truncated: t } = await fetchNowcoderHistory(ctx.db, account.externalId)
       truncated = t
       synced = await upsertParticipations(ctx.db, accountId, 'nowcoder', records, t)
-      note = `牛客参赛历史 ${synced} 条${t ? '（截断）' : ''}`
+      // rating 曲线：rating-history 公开接口（rated 场次；old = rating - changeValue）
+      const ratingHistory = await fetchNowcoderRatingHistory(ctx.db, account.externalId).catch(() => [])
+      for (const point of ratingHistory) {
+        const oldValue = point.changeValue != null ? point.rating - point.changeValue : null
+        await ctx.db.platformRatingPoint.upsert({
+          where: {
+            platform_seriesType_platformAccountId_externalEventId: {
+              platform: 'nowcoder',
+              seriesType: 'algorithm_rating',
+              platformAccountId: accountId,
+              externalEventId: `nc:${point.contestId}`,
+            },
+          },
+          create: {
+            id: randomUUID(),
+            platform: 'nowcoder',
+            platformAccountId: accountId,
+            seriesType: 'algorithm_rating',
+            externalEventId: `nc:${point.contestId}`,
+            contestKey: `nowcoder:${point.contestId}`,
+            occurredAt: point.occurredAt,
+            oldValue,
+            newValue: point.rating,
+          },
+          update: { oldValue, newValue: point.rating },
+        })
+      }
+      note = `牛客参赛历史 ${synced} 条 + rating ${ratingHistory.length} 条${t ? '（截断）' : ''}`
     } else if (account.platform === 'codeforces') {
       // CF rating 历史（秒时间戳）+ 用户提交证据
       const [rating, submissions] = await Promise.all([
@@ -325,53 +383,6 @@ const handlers: Record<string, JobHandler> = {
       data: { status: 'ready', width: meta.width, height: meta.height, frames: 1, variants: variants as never, mimeType: 'image/webp' },
     })
     return { variants: Object.keys(variants) }
-  },
-
-  /** 冻结榜：到点在快照中记录资格、积分与排序；冻结后回填不改变名单（幂等） */
-  'disclosure.freeze_ranking': async (ctx, payload) => {
-    const freezeId = String(payload.freezeId)
-    const freeze = await ctx.db.rankingFreeze.findUnique({ where: { id: freezeId } })
-    if (!freeze) throw new Error('冻结任务不存在')
-    const existing = await ctx.db.frozenRankingRow.count({ where: { freezeId } })
-    if (existing > 0) return { frozen: existing, note: '已有冻结快照（幂等跳过）' }
-    if (freeze.freezeAt > new Date()) return { note: `未到冻结时点 ${freeze.freezeAt.toISOString()}` }
-    const { computeEffectiveScore } = await import('@acm/scoring-core')
-    const entries = await ctx.db.pointsLedgerEntry.findMany({
-      where: { status: 'approved', recordedAt: { lte: freeze.freezeAt } },
-      select: { userId: true, amount: true, scoreMonth: true },
-    })
-    const byUser = new Map<string, Record<string, number>>()
-    for (const e of entries) {
-      if (!byUser.has(e.userId)) byUser.set(e.userId, {})
-      const m = byUser.get(e.userId)!
-      m[e.scoreMonth] = (m[e.scoreMonth] ?? 0) + Number(e.amount)
-    }
-    const users = await ctx.db.user.findMany({
-      where: { id: { in: [...byUser.keys()] } },
-      include: { membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 } },
-    })
-    // 冻结取数水位：仅纳入冻结时点前已审核入账（之后补录不改名单）
-    const monthKeyOfFreeze = freeze.freezeAt.toISOString().slice(0, 7)
-    const rows = users
-      .filter((u) => ['formal', 'provisional', 'observing'].includes(u.membershipTerms[0]?.membershipStatus ?? ''))
-      .map((u) => {
-        const eff = computeEffectiveScore({ monthlyScores: byUser.get(u.id) ?? {}, currentMonth: monthKeyOfFreeze }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
-        return { userId: u.id, e: Number(eff.e) }
-      })
-      .sort((a, b) => b.e - a.e)
-    await ctx.db.$transaction(async (tx) => {
-      let position = 0
-      for (const row of rows) {
-        position++
-        await tx.frozenRankingRow.upsert({
-          where: { freezeId_userId: { freezeId, userId: row.userId } },
-          create: { id: randomUUID(), freezeId, userId: row.userId, position, eSnapshot: row.e.toFixed(4) },
-          update: {},
-        })
-      }
-      await tx.rankingFreeze.update({ where: { id: freezeId }, data: { status: 'frozen' } })
-    })
-    return { frozen: rows.length, watermark: freeze.freezeAt.toISOString() }
   },
 
   /** Hydro 事件触发刷新：connector 未联调前记录 receipt 状态并跳过拉取 */

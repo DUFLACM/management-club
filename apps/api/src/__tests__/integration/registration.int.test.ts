@@ -4,7 +4,9 @@ import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { AuthService } from '../../modules/auth/auth.service.js'
 import { SessionService } from '../../modules/auth/session.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import { MembersService } from '../../modules/members/members.service.js'
 import { sha256Hex } from '../../common/utils.js'
+import { makeActor } from './helpers.js'
 import type { Request, Response } from 'express'
 
 /**
@@ -21,6 +23,7 @@ let db: PrismaService
 let auth: AuthService
 let sessions: SessionService
 let audit: AuditService
+let members: MembersService
 
 /** 极简 cookie jar 模拟（捕获 set-cookie 供下一步请求携带） */
 function makeJar(): { jar: Record<string, string>; req: () => Request; res: () => Response } {
@@ -114,6 +117,7 @@ beforeAll(async () => {
   audit = new AuditService(db)
   sessions = new SessionService(db)
   auth = new AuthService(db, sessions, audit)
+  members = new MembersService(db, audit)
   await db.ruleVersion
     .create({
       data: {
@@ -250,6 +254,89 @@ describe('邀请注册事务', () => {
     const flow = new URL(service).searchParams.get('flow')!
     await expect(auth.handleCasCallback({ cookies: { ...jar }, headers: {} } as never, captureRes(), flow, ticket)).rejects.toMatchObject({ code: 'IDENTITY_CONFLICT' })
     expect(await db.authIdentity.count({ where: { principalId: staff!.principalId, provider: 'cas' } })).toBe(1)
+  })
+
+  it('Excel 导入成员：校验/去重/冲突跳过，有效行建号', async () => {
+    const before = await db.user.count()
+    const result = await members.importMembers(makeActor(), [
+      { studentNo: '202605001', realName: '导入甲' },
+      { studentNo: '202605002', realName: '导入乙', grade: 2026, phone: '13900000000', membershipStatus: 'provisional' },
+      { studentNo: 'bad no', realName: '格式不合法' },
+      { studentNo: '', realName: '缺学号' },
+      { studentNo: '202605003', realName: '' },
+      { studentNo: '202605004', realName: '批内重复' },
+      { studentNo: '202605004', realName: '批内重复' },
+      { studentNo: '202605001', realName: '与已创建行重复' },
+    ])
+    expect(result.createdCount).toBe(3)
+    expect(await db.user.count()).toBe(before + 3)
+    const skippedMessages = result.results.filter((r) => r.status === 'skipped').map((r) => r.message)
+    expect(skippedMessages).toEqual([
+      '学号格式不合法（1-64 位字母/数字/._-）', // 'bad no'（含空格）
+      '学号格式不合法（1-64 位字母/数字/._-）', // 空学号
+      '姓名为空',
+      '本次导入内学号重复', // 202605004 第二次出现
+      '本次导入内学号重复', // 202605001 与第一行重复
+    ])
+  })
+
+  it('Excel 导入遇已存在学号（账号/教职工）跳过', async () => {
+    const existingStaffPrincipal = crypto.randomUUID()
+    await db.principal.create({ data: { id: existingStaffPrincipal, kind: 'staff' } })
+    await db.staffProfile.create({
+      data: { id: crypto.randomUUID(), principalId: existingStaffPrincipal, staffNo: 'STAFF-IMPORT-1', realName: '在职教师', approvedSource: '集成测试' },
+    })
+    const result = await members.importMembers(makeActor(), [
+      { studentNo: '202605001', realName: '重复导入（已是账号）' },
+      { studentNo: 'STAFF-IMPORT-1', realName: '误把教职工编号当学号' },
+    ])
+    expect(result.createdCount).toBe(0)
+    expect(result.results[0]).toMatchObject({ status: 'skipped', message: '学号已存在（账号）' })
+    expect(result.results[1]).toMatchObject({ status: 'skipped', message: '学号已属于教职工主体' })
+  })
+
+  it('Excel 预导入学生首次 CAS 登录（login 入口）按学号自动绑定，无需邀请', async () => {
+    const imported = await members.importMembers(makeActor(), [{ studentNo: '202605010', realName: '预导入学生' }])
+    expect(imported.createdCount).toBe(1)
+    const user = await db.user.findUnique({ where: { studentNo: '202605010' } })
+    expect(user).toBeTruthy()
+    expect(await db.authIdentity.count({ where: { principalId: user!.principalId } })).toBe(0)
+
+    const { jar } = await primeCsrf(sessions)
+    const startRes = captureRes()
+    const redirect = await auth.startCasAuth({ cookies: { ...jar }, headers: {} } as never, startRes, { purpose: 'login' })
+    absorb(jar, startRes)
+    const service = new URL(redirect).searchParams.get('service')!
+    const ticket = auth.devIssueTicket(service, '202605010', '预导入学生')
+    const flow = new URL(service).searchParams.get('flow')!
+    const callbackRes = captureRes()
+    await expect(auth.handleCasCallback({ cookies: { ...jar }, headers: {} } as never, callbackRes, flow, ticket)).resolves.toMatchObject({ redirect: '/app' })
+
+    const sessionCookie = Object.entries(callbackRes.captured).find(([name]) => name === sessions.cookieName())
+    expect(sessionCookie).toBeTruthy()
+    const actor = await sessions.resolveActor({ cookies: { [sessionCookie![0]]: sessionCookie![1].value }, headers: {} } as never)
+    expect(actor).toMatchObject({ principalId: user!.principalId, principalKind: 'student', studentNo: '202605010' })
+    expect(await db.authIdentity.findUnique({ where: { principalId_provider: { principalId: user!.principalId, provider: 'cas' } } })).toMatchObject({
+      subject: `dev-202605010`, verifiedCampusId: '202605010',
+    })
+  })
+
+  it('Excel 预导入学生姓名与 CAS 认证不一致：拒绝自动绑定', async () => {
+    const imported = await members.importMembers(makeActor(), [{ studentNo: '202605011', realName: '正确姓名' }])
+    expect(imported.createdCount).toBe(1)
+
+    const { jar } = await primeCsrf(sessions)
+    const startRes = captureRes()
+    const redirect = await auth.startCasAuth({ cookies: { ...jar }, headers: {} } as never, startRes, { purpose: 'login' })
+    absorb(jar, startRes)
+    const service = new URL(redirect).searchParams.get('service')!
+    const ticket = auth.devIssueTicket(service, '202605011', '错误姓名')
+    const flow = new URL(service).searchParams.get('flow')!
+    await expect(
+      auth.handleCasCallback({ cookies: { ...jar }, headers: {} } as never, captureRes(), flow, ticket),
+    ).rejects.toMatchObject({ code: 'IDENTITY_CONFLICT' })
+    const user = await db.user.findUnique({ where: { studentNo: '202605011' } })
+    expect(await db.authIdentity.count({ where: { principalId: user!.principalId } })).toBe(0)
   })
 
   it('注册成功者为 applicant 且无初始积分', async () => {

@@ -6,14 +6,15 @@
  */
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { CalendarRangeIcon, LoaderCircleIcon, SearchIcon } from 'lucide-react';
+import { CalendarRangeIcon, LoaderCircleIcon, SearchIcon, Trash2Icon, UploadIcon } from 'lucide-react';
+import * as XLSX from 'xlsx';
 
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { useDebouncedValue, LoadMoreButton } from '@/lib/hooks';
-import { currentMonthKey, formatDateTime, membershipLabel } from '@/lib/format';
+import { currentMonthKey, formatDateTime, membershipBadgeClass, membershipLabel } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { PrincipalGate } from '@/components/club/QueryBoundary';
 import { EmptyState } from '@/components/club/EmptyState';
@@ -21,9 +22,9 @@ import { ErrorState } from '@/components/club/ErrorState';
 import { ResponsiveDetail } from '@/components/club/ResponsiveDetail';
 import { StatusBadge } from '@/components/club/StatusBadge';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -112,7 +113,13 @@ const ADJUST_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
 ];
 
 function MembershipBadge({ status }: { status: string }) {
-  return <Badge variant="neutral">{membershipLabel(status)}</Badge>;
+  return (
+    <span
+      className={`inline-flex rounded-md px-2 py-0.5 text-xs font-medium ${membershipBadgeClass(status)}`}
+    >
+      {membershipLabel(status)}
+    </span>
+  );
 }
 
 export default function MembersPanel() {
@@ -125,11 +132,16 @@ export default function MembersPanel() {
 }
 
 function MembersBody({ principalId }: { principalId: string }) {
+  const queryClient = useQueryClient();
   const [searchInput, setSearchInput] = useState('');
   const debouncedSearch = useDebouncedValue(searchInput, 450);
   const [status, setStatus] = useState('all');
   const [detailId, setDetailId] = useState<string | null>(null);
   const [evaluationOpen, setEvaluationOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmBatch, setConfirmBatch] = useState(false);
+  const [batchResult, setBatchResult] = useState<{ deletedCount: number; skipped: Array<{ label: string; reason: string }> } | null>(null);
 
   const listQuery = usePrivateInfiniteQuery<
     { items: MemberRowDto[]; nextCursor?: string | null },
@@ -151,16 +163,60 @@ function MembersBody({ principalId }: { principalId: string }) {
 
   const items = listQuery.data?.pages.flatMap((page) => page.items) ?? [];
 
+  const toggleSelected = (id: string) => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const allVisibleSelected = items.length > 0 && items.every((member) => selected.has(member.id));
+  const toggleAllVisible = () => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (allVisibleSelected) items.forEach((member) => next.delete(member.id));
+      else items.forEach((member) => next.add(member.id));
+      return next;
+    });
+  };
+
+  const batchDeleteMutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await api.post<{ deletedCount: number; skipped: Array<{ id: string; label: string; reason: string }> }>(
+        '/admin/members/batch-delete',
+        { userIds: [...selected] },
+      );
+      return data;
+    },
+    onSuccess: (result) => {
+      setBatchResult({ deletedCount: result.deletedCount, skipped: result.skipped.map(({ label, reason }) => ({ label, reason })) });
+      setConfirmBatch(false);
+      setSelected(new Set());
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (error: ApiError) => {
+      setBatchResult({ deletedCount: 0, skipped: [{ label: '批量删除请求失败', reason: error.message }] });
+      setConfirmBatch(false);
+    },
+  });
+
   return (
     <div className="flex flex-col gap-4">
       <PanelHeader
         title="成员"
         description="社员名册、身份与入社审批。"
         actions={
-          <Button variant="outline" onClick={() => setEvaluationOpen(true)}>
-            <CalendarRangeIcon aria-hidden="true" />
-            月评预览
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => setImportOpen(true)}>
+              <UploadIcon aria-hidden="true" />
+              Excel 导入
+            </Button>
+            <Button variant="outline" onClick={() => setEvaluationOpen(true)}>
+              <CalendarRangeIcon aria-hidden="true" />
+              月评预览
+            </Button>
+          </div>
         }
       />
 
@@ -227,11 +283,59 @@ function MembersBody({ principalId }: { principalId: string }) {
       ) : (
         <Card>
           <CardContent className="p-0 pb-2">
+            {batchResult && (
+              <div className="mx-5 mt-4 rounded-xl border border-border bg-muted/40 p-3 text-sm">
+                <p className="font-medium text-foreground">已删除 {batchResult.deletedCount} 个成员账号</p>
+                {batchResult.skipped.length > 0 && (
+                  <ul className="mt-1 flex flex-col gap-0.5 text-xs text-muted-foreground">
+                    {batchResult.skipped.map((item, index) => (
+                      <li key={index}>跳过 {item.label}：{item.reason}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+            {(selected.size > 0 || batchResult) && (
+              <div className="mx-5 mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-border p-3">
+                <span className="text-sm font-medium text-foreground">已选 {selected.size} 项</span>
+                <Button size="sm" variant="ghost" onClick={toggleAllVisible}>
+                  {allVisibleSelected ? '取消全选' : '全选本页'}
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>
+                  清除选择
+                </Button>
+                <Button
+                  size="sm"
+                  variant={confirmBatch ? 'destructive' : 'outline'}
+                  className={confirmBatch ? undefined : 'text-destructive hover:text-destructive'}
+                  disabled={batchDeleteMutation.isPending || selected.size === 0}
+                  onClick={() => {
+                    if (confirmBatch) batchDeleteMutation.mutate();
+                    else setConfirmBatch(true);
+                  }}
+                >
+                  {batchDeleteMutation.isPending ? (
+                    <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Trash2Icon aria-hidden="true" />
+                  )}
+                  {confirmBatch ? `确认删除 ${selected.size} 项（不可恢复）` : '批量删除（仅空账号）'}
+                </Button>
+                <span className="text-xs text-muted-foreground">有报名/积分等记录的成员会被自动跳过。</span>
+              </div>
+            )}
             <div className="hidden md:block">
               <Table>
                 <TableHeader>
                   <TableRow className="h-10">
-                    <TableHead className="pl-5">校园编号</TableHead>
+                    <TableHead className="w-10 pl-5">
+                      <Checkbox
+                        aria-label="全选本页成员"
+                        checked={allVisibleSelected}
+                        onCheckedChange={toggleAllVisible}
+                      />
+                    </TableHead>
+                    <TableHead>校园编号</TableHead>
                     <TableHead>姓名</TableHead>
                     <TableHead>年级</TableHead>
                     <TableHead>身份</TableHead>
@@ -247,7 +351,14 @@ function MembersBody({ principalId }: { principalId: string }) {
                       className="h-14 cursor-pointer"
                       onClick={() => setDetailId(member.id)}
                     >
-                      <TableCell className="pl-5 tabular-nums">{member.studentNo}</TableCell>
+                      <TableCell className="pl-5" onClick={(event) => event.stopPropagation()}>
+                        <Checkbox
+                          aria-label={`选择 ${member.displayName}`}
+                          checked={selected.has(member.id)}
+                          onCheckedChange={() => toggleSelected(member.id)}
+                        />
+                      </TableCell>
+                      <TableCell className="tabular-nums">{member.studentNo}</TableCell>
                       <TableCell className="font-medium">{member.displayName}</TableCell>
                       <TableCell className="text-muted-foreground tabular-nums">
                         {member.grade ?? '—'}
@@ -271,11 +382,17 @@ function MembersBody({ principalId }: { principalId: string }) {
             </div>
             <ul className="flex flex-col divide-y divide-border md:hidden">
               {items.map((member) => (
-                <li key={member.id}>
+                <li key={member.id} className="flex items-start gap-3 px-4 py-3">
+                  <Checkbox
+                    aria-label={`选择 ${member.displayName}`}
+                    className="mt-1"
+                    checked={selected.has(member.id)}
+                    onCheckedChange={() => toggleSelected(member.id)}
+                  />
                   <button
                     type="button"
                     onClick={() => setDetailId(member.id)}
-                    className="flex w-full flex-col gap-1 p-4 text-left"
+                    className="min-w-0 flex-1 flex-col gap-1 text-left"
                   >
                     <span className="flex items-center justify-between gap-2">
                       <span className="text-sm font-medium text-foreground">
@@ -312,6 +429,11 @@ function MembersBody({ principalId }: { principalId: string }) {
         />
       )}
       <EvaluationDialog open={evaluationOpen} onOpenChange={setEvaluationOpen} />
+      <ImportMembersDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={() => void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] })}
+      />
     </div>
   );
 }
@@ -336,6 +458,8 @@ function MemberDetail({
     displayHandle: string;
   } | null>(null);
   const [armedRevokeId, setArmedRevokeId] = useState<string | null>(null);
+  const [disableReason, setDisableReason] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const query = usePrivateQuery<MemberDetailDto, ApiError>(
     principalId,
@@ -397,6 +521,47 @@ function MemberDetail({
     onError: (error: ApiError) => setActionError(error.message),
   });
 
+  const disableMutation = useMutation({
+    mutationFn: async (reason: string) => {
+      await api.post(`/admin/members/${memberId}/disable`, { reason });
+      return true;
+    },
+    onSuccess: () => {
+      setActionError(null);
+      setDisableReason('');
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (error: ApiError) => setActionError(error.message),
+  });
+
+  const enableMutation = useMutation({
+    mutationFn: async () => {
+      await api.post(`/admin/members/${memberId}/enable`);
+      return true;
+    },
+    onSuccess: () => {
+      setActionError(null);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (error: ApiError) => setActionError(error.message),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async () => {
+      await api.delete(`/admin/members/${memberId}`);
+      return true;
+    },
+    onSuccess: () => {
+      setActionError(null);
+      onClose();
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+    },
+    onError: (error: ApiError) => {
+      setConfirmDelete(false);
+      setActionError(error.message);
+    },
+  });
+
   const term = query.data?.membershipTerms[0];
   const isApplicant = term?.membershipStatus === 'applicant';
   const currentMembership = term?.membershipStatus ?? 'applicant';
@@ -434,7 +599,17 @@ function MemberDetail({
                 {query.data.studentNo} / {query.data.grade ?? '—'}
               </dd>
               <dt className="text-muted-foreground">账户状态</dt>
-              <dd>{query.data.accountStatus}</dd>
+              <dd>
+                <span
+                  className={`inline-flex rounded-md px-2 py-0.5 text-xs font-medium ${
+                    query.data.accountStatus === 'disabled'
+                      ? 'bg-destructive-subtle text-destructive'
+                      : 'bg-success-subtle text-success-foreground'
+                  }`}
+                >
+                  {query.data.accountStatus === 'disabled' ? '已禁用' : '正常'}
+                </span>
+              </dd>
               <dt className="text-muted-foreground">主页可见性</dt>
               <dd>{query.data.profile?.visibility ?? '—'}</dd>
               {query.data.profile?.bio && (
@@ -506,6 +681,68 @@ function MemberDetail({
                 {membershipMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
                 保存身份
               </Button>
+            </div>
+          </section>
+
+          <section className="flex flex-col gap-2 rounded-xl border border-border p-3">
+            <h3 className="text-sm font-semibold text-foreground">账号管理</h3>
+            <p className="text-xs leading-5 text-muted-foreground">
+              禁用后该成员所有会话立即失效、无法登录，但积分与出勤历史保留且可重新启用；
+              删除仅适用于没有任何报名/出勤/积分/绑定记录的空账号（误注册清理）。
+            </p>
+            {query.data.accountStatus === 'disabled' ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant="outline" disabled={enableMutation.isPending} onClick={() => enableMutation.mutate()}>
+                  {enableMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+                  重新启用账号
+                </Button>
+                <span className="text-xs text-muted-foreground">当前已禁用。</span>
+              </div>
+            ) : (
+              <form
+                className="flex flex-col gap-2"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (disableReason.trim().length >= 3) disableMutation.mutate(disableReason.trim());
+                }}
+              >
+                <Label htmlFor="disable-reason">禁用原因（3-500 字，必填）</Label>
+                <Textarea
+                  id="disable-reason"
+                  value={disableReason}
+                  onChange={(event) => setDisableReason(event.target.value)}
+                  rows={2}
+                  maxLength={500}
+                />
+                <div className="flex justify-start">
+                  <Button
+                    type="submit"
+                    size="sm"
+                    variant="outline"
+                    className="text-destructive hover:text-destructive"
+                    disabled={disableMutation.isPending || disableReason.trim().length < 3}
+                  >
+                    {disableMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+                    禁用账号
+                  </Button>
+                </div>
+              </form>
+            )}
+            <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-2">
+              <Button
+                size="sm"
+                variant={confirmDelete ? 'destructive' : 'ghost'}
+                className={confirmDelete ? undefined : 'text-destructive hover:text-destructive'}
+                disabled={deleteMutation.isPending}
+                onClick={() => {
+                  if (confirmDelete) deleteMutation.mutate();
+                  else setConfirmDelete(true);
+                }}
+              >
+                {deleteMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+                {confirmDelete ? '确认删除（不可恢复）' : '删除成员'}
+              </Button>
+              <span className="text-xs text-muted-foreground">有历史记录的成员会被后端拒绝删除。</span>
             </div>
           </section>
 
@@ -801,6 +1038,252 @@ function EvaluationDialog({
               )}
             </section>
             <p className="text-xs leading-5 text-muted-foreground">{query.data.note}</p>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+const IMPORT_HEADER_ALIASES: Record<string, 'studentNo' | 'realName' | 'grade' | 'phone'> = {
+  学号: 'studentNo', studentno: 'studentNo', student_no: 'studentNo',
+  姓名: 'realName', 真实姓名: 'realName', realname: 'realName', real_name: 'realName', name: 'realName',
+  年级: 'grade', grade: 'grade',
+  手机: 'phone', 电话: 'phone', 手机号: 'phone', phone: 'phone',
+};
+
+interface ImportMemberRow {
+  row: number;
+  studentNo: string;
+  realName: string;
+  grade?: number;
+  phone?: string;
+  error?: string;
+}
+
+/** 解析 Excel 工作表第一个 sheet：表头按常见中英文别名归一化，数据行号从 2 起算（跳过表头） */
+function parseMemberSheet(workbook: XLSX.WorkBook): ImportMemberRow[] {
+  const firstSheetName = workbook.SheetNames[0];
+  const sheet = firstSheetName ? workbook.Sheets[firstSheetName] : undefined;
+  if (!sheet) return [];
+  const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+  return raw.map((entry, index) => {
+    const mapped: Record<string, string> = {};
+    for (const [key, value] of Object.entries(entry)) {
+      const normalized = IMPORT_HEADER_ALIASES[key.trim()] ?? IMPORT_HEADER_ALIASES[key.trim().toLowerCase()];
+      if (normalized) mapped[normalized] = String(value ?? '').trim();
+    }
+    const studentNo = mapped.studentNo ?? '';
+    const realName = mapped.realName ?? '';
+    const gradeText = mapped.grade ?? '';
+    const grade = /^\d+$/.test(gradeText) ? Number(gradeText) : undefined;
+    const phone = mapped.phone || undefined;
+    let error: string | undefined;
+    if (!studentNo) error = '缺少学号';
+    else if (!/^[A-Za-z0-9._-]{1,64}$/.test(studentNo)) error = '学号格式不合法';
+    else if (!realName) error = '缺少姓名';
+    return { row: index + 2, studentNo, realName, grade, phone, error };
+  });
+}
+
+interface ImportMemberResult {
+  row: number;
+  studentNo: string;
+  status: 'created' | 'skipped';
+  message?: string;
+}
+
+/** Excel 批量导入成员：管理员确认为已验证成员，跳过 CAS 核验直接建账号（members.manage） */
+function ImportMembersDialog({
+  open,
+  onOpenChange,
+  onImported,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onImported: () => void;
+}) {
+  const [rows, setRows] = useState<ImportMemberRow[]>([]);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [membershipStatus, setMembershipStatus] = useState('formal');
+  const [parseError, setParseError] = useState<string | null>(null);
+  const [results, setResults] = useState<{ createdCount: number; results: ImportMemberResult[] } | null>(null);
+
+  const validRows = rows.filter((row) => !row.error);
+  const invalidRows = rows.filter((row) => row.error);
+
+  const reset = () => {
+    setRows([]);
+    setFileName(null);
+    setParseError(null);
+    setResults(null);
+  };
+
+  const importMutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await api.post<{ createdCount: number; results: ImportMemberResult[] }>('/admin/members/import', {
+        rows: validRows.map((row) => ({
+          studentNo: row.studentNo,
+          realName: row.realName,
+          grade: row.grade,
+          phone: row.phone,
+          membershipStatus,
+        })),
+      });
+      return data;
+    },
+    onSuccess: (data) => {
+      setResults(data);
+      onImported();
+    },
+  });
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) reset();
+        onOpenChange(next);
+      }}
+    >
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Excel 导入成员</DialogTitle>
+          <DialogDescription>
+            适用于迁移历史名册：直接建立已验证成员账号，跳过 CAS 校验。表格需含「学号」「姓名」列（可选「年级」「手机」），
+            首行为表头。导入账号首次通过校园认证登录时会按学号自动绑定身份。
+          </DialogDescription>
+        </DialogHeader>
+
+        {results ? (
+          <div className="flex flex-col gap-3 text-sm">
+            <p className="font-medium text-foreground">成功创建 {results.createdCount} / {rows.length} 个成员账号</p>
+            {results.results.some((r) => r.status === 'skipped') && (
+              <ul className="flex max-h-48 flex-col gap-0.5 overflow-y-auto text-xs text-muted-foreground">
+                {results.results
+                  .filter((r) => r.status === 'skipped')
+                  .map((r) => (
+                    <li key={r.row}>第 {r.row} 行（{r.studentNo || '无学号'}）跳过：{r.message}</li>
+                  ))}
+              </ul>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={reset}>
+                继续导入
+              </Button>
+              <Button onClick={() => onOpenChange(false)}>完成</Button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor="import-members-file">Excel 文件（.xlsx/.xls）</Label>
+              <Input
+                id="import-members-file"
+                type="file"
+                accept=".xlsx,.xls"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (!file) return;
+                  setFileName(file.name);
+                  setParseError(null);
+                  const reader = new FileReader();
+                  reader.onload = () => {
+                    try {
+                      const workbook = XLSX.read(reader.result, { type: 'array' });
+                      const parsed = parseMemberSheet(workbook);
+                      if (parsed.length === 0) setParseError('未解析出任何数据行，请检查表头是否包含「学号」「姓名」列。');
+                      setRows(parsed);
+                    } catch {
+                      setParseError('文件解析失败，请确认是有效的 Excel 文件。');
+                      setRows([]);
+                    }
+                  };
+                  reader.readAsArrayBuffer(file);
+                }}
+              />
+              {fileName && <p className="text-xs text-muted-foreground">已选择：{fileName}</p>}
+            </div>
+
+            <div className="grid gap-1.5">
+              <Label htmlFor="import-members-status">导入账号身份</Label>
+              <Select value={membershipStatus} onValueChange={setMembershipStatus}>
+                <SelectTrigger id="import-members-status" aria-label="导入账号身份">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {STATUS_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">本次导入的所有成员统一设为该身份，不支持按行单独指定。</p>
+            </div>
+
+            {parseError && (
+              <Alert variant="destructive">
+                <AlertDescription>{parseError}</AlertDescription>
+              </Alert>
+            )}
+
+            {rows.length > 0 && (
+              <div className="flex flex-col gap-2">
+                <p className="text-sm text-muted-foreground">
+                  共 {rows.length} 行，有效 {validRows.length} 行{invalidRows.length > 0 ? `，${invalidRows.length} 行有误（将跳过）` : ''}。
+                </p>
+                <div className="max-h-64 overflow-y-auto rounded-xl border border-border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>行</TableHead>
+                        <TableHead>学号</TableHead>
+                        <TableHead>姓名</TableHead>
+                        <TableHead>年级</TableHead>
+                        <TableHead>手机</TableHead>
+                        <TableHead>状态</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {rows.map((row) => (
+                        <TableRow key={row.row} className={row.error ? 'bg-destructive-subtle/40' : undefined}>
+                          <TableCell className="tabular-nums">{row.row}</TableCell>
+                          <TableCell className="tabular-nums">{row.studentNo || '—'}</TableCell>
+                          <TableCell>{row.realName || '—'}</TableCell>
+                          <TableCell className="tabular-nums">{row.grade ?? '—'}</TableCell>
+                          <TableCell className="tabular-nums">{row.phone ?? '—'}</TableCell>
+                          <TableCell className="text-muted-foreground">
+                            {row.error ? <span className="text-destructive">{row.error}</span> : '有效'}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              </div>
+            )}
+
+            {importMutation.isError && (
+              <Alert variant="destructive">
+                <AlertDescription>
+                  {importMutation.error instanceof ApiError ? importMutation.error.message : '导入失败'}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                取消
+              </Button>
+              <Button
+                disabled={validRows.length === 0 || importMutation.isPending}
+                onClick={() => importMutation.mutate()}
+              >
+                {importMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+                导入 {validRows.length} 个成员
+              </Button>
+            </div>
           </div>
         )}
       </DialogContent>

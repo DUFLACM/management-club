@@ -154,3 +154,20 @@ export function remoteMonthlyAllowance(
   }
   return { allowed: true }
 }
+
+/**
+ * R04 已拍板：有效提交判题状态集合 = AC/WA/TLE/MLE/RE/PE（有真实作题行为即有效，零分题也算）；
+ * 仅 CE 等人工复核状态需人工确认；集合为空且含人工状态 → 待确认；完全无提交 → attendance_only。
+ */
+export type ValidSubmissionVerdict =
+  | { status: 'valid'; matched: string[] }
+  | { status: 'manual_review'; matched: string[] }
+  | { status: 'none' }
+
+export function hasValidSubmission(verdicts: string[], params: RuleParams): ValidSubmissionVerdict {
+  const accepted = verdicts.filter((v) => params.validSubmission.acceptedStatuses.includes(v))
+  if (accepted.length > 0) return { status: 'valid', matched: accepted }
+  const manual = verdicts.filter((v) => params.validSubmission.manualReviewStatuses.includes(v))
+  if (manual.length > 0) return { status: 'manual_review', matched: manual }
+  return { status: 'none' }
+}

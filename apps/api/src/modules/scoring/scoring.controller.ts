@@ -1,14 +1,19 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
+import { Body, Controller, Inject, Delete, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
 import { z } from 'zod'
 import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentUser, CurrentActor, ok } from '../../common/guards.js'
-import { ScoringService, ledgerEntrySchema } from './scoring.service.js'
+import { ScoringService, ScoringError, ledgerEntrySchema } from './scoring.service.js'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
+import { ActivityService } from '../activities/activity.service.js'
+import { ContestStandingsService } from '../activities/contest-standings.service.js'
 import type { SessionActor } from '../auth/session.service.js'
 
 @Controller('/api/v1/me')
 @UseGuards(SessionGuard, PermissionsGuard)
 export class ScoringMeController {
-  constructor(private readonly scoring: ScoringService) {}
+  constructor(
+    private readonly scoring: ScoringService,
+    private readonly db: PrismaService,
+  ) {}
 
   @Get('points')
   async points(@CurrentUser() user: { userId: string }, @Query('month') month?: string, @Query('cursor') cursor?: string) {
@@ -23,8 +28,20 @@ export class ScoringMeController {
   @Get('leaderboard')
   async leaderboard(@CurrentUser() user: { userId: string } | null, @Query('kind') kind?: string, @Query('ref') ref?: string) {
     const viewerId = user?.userId ?? null
-    const validKind = kind === 'disclosure' || kind === 'frozen' ? kind : 'current'
+    const validKind = kind === 'disclosure' ? kind : 'current'
     return ok(await this.scoring.leaderboard(validKind, ref, viewerId))
+  }
+
+  /** 成员端公示批次卡片列表（进行中优先，不再依赖粘贴引用） */
+  @Get('disclosures')
+  async myDisclosures() {
+    const rows = await this.db.disclosure.findMany({
+      where: { status: 'published' },
+      orderBy: { publishedAt: 'desc' },
+      take: 12,
+      select: { id: true, monthKey: true, status: true, startsAt: true, endsAt: true },
+    })
+    return ok(rows)
   }
 
   @Post('claims')
@@ -36,6 +53,7 @@ export class ScoringMeController {
       activityId: z.string().uuid().optional(),
       contestKey: z.string().max(120).optional(),
       evidenceNote: z.string().max(500).optional(),
+      evidenceAssetIds: z.array(z.string().uuid()).max(5).optional(),
     }).parse(body)
     return ok(await this.scoring.submitClaim(user.userId, parsed))
   }
@@ -63,6 +81,8 @@ export class ScoringAdminController {
   constructor(
     private readonly scoring: ScoringService,
     private readonly db: PrismaService,
+    @Inject(ActivityService) private readonly activities: ActivityService,
+    @Inject(ContestStandingsService) private readonly standings: ContestStandingsService,
   ) {}
 
   @Post('scoring-batches')
@@ -77,6 +97,24 @@ export class ScoringAdminController {
   async postEntry(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
     const input = ledgerEntrySchema.parse(body)
     return ok(await this.scoring.postLedgerEntry(actor, input))
+  }
+
+  /** 批量手动加分（粘贴/导入：学号+分数+备注；可关联活动，成员端活动详情展示积分） */
+  @Post('ledger-entries/batch')
+  @RequireAction('points.review')
+  async postEntriesBatch(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
+    const parsed = z.object({
+      rows: z.array(z.object({
+        studentNo: z.string().min(3).max(64),
+        amount: z.string().regex(/^-?\d+(\.\d+)?$/, '分数为十进制（可负）'),
+        note: z.string().max(300).optional(),
+      })).min(1).max(200),
+      category: z.enum(['contest', 'remote_contest', 'activity', 'contribution', 'service', 'award', 'initial', 'penalty']).default('activity'),
+      activityId: z.string().uuid().optional(),
+      scoreMonth: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+    }).safeParse(body)
+    if (!parsed.success) throw new ScoringError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.scoring.batchPostEntries(actor, parsed.data))
   }
 
   @Post('ledger-entries/:id/reverse')
@@ -104,6 +142,22 @@ export class ScoringAdminController {
     return ok(rows)
   }
 
+  /** 提前结束公示（保留批次与快照，状态转 closed） */
+  @Post('disclosures/:id/close')
+  @RequireAction('disclosure.publish')
+  async closeDisclosure(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    await this.scoring.closeDisclosure(actor, id)
+    return ok({ closed: true })
+  }
+
+  /** 删除公示批次（连同快照行；审计保留） */
+  @Delete('disclosures/:id')
+  @RequireAction('disclosure.publish')
+  async deleteDisclosure(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    await this.scoring.deleteDisclosure(actor, id)
+    return ok({ deleted: true })
+  }
+
   @Get('reviews')
   @RequireAction('points.review')
   async reviewQueue(@Query('type') type?: string) {
@@ -113,7 +167,15 @@ export class ScoringAdminController {
       take: 50,
       include: { votes: true },
     })
-    const claims = await this.db.pointsClaim.findMany({ where: { status: 'pending' }, orderBy: { createdAt: 'asc' }, take: 50, include: { user: { select: { verifiedRealName: true, studentNo: true } } } })
+    const claims = await this.db.pointsClaim.findMany({
+      where: { status: 'pending' },
+      orderBy: { createdAt: 'asc' },
+      take: 50,
+      include: {
+        user: { select: { verifiedRealName: true, studentNo: true } },
+        assets: { orderBy: { sortOrder: 'asc' }, select: { assetId: true } },
+      },
+    })
     const appeals = await this.db.appeal.findMany({ where: { status: 'submitted' }, orderBy: { createdAt: 'asc' }, take: 50, include: { user: { select: { verifiedRealName: true, studentNo: true } } } })
     return ok({ cases, claims, appeals })
   }
@@ -150,33 +212,18 @@ export class ScoringAdminController {
     return ok({ decided: true })
   }
 
-  /** 冻结榜（02 方案 6.4）：默认报名截止前一日 22:00；冻结后回填不改变名单 */
-  @Post('freezes')
-  @RequireAction('competitions.manage')
-  async createFreeze(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
-    const parsed = z.object({
-      contestKey: z.string().min(2).max(120),
-      title: z.string().min(2).max(120),
-      freezeAt: z.string().datetime(),
-    }).parse(body)
-    const rule = await this.db.ruleVersion.findFirst({ where: { status: 'published' }, orderBy: { version: 'desc' } })
-    const freezeId = crypto.randomUUID()
-    await this.db.$transaction(async (tx) => {
-      await tx.rankingFreeze.create({
-        data: { id: freezeId, contestKey: parsed.contestKey, title: parsed.title, freezeAt: new Date(parsed.freezeAt), ruleVersionId: rule?.id ?? '', status: 'scheduled' },
-      })
-    })
-    await this.db.job.create({
-      data: { id: crypto.randomUUID(), type: 'disclosure.freeze_ranking', payload: { freezeId } as never, dedupeKey: `freeze:${freezeId}`, priority: 3 },
-    })
-    void actor
-    return ok({ freezeId })
+  /** 平台赛积分结算（引擎：有效提交自动核验 + λ 目录匹配；结束后 5 分钟窗口） */
+  @Post('activities/:id/settle-scores')
+  @RequireAction('activity.manage')
+  async settleScores(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    return ok(await this.scoring.settleContestScores(actor, id))
   }
 
-  @Get('freezes')
-  @RequireAction('competitions.manage')
-  async listFreezes() {
-    const rows = await this.db.rankingFreeze.findMany({ orderBy: { freezeAt: 'desc' }, take: 30, include: { rows: { orderBy: { position: 'asc' }, take: 5 } } })
-    return ok(rows)
+  /** 管理端比赛榜单：社团排名 + 平台位次 + 逐题通过情况 */
+  @Get('activities/:id/standings')
+  @RequireAction('activity.manage')
+  async adminStandings(@Param('id', ParseUUIDPipe) id: string) {
+    return ok(await this.activities.activityStandings(null as never, id, this.standings))
   }
+
 }

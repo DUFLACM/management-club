@@ -8,6 +8,7 @@ import type { SessionActor } from '../../modules/auth/session.service.js'
 const { ActivityAdminController, ActivityUserController } = require('../../../dist/modules/activities/activity.controller.js')
 const { ActivityService } = require('../../../dist/modules/activities/activity.service.js')
 const { AttendanceService } = require('../../../dist/modules/attendance/attendance.service.js')
+const { ContestStandingsService } = require('../../../dist/modules/activities/contest-standings.service.js')
 const { PrismaService } = require('../../../dist/infrastructure/database/database.module.js')
 const { SessionService } = require('../../../dist/modules/auth/session.service.js')
 
@@ -21,6 +22,9 @@ const update = vi.fn()
 const audit = { log: vi.fn() }
 const db = {
   activity: { findUnique, update },
+  pointsLedgerEntry: { findMany: vi.fn().mockResolvedValue([]) },
+  // 讲题满意度区块：无获批讲题时提前返回，不再读取出勤口径
+  lectureRequest: { findMany: vi.fn().mockResolvedValue([]) },
   $executeRaw: vi.fn(),
   $transaction: async (callback: (tx: unknown) => unknown) => callback(db),
 }
@@ -33,6 +37,7 @@ beforeAll(async () => {
     providers: [
       { provide: ActivityService, useValue: new ActivityService(db, audit, {}, {}) },
       { provide: AttendanceService, useValue: {} },
+      { provide: ContestStandingsService, useValue: {} },
       { provide: PrismaService, useValue: db },
       { provide: SessionService, useValue: { resolveActor: async () => actor } },
     ],

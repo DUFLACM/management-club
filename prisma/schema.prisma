@@ -52,6 +52,9 @@ model User {
   attendanceResults    AttendanceAttendanceResult[]
   leaveRequests        LeaveRequest[]
   remotePermissions    RemotePermission[]
+  lectureRequests      LectureRequest[]
+  lectureRatingsGiven  LectureRating[]    @relation("lectureRatingsGiven")
+  uploadedMaterials    ActivityMaterial[] @relation("uploadedMaterials")
   restrictions         Restriction[]
   pointsClaims         PointsClaim[]
   appeals              Appeal[]
@@ -60,6 +63,11 @@ model User {
   platformAccounts     PlatformAccount[]
   badgeAwards          BadgeAward[]
   featuredBadges       ProfileFeaturedBadge[]
+  competitionRegistrations CompetitionRegistration[]
+  competitionShortlistRows CompetitionShortlistRow[]
+  teamMemberships      TeamMember[]
+  teamInvitesReceived  TeamInvite[]
+  evaluationRows       EvaluationRow[]
 
   @@index([studentNo])
   @@map("users")
@@ -205,7 +213,7 @@ model AdminLoginChallenge {
   consumedAt DateTime? @db.Timestamptz(3) @map("consumed_at")
   createdAt  DateTime  @db.Timestamptz(3) @default(now()) @map("created_at")
 
-  gate AdminGateChallenge @relation(fields: [gateId], references: [id])
+  gate AdminGateChallenge @relation(fields: [gateId], references: [id], onDelete: Cascade)
 
   @@index([gateId, expiresAt])
   @@map("admin_login_challenges")
@@ -290,7 +298,8 @@ model Semester {
   endsOn      DateTime @db.Timestamptz(3) @map("ends_on")
   createdAt   DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
 
-  membershipTerms MembershipTerm[]
+  membershipTerms   MembershipTerm[]
+  evaluationBatches EvaluationBatch[]
 
   @@map("semesters")
 }
@@ -544,6 +553,8 @@ model Activity {
   leaveRequests   LeaveRequest[]
   remotePermissions RemotePermission[]
   incidents       IncidentReport[]
+  lectureRequests LectureRequest[]
+  materials       ActivityMaterial[]
 
   @@index([status, startAt])
   @@index([platform, platformContestId])
@@ -575,6 +586,7 @@ model AttendancePolicy {
   qrRotateSeconds   Int     @default(25) @map("qr_rotate_seconds")
   qrTtlSeconds      Int     @default(60) @map("qr_ttl_seconds")
   selfCheckout      Boolean @default(true) @map("self_checkout") // false = 工作人员点验
+  autoCheckout      Boolean @default(false) @map("auto_checkout") // true = 活动结束时为已签到未签退者按结束时间补记 OUT（method=AUTO）
   version           Int     @default(1)
   revision          Int     @default(1)
 
@@ -690,6 +702,86 @@ model IncidentReport {
   activity Activity @relation(fields: [activityId], references: [id])
 
   @@map("incident_reports")
+}
+
+// 指定比赛认定目录（附录一）：A 学校配额统管 / B 积分认定非配额 / C 原则不认定
+model DesignatedContest {
+  id            String    @id @db.Uuid
+  category      String // A | B | C
+  groupName     String    @map("group_name")
+  name          String
+  platform      String? // nowcoder | codeforces | atcoder | hydro | other
+  lambdaKey     String?   @map("lambda_key") // 附录二 λ 档（甲/乙/丙）；null = 须赛前公告确定
+  note          String?
+  evidenceRef   String?   @map("evidence_ref") // 依据（附录一条款/决议引用，R13）
+  effectiveFrom DateTime  @default(now()) @map("effective_from") @db.Timestamptz(3)
+  status        String    @default("active") // active | retired
+  createdAt     DateTime  @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  competitionEvents CompetitionEvent[]
+
+  @@index([category, status])
+  @@map("designated_contests")
+}
+
+// 讲题申请：成员报名时或详情页提交；审批通过获得该活动的材料上传权限
+model LectureRequest {
+  id         String    @id @db.Uuid
+  activityId String    @map("activity_id") @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  topic      String?
+  status     String    @default("pending") // pending | approved | rejected
+  reviewNote String?   @map("review_note")
+  reviewedBy String?   @map("reviewed_by") @db.Uuid
+  reviewedAt DateTime? @db.Timestamptz(3) @map("reviewed_at")
+  createdAt  DateTime  @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+  ratings  LectureRating[]
+
+  @@unique([activityId, userId])
+  @@map("lecture_requests")
+}
+
+/// 讲题满意度：参与者对获批讲题人的 1–5 分评价。
+/// raterUserId 只用于防重与本人撤改，任何读接口都不返回评价人身份；聚合值对讲题人本人与
+/// activity.manage 可见，匿名留言在样本过少时不向讲题人展示（避免反推评价人）。
+model LectureRating {
+  id               String   @id @db.Uuid
+  lectureRequestId String   @map("lecture_request_id") @db.Uuid
+  raterUserId      String   @map("rater_user_id") @db.Uuid
+  score            Int // 1 | 2 | 3 | 4 | 5
+  comment          String?  @db.Text
+  createdAt        DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+  updatedAt        DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
+
+  lectureRequest LectureRequest @relation(fields: [lectureRequestId], references: [id], onDelete: Cascade)
+  rater          User           @relation("lectureRatingsGiven", fields: [raterUserId], references: [id])
+
+  @@unique([lectureRequestId, raterUserId])
+  @@index([lectureRequestId, createdAt])
+  @@map("lecture_ratings")
+}
+
+// 活动材料：讲题幻灯片/题解等附件，受控本地存储（同头像私有目录约定）
+model ActivityMaterial {
+  id              String   @id @db.Uuid
+  activityId      String   @map("activity_id") @db.Uuid
+  uploaderUserId  String   @map("uploader_user_id") @db.Uuid
+  title           String
+  kind            String   @default("solution") // slides | solution | data | other
+  fileName        String   @map("file_name")
+  mimeType        String?  @map("mime_type")
+  sizeBytes       Int?     @map("size_bytes")
+  storageKey      String   @map("storage_key")
+  createdAt       DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  activity Activity @relation(fields: [activityId], references: [id])
+  user     User     @relation("uploadedMaterials", fields: [uploaderUserId], references: [id])
+
+  @@index([activityId])
+  @@map("activity_materials")
 }
 
 // ===========================================================================
@@ -839,6 +931,7 @@ model PlatformAccount {
   user     User              @relation(fields: [userId], references: [id])
   results  PlatformResult[]
   ratings  PlatformRatingPoint[]
+  competitionRegistrations CompetitionRegistration[]
 
   // 活跃绑定对 (platform, canonical external_id) 唯一 —— 迁移中建立部分唯一索引
   @@index([platform, externalId])
@@ -1055,7 +1148,6 @@ model RuleVersion {
 
   activities  Activity[]
   disclosures Disclosure[]
-  freezes     RankingFreeze[]
   batches     CalculationBatch[]
 
   @@map("rule_versions")
@@ -1152,7 +1244,9 @@ model PointsClaim {
   contestKey   String?  @map("contest_key")
   title        String
   description  String
+  /// 单图遗留字段，已被 assets（多图）取代，保留以兼容历史数据
   evidenceAssetId String? @map("evidence_asset_id") @db.Uuid
+  evidenceNote String?  @map("evidence_note")
   scoreMonth   String   @map("score_month") @db.VarChar(7)
   status       String   @default("pending") // pending | approved | rejected | more_info
   reviewNote   String?  @map("review_note")
@@ -1160,10 +1254,26 @@ model PointsClaim {
   reviewedAt   DateTime? @db.Timestamptz(3) @map("reviewed_at")
   createdAt    DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
 
-  user User @relation(fields: [userId], references: [id])
+  user   User               @relation(fields: [userId], references: [id])
+  assets PointsClaimAsset[]
 
   @@index([status])
   @@map("points_claims")
+}
+
+/// 贡献申报的图片佐证（media_assets.purpose = 'evidence'），单条申报最多 5 张
+model PointsClaimAsset {
+  id        String   @id @db.Uuid
+  claimId   String   @map("claim_id") @db.Uuid
+  assetId   String   @unique @map("asset_id") @db.Uuid
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  claim PointsClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  asset MediaAsset  @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([claimId])
+  @@map("points_claim_assets")
 }
 
 model ReviewCase {
@@ -1258,78 +1368,187 @@ model DisclosureRow {
   @@map("disclosure_rows")
 }
 
-model RankingFreeze {
-  id            String    @id @db.Uuid
-  contestKey    String    @map("contest_key")
-  title         String
-  freezeAt      DateTime @db.Timestamptz(3)  @map("freeze_at")
-  ruleVersionId String    @map("rule_version_id") @db.Uuid
-  status        String    @default("scheduled") // scheduled | frozen | cancelled
-  scopeNote     String?   @map("scope_note")
-  createdAt     DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
-
-  ruleVersion RuleVersion        @relation(fields: [ruleVersionId], references: [id])
-  rows        FrozenRankingRow[]
-
-  @@map("ranking_freezes")
-}
-
-model FrozenRankingRow {
-  id         String  @id @db.Uuid
-  freezeId   String  @map("freeze_id") @db.Uuid
-  userId     String  @map("user_id") @db.Uuid
-  position   Int
-  eSnapshot  Decimal @map("e_snapshot") @db.Decimal(20, 4)
-  qScore     Decimal? @map("q_score") @db.Decimal(20, 4)
-  eligible   Boolean @default(true)
-
-  freeze RankingFreeze @relation(fields: [freezeId], references: [id])
-
-  @@unique([freezeId, userId])
-  @@map("frozen_ranking_rows")
-}
-
 // ===========================================================================
-// 九、正式赛报名与组队
+// 九、正式赛事报名、资格排序与组队
 // ===========================================================================
 
+// 正式赛事届次：报名、资格、计分方式的载体（依据《竞赛报名、名额分配与组队管理办法》与附录一/二）
+model CompetitionEvent {
+  id                  String    @id @db.Uuid
+  designatedContestId String?   @map("designated_contest_id") @db.Uuid
+  title               String
+  category            String // A 学校配额统一管理 | B 纳入积分认定（非配额）
+  teamSize            Int?      @map("team_size") // null = 个人赛；非空 = 团队赛固定人数
+  scoringMode         String    @map("scoring_mode") // platform_auto | manual_review
+  platform            String? // nowcoder | codeforces | atcoder | hydro（platform_auto 用）
+  platformContestId   String?   @map("platform_contest_id")
+  contestTier         String?   @map("contest_tier") // school_select|provincial|icpc_invite|icpc_regional|top_final|network_qualifier|ladder|lanqiao|baidu_star（manual_review 用）
+  lambdaKey           String?   @map("lambda_key") // 甲/乙/丙（platform_auto 用；未设按认定目录匹配，兜底乙类）
+  announcement        String    @db.Text
+  registerStartAt     DateTime? @db.Timestamptz(3) @map("register_start_at")
+  registerDeadline    DateTime  @db.Timestamptz(3) @map("register_deadline")
+  startAt             DateTime  @db.Timestamptz(3) @map("start_at")
+  endAt               DateTime  @db.Timestamptz(3) @map("end_at")
+  quota               Int? // A 类学校可用名额/队伍数
+  qualificationRule   Json?     @map("qualification_rule") // { basedOn: 'currentE'|'specialQ', specialWeight?, scope? }
+  freezeAt            DateTime? @db.Timestamptz(3) @map("freeze_at") // 积分冻结时点（办法第十条；默认报名截止前一日 22:00，可自定义）
+  teamFormDeadline    DateTime? @db.Timestamptz(3) @map("team_form_deadline") // 自主组队截止（办法第十四条）
+  status              String    @default("draft") // draft|open|shortlisted|team_forming|closed|settled|archived
+  createdBy           String    @map("created_by") @db.Uuid
+  createdAt           DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  designatedContest DesignatedContest? @relation(fields: [designatedContestId], references: [id])
+  registrations     CompetitionRegistration[]
+  shortlist         CompetitionShortlistRow[]
+  teamEntries       TeamCompetitionEntry[]
+
+  @@index([status, category])
+  @@map("competition_events")
+}
+
+// 报名截止前积分排名快照：资格判定 + 专项选拔 Q 值（原冻结机制的继承者，办法第九~十一条）
+model CompetitionShortlistRow {
+  id          String   @id @db.Uuid
+  eventId     String   @map("event_id") @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  position    Int
+  eSnapshot   Decimal  @map("e_snapshot") @db.Decimal(20, 4)
+  qScore      Decimal? @map("q_score") @db.Decimal(20, 4)
+  eligible    Boolean  @default(true)
+  shortlisted Boolean  @default(false)
+
+  event CompetitionEvent @relation(fields: [eventId], references: [id])
+  user  User             @relation(fields: [userId], references: [id])
+
+  @@unique([eventId, userId])
+  @@map("competition_shortlist_rows")
+}
+
+// 个人赛报名（团队赛走 TeamCompetitionEntry）
 model CompetitionRegistration {
-  id            String    @id @db.Uuid
-  contestKey    String    @map("contest_key")
-  title         String
-  userId        String    @map("user_id") @db.Uuid
-  status        String    @default("submitted") // submitted | shortlisted | confirmed | declined | waitlisted
-  freezeId      String?   @map("freeze_id") @db.Uuid
-  note          String?
-  registeredAt  DateTime @db.Timestamptz(3)  @default(now()) @map("registered_at")
-  confirmedAt   DateTime? @db.Timestamptz(3) @map("confirmed_at")
+  id                String    @id @db.Uuid
+  eventId           String    @map("event_id") @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  platformAccountId String?   @map("platform_account_id") @db.Uuid // scoringMode=platform_auto 必填
+  status            String    @default("submitted") // submitted|pending_review|approved|rejected|confirmed|waitlisted|declined|cancelled
+  resultScore       Decimal?  @map("result_score") @db.Decimal(12, 4)
+  resultDetail      Json?     @map("result_detail")
+  reviewNote        String?   @map("review_note")
+  reviewedBy        String?   @map("reviewed_by") @db.Uuid
+  reviewedAt        DateTime? @db.Timestamptz(3) @map("reviewed_at")
+  note              String?
+  registeredAt      DateTime  @default(now()) @db.Timestamptz(3) @map("registered_at")
+  confirmedAt       DateTime? @db.Timestamptz(3) @map("confirmed_at")
 
-  @@unique([contestKey, userId])
+  event           CompetitionEvent  @relation(fields: [eventId], references: [id])
+  user            User              @relation(fields: [userId], references: [id])
+  platformAccount PlatformAccount?  @relation(fields: [platformAccountId], references: [id])
+  materials       CompetitionRegistrationMaterial[]
+
+  @@unique([eventId, userId])
   @@map("competition_registrations")
 }
 
+// 佐证材料上传（manual_review 档位用；镜像 ActivityMaterial 的受控本地存储模式）
+model CompetitionRegistrationMaterial {
+  id             String   @id @db.Uuid
+  registrationId String   @map("registration_id") @db.Uuid
+  title          String
+  fileName       String   @map("file_name")
+  mimeType       String?  @map("mime_type")
+  sizeBytes      Int?     @map("size_bytes")
+  storageKey     String   @map("storage_key")
+  createdAt      DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  registration CompetitionRegistration @relation(fields: [registrationId], references: [id])
+
+  @@map("competition_registration_materials")
+}
+
+// 常驻小队（组队广场）：一人可属于多队，可持续邀请新成员，不与单场比赛强绑定
 model Team {
-  id         String   @id @db.Uuid
-  contestKey String   @map("contest_key")
-  name       String
-  createdAt  DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+  id            String   @id @db.Uuid
+  name          String
+  teamSize      Int      @map("team_size")
+  captainUserId String   @map("captain_user_id") @db.Uuid
+  status        String   @default("forming") // forming | locked | disbanded
+  createdBy     String   @map("created_by") @db.Uuid
+  createdAt     DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
 
   members TeamMember[]
+  invites TeamInvite[]
+  entries TeamCompetitionEntry[]
 
-  @@unique([contestKey, name])
   @@map("teams")
 }
 
 model TeamMember {
-  id     String @id @db.Uuid
-  teamId String @map("team_id") @db.Uuid
-  userId String @map("user_id") @db.Uuid
-  role   String @default("member") // member | captain
+  id       String    @id @db.Uuid
+  teamId   String    @map("team_id") @db.Uuid
+  userId   String    @map("user_id") @db.Uuid
+  role     String    @default("member") // member | captain
+  status   String    @default("active") // active | left
+  joinedAt DateTime  @default(now()) @db.Timestamptz(3) @map("joined_at")
+  leftAt   DateTime? @db.Timestamptz(3) @map("left_at")
 
   team Team @relation(fields: [teamId], references: [id])
+  user User @relation(fields: [userId], references: [id])
 
   @@unique([teamId, userId])
   @@map("team_members")
+}
+
+// 组队广场邀请
+model TeamInvite {
+  id            String    @id @db.Uuid
+  teamId        String    @map("team_id") @db.Uuid
+  invitedUserId String    @map("invited_user_id") @db.Uuid
+  invitedBy     String    @map("invited_by") @db.Uuid
+  status        String    @default("pending") // pending|accepted|declined|expired|cancelled
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+  respondedAt   DateTime? @db.Timestamptz(3) @map("responded_at")
+
+  team Team @relation(fields: [teamId], references: [id])
+  invitedUser User @relation(fields: [invitedUserId], references: [id])
+
+  @@unique([teamId, invitedUserId, status])
+  @@map("team_invites")
+}
+
+// 队伍 ↔ 赛事报名：一个 Team 可报名多场团队赛
+model TeamCompetitionEntry {
+  id           String    @id @db.Uuid
+  teamId       String    @map("team_id") @db.Uuid
+  eventId      String    @map("event_id") @db.Uuid
+  status       String    @default("submitted") // submitted|pending_review|approved|rejected|confirmed|cancelled
+  resultScore  Decimal?  @map("result_score") @db.Decimal(12, 4)
+  resultDetail Json?     @map("result_detail")
+  reviewNote   String?   @map("review_note")
+  reviewedBy   String?   @map("reviewed_by") @db.Uuid
+  reviewedAt   DateTime? @db.Timestamptz(3) @map("reviewed_at")
+  registeredAt DateTime  @default(now()) @db.Timestamptz(3) @map("registered_at")
+
+  team      Team                      @relation(fields: [teamId], references: [id])
+  event     CompetitionEvent          @relation(fields: [eventId], references: [id])
+  materials TeamCompetitionMaterial[]
+
+  @@unique([teamId, eventId])
+  @@map("team_competition_entries")
+}
+
+model TeamCompetitionMaterial {
+  id         String   @id @db.Uuid
+  entryId    String   @map("entry_id") @db.Uuid
+  title      String
+  fileName   String   @map("file_name")
+  mimeType   String?  @map("mime_type")
+  sizeBytes  Int?     @map("size_bytes")
+  storageKey String   @map("storage_key")
+  createdAt  DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  entry TeamCompetitionEntry @relation(fields: [entryId], references: [id])
+
+  @@map("team_competition_materials")
 }
 
 // ===========================================================================
@@ -1404,6 +1623,9 @@ model MediaAsset {
   visibility   String   @default("private")
   revision     Int      @default(1)
   createdAt    DateTime @db.Timestamptz(3) @default(now()) @map("created_at")
+
+  /// 佐证图被哪条贡献申报引用；为空表示尚未提交（用于限制滞留资产）
+  claimLink PointsClaimAsset?
 
   @@index([ownerUserId])
   @@map("media_assets")
@@ -1557,4 +1779,81 @@ model AppMeta {
   updatedAt  DateTime @db.Timestamptz(3) @default(now()) @updatedAt @map("updated_at")
 
   @@map("app_meta")
+}
+
+// ===========================================================================
+// 十四、综合素质评价建议折算（附录三）：学期批次 + 逐人建议加分
+// 口径仅为社团内部排序与建议值，不等同学院最终结果（附录三·九）。
+// ===========================================================================
+
+/// 综评建议批次：一个学期算一次快照。isTest=true 为测试口产物，导出与页面均标注，不得作为正式结果上报。
+model EvaluationBatch {
+  id          String    @id @db.Uuid
+  semesterId  String    @map("semester_id") @db.Uuid
+  status      String    @default("draft") // draft | published
+  isTest      Boolean   @default(false) @map("is_test")
+  /// 折算口径快照（附录三·九：可按学期微调并于学期初公示）{ points, contest, service }
+  weights     Json
+  /// 定档比例快照 { a, b }，C 档为余量
+  tierRatios  Json      @map("tier_ratios")
+  memberCount Int       @default(0) @map("member_count") // 参与定档的普通成员数 N
+  note        String?   @db.Text
+  generatedBy String?   @map("generated_by") @db.Uuid
+  generatedAt DateTime  @db.Timestamptz(3) @default(now()) @map("generated_at")
+  publishedAt DateTime? @db.Timestamptz(3) @map("published_at")
+
+  semester Semester        @relation(fields: [semesterId], references: [id])
+  rows     EvaluationRow[]
+
+  @@index([semesterId, generatedAt])
+  @@map("evaluation_batches")
+}
+
+/// 批次内逐人行：*Std 为引擎算出的标准分，override* 为管理端修改（存在时优先生效，便于公示期申诉更正）
+model EvaluationRow {
+  id        String @id @db.Uuid
+  batchId   String @map("batch_id") @db.Uuid
+  userId    String @map("user_id") @db.Uuid
+  /// 导出所需字段在生成时固化，避免成员后续改名导致历史批次漂移
+  studentNo String @map("student_no") @db.VarChar(64)
+  realName  String @map("real_name")
+
+  /// 学期有效积分月均原始值（仅用于追溯标准分来源）
+  pointsAvg         Decimal @default(0) @map("points_avg") @db.Decimal(20, 10)
+  /// 三项标准分（0-100）与纪律扣减
+  pointsStd         Decimal @default(0) @map("points_std") @db.Decimal(9, 4)
+  contestStd        Decimal @default(0) @map("contest_std") @db.Decimal(9, 4)
+  serviceStd        Decimal @default(0) @map("service_std") @db.Decimal(9, 4)
+  disciplinePenalty Decimal @default(0) @map("discipline_penalty") @db.Decimal(9, 4)
+  /// H = 0.70×积分标准分 + 0.20×竞赛标准分 + 0.10×服务标准分 − 纪律扣减
+  hScore            Decimal @default(0) @map("h_score") @db.Decimal(9, 4)
+
+  rankNo         Int?    @map("rank_no")
+  tier           String? // A | B | C；排除与干部口径行为 null
+  suggestedScore Decimal @default(0) @map("suggested_score") @db.Decimal(6, 3)
+
+  overridePointsStd  Decimal?  @map("override_points_std") @db.Decimal(9, 4)
+  overrideContestStd Decimal?  @map("override_contest_std") @db.Decimal(9, 4)
+  overrideServiceStd Decimal?  @map("override_service_std") @db.Decimal(9, 4)
+  overridePenalty    Decimal?  @map("override_penalty") @db.Decimal(9, 4)
+  /// 最终加分覆盖：填写后直接作为导出值，优先于定档建议值
+  overrideScore      Decimal?  @map("override_score") @db.Decimal(6, 3)
+  overrideReason     String?   @map("override_reason") @db.Text
+  overrideBy         String?   @map("override_by") @db.Uuid
+  overrideAt         DateTime? @db.Timestamptz(3) @map("override_at")
+
+  /// 排除出定档（附录三·六）
+  excluded      Boolean @default(false)
+  excludeReason String? @map("exclude_reason")
+  /// 干部口径单列（附录三·二）：主席团按部长/副部长级口径另报，不占普通成员档位
+  cadre         Boolean @default(false)
+  /// 并列决胜依据（附录三·七）：近三个月有效积分/正式竞赛/周赛月赛
+  tiebreak      Json?
+
+  batch EvaluationBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  user  User            @relation(fields: [userId], references: [id])
+
+  @@unique([batchId, userId])
+  @@index([batchId, rankNo])
+  @@map("evaluation_rows")
 }

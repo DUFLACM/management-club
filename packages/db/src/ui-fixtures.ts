@@ -19,7 +19,6 @@ async function main() {
   const venue = await db.venue.findFirstOrThrow({ where: { name: '教学楼 A-306（演示）' } });
   if (!venue.effectiveVersionId) throw new Error('请先执行 pnpm db:seed');
   const version = await db.venueVersion.findUniqueOrThrow({ where: { id: venue.effectiveVersionId } });
-  const rule = await db.ruleVersion.findFirstOrThrow({ where: { status: 'published' }, orderBy: { version: 'desc' } });
   // 两类权限保持业务分离；仅给已有演示账号补系统设置/同步/审计的截图授权。
   if (!await db.roleGrant.findFirst({ where: { principalId: user.principalId, role: 'system_admin', revokedAt: null } })) {
     await db.roleGrant.create({ data: { id: randomUUID(), principalId: user.principalId, role: 'system_admin', grantedBy: user.principalId } });
@@ -56,23 +55,27 @@ async function main() {
       create: { id: randomUUID(), activityId, userId: user.id, status: 'enrolled', acceptedAt: new Date() },
       update: { status: 'enrolled', cancelledAt: null },
     });
-    const contestKey = 'ui-preview-demo';
-    const freeze = await tx.rankingFreeze.findFirst({ where: { contestKey } });
-    const freezeId = freeze?.id ?? randomUUID();
-    await tx.rankingFreeze.upsert({
-      where: { id: freezeId },
-      create: { id: freezeId, contestKey, title: '截图验收冻结榜（演示）', freezeAt: time(-60), ruleVersionId: rule.id, status: 'frozen', scopeNote: '本地 UI fixture；非真实赛事冻结' },
+    const eventTitle = '截图验收 · 正式赛报名（演示）';
+    const previousEvent = await tx.competitionEvent.findFirst({ where: { title: eventTitle } });
+    const eventId = previousEvent?.id ?? randomUUID();
+    await tx.competitionEvent.upsert({
+      where: { id: eventId },
+      create: {
+        id: eventId, title: eventTitle, category: 'B', scoringMode: 'manual_review', contestTier: 'school_select',
+        announcement: '本地 UI fixture；非真实赛事报名。', registerDeadline: time(120), startAt: time(180), endAt: time(300),
+        status: 'open', createdBy: user.principalId,
+      },
       update: {},
     });
-    await tx.frozenRankingRow.upsert({
-      where: { freezeId_userId: { freezeId, userId: user.id } },
-      create: { id: randomUUID(), freezeId, userId: user.id, position: 1, eSnapshot: '95.0', eligible: true },
+    await tx.competitionShortlistRow.upsert({
+      where: { eventId_userId: { eventId, userId: user.id } },
+      create: { id: randomUUID(), eventId, userId: user.id, position: 1, eSnapshot: '95.0', eligible: true, shortlisted: true },
       update: {},
     });
     const out = path.join(root, 'docs/ui-preview');
     fs.mkdirSync(out, { recursive: true });
-    fs.writeFileSync(path.join(out, 'fixture-context.json'), JSON.stringify({ activityId, freezeId, latitude: Number(version.latitude), longitude: Number(version.longitude), dataScope: '本地开发演示 fixture；非实际场地采样、非真实赛事结果' }, null, 2) + '\n');
+    fs.writeFileSync(path.join(out, 'fixture-context.json'), JSON.stringify({ activityId, eventId, latitude: Number(version.latitude), longitude: Number(version.longitude), dataScope: '本地开发演示 fixture；非实际场地采样、非真实赛事结果' }, null, 2) + '\n');
   });
-  console.log('✓ 本地截图演示 fixture 就绪（IN/OUT 窗口开放、冻结榜示例）；docs/ui-preview/fixture-context.json');
+  console.log('✓ 本地截图演示 fixture 就绪（IN/OUT 窗口开放、正式赛报名示例）；docs/ui-preview/fixture-context.json');
 }
 void main().finally(() => db.$disconnect());

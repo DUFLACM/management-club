@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import { parseNowcoderHistoryPage, normalizeAtCoderContestId } from '@acm/integrations'
+import { parseNowcoderHistoryPage, parseNowcoderRatingHistory, normalizeAtCoderContestId } from '@acm/integrations'
 import { parseCasResponse } from '../../modules/auth/cas.client.js'
 import { evaluateGeoFence } from '../../modules/attendance/attendance.service.js'
 import { safeFetch } from '../../infrastructure/http/safe-fetch.js'
@@ -9,6 +9,7 @@ import { safeFetch } from '../../infrastructure/http/safe-fetch.js'
 /** 平台契约测试：牛客真实响应摘录 / AtCoder 归一化 / CAS XML / 围栏判定 / SSRF 防护 */
 
 const nowcoderSample = JSON.parse(readFileSync(path.join(__dirname, 'fixtures/nowcoder-sample.json'), 'utf8'))
+const nowcoderRatingSample = JSON.parse(readFileSync(path.join(__dirname, 'fixtures/nowcoder-rating-sample.json'), 'utf8'))
 
 describe('牛客参赛历史契约（真实响应摘录）', () => {
   it('code=0 且 pageInfo 完整解析；毫秒时间与毫秒时长正确转换', () => {
@@ -137,5 +138,30 @@ describe('出站 SSRF 防护（不发起真实网络请求的错误路径）', (
 
   it.each(['127.0.0.1', '192.168.1.20', '198.18.2.169'])('固定解析仍拒绝私网或保留段 %s', async (connectAddress) => {
     await expect(safeFetch('https://cas.dlufl.edu.cn/cas/proxyValidate', { allowedHosts: ['cas.dlufl.edu.cn'], connectAddress })).rejects.toMatchObject({ code: 'PRIVATE_ADDRESS' })
+  })
+})
+
+describe('牛客 rating 历史契约（真实响应摘录）', () => {
+  it('解析 rated 场次：毫秒时间转 Date、按时间升序、字段类型收窄', () => {
+    const points = parseNowcoderRatingHistory(nowcoderRatingSample)
+    expect(points).toHaveLength(4)
+    expect(points[0]).toEqual({
+      contestId: '119664',
+      contestName: '牛客小白月赛122',
+      rating: 573,
+      changeValue: -427,
+      rank: 1114,
+      occurredAt: new Date('2025-10-17T11:00:00.000Z'),
+    })
+    expect(points.map((p) => p.occurredAt.getTime())).toEqual([...points.map((p) => p.occurredAt.getTime())].sort((a, b) => a - b))
+  })
+
+  it('业务错误码抛 AdapterError；缺 rating/time 的脏行被丢弃', () => {
+    expect(() => parseNowcoderRatingHistory({ code: 1, msg: 'NOT_LOGIN', data: [] })).toThrowError()
+    expect(parseNowcoderRatingHistory({ code: 0, data: [
+      { contestId: 1, rating: 100, time: 1760698800000 },
+      { contestId: 2, time: 1760698800000 },
+      { rating: 200, time: 1760698800000 },
+    ] })).toHaveLength(1)
   })
 })

@@ -12,6 +12,7 @@ import { useSearchParams } from 'react-router';
 import {
   AlarmClockIcon,
   CalendarClockIcon,
+  ChevronRightIcon,
   CoinsIcon,
   ListTodoIcon,
   MedalIcon,
@@ -205,7 +206,7 @@ function OverviewBody({ principalId }: { principalId: string }) {
                                   <Button
                                     size="sm"
                                     onClick={() =>
-                                      goSection('attendance', { id: activity.id })
+                                      goSection('activities', { activity: activity.id })
                                     }
                                   >
                                     <ScanLineIcon aria-hidden="true" />
@@ -217,7 +218,7 @@ function OverviewBody({ principalId }: { principalId: string }) {
                                     size="sm"
                                     variant="outline"
                                     onClick={() =>
-                                      goSection('attendance', { id: activity.id })
+                                      goSection('activities', { activity: activity.id })
                                     }
                                   >
                                     去签退
@@ -378,10 +379,11 @@ function OverviewBody({ principalId }: { principalId: string }) {
                       </p>
                     ) : (
                       <ul className="flex flex-col gap-2">
-                        {data.todos.map((todo) => (
+                        {data.todos.map((todo) => {
+                          return (
                           <li
                             key={`${todo.kind}-${todo.id}`}
-                            className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2"
+                            className={`flex items-center justify-between gap-3 rounded-lg border px-3 py-2 ${todo.kind === 'disclosure' ? 'border-primary/40 bg-primary/5' : 'border-border'}`}
                           >
                             <span className="flex min-w-0 items-center gap-2 text-sm text-foreground">
                               {todo.kind === 'disclosure' ? (
@@ -402,8 +404,22 @@ function OverviewBody({ principalId }: { principalId: string }) {
                                 {relativeDeadline(todo.deadline) ?? formatDateTime(todo.deadline)}
                               </span>
                             )}
+                            {todo.kind === 'disclosure' && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="shrink-0 text-primary hover:text-primary"
+                                onClick={() =>
+                                  goSection('ranking', { tab: 'disclosure', ref: todo.id })
+                                }
+                              >
+                                去查看
+                                <ChevronRightIcon aria-hidden="true" />
+                              </Button>
+                            )}
                           </li>
-                        ))}
+                          );
+                        })}
                       </ul>
                     )}
                   </CardContent>

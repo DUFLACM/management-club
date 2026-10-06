@@ -156,6 +156,43 @@ export function membershipLabel(status: string | null | undefined): string {
   return MEMBERSHIP_LABELS[status] ?? status;
 }
 
+/** 活动类型徽标配色：比赛蓝 / 讲座·营地·聚会琥珀 / 训练·服务绿 / 会议中性 */
+export function activityTypeBadgeClass(type: string | null | undefined): string {
+  switch (type) {
+    case 'weekly_contest':
+    case 'custom_contest':
+      return 'bg-info-subtle text-info-foreground';
+    case 'monthly_contest':
+      return 'bg-primary/10 text-primary';
+    case 'lecture':
+    case 'camp':
+    case 'gathering':
+      return 'bg-warning-subtle text-warning-foreground';
+    case 'training':
+    case 'service':
+      return 'bg-success-subtle text-success-foreground';
+    default:
+      return 'bg-muted text-muted-foreground';
+  }
+}
+
+/** 身份徽标配色（浅底深字，跟随主题 token）：正式蓝 / 预备绿 / 考察琥珀 / 荣誉紫 / 其余中性 */
+export function membershipBadgeClass(status: string | null | undefined): string {
+  switch (status) {
+    case 'formal':
+      return 'bg-info-subtle text-info-foreground';
+    case 'provisional':
+      return 'bg-success-subtle text-success-foreground';
+    case 'observing':
+    case 'applicant':
+      return 'bg-warning-subtle text-warning-foreground';
+    case 'honorary_retired':
+      return 'bg-primary/10 text-primary';
+    default:
+      return 'bg-muted text-muted-foreground';
+  }
+}
+
 /** 报名状态 → StatusBadge registration 已注册文案。 */
 export const REGISTRATION_BADGE: Record<string, string> = {
   enrolled: '已报名',

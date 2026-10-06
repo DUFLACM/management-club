@@ -6,6 +6,33 @@ export function attendanceDeadline(activity: { endAt: Date; policy?: { checkinCl
   return new Date(Math.max(activity.endAt.getTime(), activity.policy?.checkinCloseAt.getTime() ?? 0, activity.policy?.checkoutCloseAt?.getTime() ?? 0))
 }
 
+/** 自动签退：策略开启时，为已签到未签退者按活动结束时间补记 OUT（method=AUTO）；重复运行幂等 */
+export async function applyAutoCheckout(db: PrismaClient, activityId: string): Promise<number> {
+  return db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT id FROM activities WHERE id = ${activityId}::uuid FOR UPDATE`
+    const activity = await tx.activity.findUnique({
+      where: { id: activityId },
+      include: { policy: true, checkpoints: true },
+    })
+    if (!activity?.policy?.autoCheckout) return 0
+    const hasOut = new Set(activity.checkpoints.filter((c) => c.checkpoint === 'OUT').map((c) => c.userId))
+    const missing = activity.checkpoints.filter((c) => c.checkpoint === 'IN' && !hasOut.has(c.userId))
+    for (const checkpoint of missing) {
+      await tx.attendanceCheckpoint.create({
+        data: {
+          id: randomUUID(),
+          activityId,
+          userId: checkpoint.userId,
+          checkpoint: 'OUT',
+          method: 'AUTO',
+          acceptedAt: activity.endAt,
+        },
+      })
+    }
+    return missing.length
+  })
+}
+
 /** API 与 Worker 共用；活动锁防止与签到、名单修改或人工更正交叉，重复运行不覆盖人工认定。 */
 export async function settleRequiredAbsences(db: PrismaClient, activityId: string, now = new Date()) {
   return db.$transaction(async (tx) => {

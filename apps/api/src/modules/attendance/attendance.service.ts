@@ -211,6 +211,7 @@ export class AttendanceService {
             checkoutOpenAt: policy.checkoutOpenAt?.toISOString() ?? null,
             checkoutCloseAt: policy.checkoutCloseAt?.toISOString() ?? null,
             selfCheckout: policy.selfCheckout,
+            autoCheckout: policy.autoCheckout,
             maxAccuracyMeters: Number(policy.maxAccuracyMeters),
             windowOpen: { IN: policy.checkinOpenAt <= now && now <= policy.checkinCloseAt, OUT: !!(policy.checkoutOpenAt && policy.checkoutCloseAt && policy.checkoutOpenAt <= now && now <= policy.checkoutCloseAt) },
           }

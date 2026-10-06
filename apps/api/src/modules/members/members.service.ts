@@ -5,6 +5,12 @@ import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newInvitationSecret } from '../auth/auth.service.js'
 import { newId, sha256Hex, monthKey } from '../../common/utils.js'
 import { computeEffectiveScore, formalQuota, graceMonths } from '@acm/scoring-core'
+import {
+  RANKED_MEMBERSHIPS,
+  rankEligibleMembers,
+  rankExclusionReason,
+  resolveEffectiveWeights,
+} from '../scoring/effective-ranking.js'
 import type { Prisma } from '@acm/db'
 import type { SessionActor } from '../auth/session.service.js'
 
@@ -55,13 +61,14 @@ export class MembersService {
     const currentMonth = monthKey(now)
 
     // E（当前规则版本）
+    const effectiveWeights = await resolveEffectiveWeights(this.db)
     const entries = await this.db.pointsLedgerEntry.findMany({ where: { userId, status: 'approved' }, select: { amount: true, scoreMonth: true } })
     const monthly: Record<string, number> = {}
     for (const e of entries) monthly[e.scoreMonth] = (monthly[e.scoreMonth] ?? 0) + Number(e.amount)
-    const eff = computeEffectiveScore({ monthlyScores: monthly, currentMonth }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
+    const eff = computeEffectiveScore({ monthlyScores: monthly, currentMonth }, { effectiveWeights })
 
-    // 排名（正式/预备/考察参与当前有效榜）
-    const ranked = await this.rankedList(currentMonth)
+    // 排名（正式/预备/考察参与当前有效榜；E=0 的成员同样在榜，口径与榜单页同源）
+    const ranked = await rankEligibleMembers(this.db, currentMonth, effectiveWeights)
     const myRank = ranked.findIndex((r) => r.userId === userId)
 
     // 出勤摘要：本人必须参加且已结算的活动
@@ -118,7 +125,18 @@ export class MembersService {
         components: eff.components.map((c) => ({ month: c.month, m: Number(c.m), weight: Number(c.weight), contribution: Number(c.contribution) })),
         currentMonthM: monthly[currentMonth] ?? 0,
       },
-      rank: myRank >= 0 ? { position: myRank + 1, total: ranked.length, qualified: true } : { position: null, total: ranked.length, qualified: false, reason: membership === 'applicant' ? '申请中：尚未获得入社资格' : membership === 'honorary_retired' ? '荣誉退役：退出日常排名' : null },
+      rank:
+        myRank >= 0
+          ? { position: myRank + 1, total: ranked.length, qualified: true }
+          : {
+              position: null,
+              total: ranked.length,
+              qualified: false,
+              // 身份本应参与却不在榜上，只可能是账号被停用/注销，据实说明而不是笼统说「身份不参与」
+              reason: RANKED_MEMBERSHIPS.includes(membership)
+                ? '账号当前不是正常状态，暂不计入当前有效榜，请联系管理员'
+                : rankExclusionReason(membership),
+            },
       attendance: { done: attendanceDone, total: attendanceTotal, note: attendanceTotal === 0 ? '暂无已结算的必到活动' : null },
       openActivities: openActivities.map((a) => {
         const policy = a.policy
@@ -151,27 +169,6 @@ export class MembersService {
       })),
       platformSync: await this.db.platformAccount.findMany({ where: { userId, status: { not: 'revoked' } }, select: { platform: true, status: true, lastSyncAt: true, lastSyncStatus: true } }),
     }
-  }
-
-  private async rankedList(currentMonth: string) {
-    const entries = await this.db.pointsLedgerEntry.findMany({ where: { status: 'approved' }, select: { userId: true, amount: true, scoreMonth: true } })
-    const byUser = new Map<string, Record<string, number>>()
-    for (const e of entries) {
-      if (!byUser.has(e.userId)) byUser.set(e.userId, {})
-      const m = byUser.get(e.userId)!
-      m[e.scoreMonth] = (m[e.scoreMonth] ?? 0) + Number(e.amount)
-    }
-    const users = await this.db.user.findMany({
-      where: { id: { in: [...byUser.keys()] }, accountStatus: 'active' },
-      include: { membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 } },
-    })
-    return users
-      .filter((u) => ['formal', 'provisional', 'observing'].includes(u.membershipTerms[0]?.membershipStatus ?? ''))
-      .map((u) => {
-        const eff = computeEffectiveScore({ monthlyScores: byUser.get(u.id) ?? {}, currentMonth }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
-        return { userId: u.id, e: Number(eff.e) }
-      })
-      .sort((a, b) => b.e - a.e)
   }
 
   /** 管理概览：真实待办计数 + 当天活动 */
@@ -341,6 +338,177 @@ export class MembersService {
       resourceId: accountId,
       summary: `解绑成员平台账号：${account.platform} ${account.externalId}`,
     })
+  }
+
+  /** 禁用成员账号（软删除）：立即失效全部会话；积分/出勤历史保留，可重新启用 */
+  async disableMember(actor: SessionActor, userId: string, reason: string): Promise<void> {
+    if (actor.userId === userId) throw new MembersError('不能禁用本人账号', 'RECUSED')
+    const user = await this.db.user.findUnique({ where: { id: userId } })
+    if (!user) throw new MembersError('成员不存在', 'NOT_FOUND')
+    if (user.accountStatus === 'disabled') throw new MembersError('账号已是禁用状态', 'STATE_INVALID')
+    const now = new Date()
+    await this.db.$transaction(async (tx) => {
+      await tx.user.update({ where: { id: userId }, data: { accountStatus: 'disabled' } })
+      await tx.session.updateMany({
+        where: { principalId: user.principalId, revokedAt: null },
+        data: { revokedAt: now, revokeReason: `账号禁用：${reason.slice(0, 120)}` },
+      })
+      await tx.auditLog.create({
+        data: {
+          id: newId(), actorPrincipalId: actor.principalId, action: 'members.disable', resourceType: 'user', resourceId: userId,
+          summary: `禁用成员账号（${user.studentNo}）：${reason.slice(0, 200)}`,
+        },
+      })
+    })
+  }
+
+  /** 重新启用被禁用的账号 */
+  async enableMember(actor: SessionActor, userId: string): Promise<void> {
+    const user = await this.db.user.findUnique({ where: { id: userId } })
+    if (!user) throw new MembersError('成员不存在', 'NOT_FOUND')
+    if (user.accountStatus !== 'disabled') throw new MembersError('账号不是禁用状态', 'STATE_INVALID')
+    await this.db.user.update({ where: { id: userId }, data: { accountStatus: 'active' } })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId, action: 'members.enable', resourceType: 'user', resourceId: userId,
+      summary: `重新启用成员账号（${user.studentNo}）`,
+    })
+  }
+
+  /** 删除成员：仅限无任何业务数据的空账号（误注册清理）；有记录请禁用以保留历史 */
+  async deleteMember(actor: SessionActor, userId: string): Promise<void> {
+    if (actor.userId === userId) throw new MembersError('不能删除本人账号', 'RECUSED')
+    const user = await this.db.user.findUnique({
+      where: { id: userId },
+      include: {
+        _count: {
+          select: {
+            registrations: true, participation: true, checkpoints: true, attendanceResults: true,
+            pointsClaims: true, appeals: true, ledgerEntries: true, monthlyScores: true,
+            platformAccounts: true, badgeAwards: true, lectureRequests: true, uploadedMaterials: true,
+            leaveRequests: true, remotePermissions: true, restrictions: true,
+            membershipTerms: true, invitationRedemptions: true,
+          },
+        },
+      },
+    })
+    if (!user) throw new MembersError('成员不存在', 'NOT_FOUND')
+    const used = Object.values(user._count).reduce((sum, count) => sum + count, 0)
+    if (used > 0) {
+      throw new MembersError('该成员已有报名/出勤/积分/绑定等记录，删除会破坏社团数据；请改用「禁用账号」', 'STATE_INVALID')
+    }
+    await this.db.$transaction(async (tx) => {
+      await tx.session.deleteMany({ where: { principalId: user.principalId } })
+      await tx.roleGrant.deleteMany({ where: { principalId: user.principalId } })
+      await tx.authIdentity.deleteMany({ where: { principalId: user.principalId } })
+      await tx.userProfile.deleteMany({ where: { userId } })
+      await tx.user.delete({ where: { id: userId } })
+      await tx.principal.deleteMany({ where: { id: user.principalId } })
+      await tx.auditLog.create({
+        data: {
+          id: newId(), actorPrincipalId: actor.principalId, action: 'members.delete', resourceType: 'user', resourceId: userId,
+          summary: `删除空账号成员（${user.studentNo} ${user.verifiedRealName}）`,
+        },
+      })
+    })
+  }
+
+  /** 批量删除空账号成员：逐项走删除校验，失败项跳过并汇总原因（部分成功） */
+  async batchDeleteMembers(actor: SessionActor, userIds: string[]): Promise<{ deletedCount: number; skipped: Array<{ id: string; label: string; reason: string }> }> {
+    const skipped: Array<{ id: string; label: string; reason: string }> = []
+    let deletedCount = 0
+    for (const userId of userIds) {
+      const user = await this.db.user.findUnique({ where: { id: userId }, select: { studentNo: true, verifiedRealName: true } })
+      const label = user ? `${user.verifiedRealName}（${user.studentNo}）` : userId.slice(0, 8)
+      try {
+        await this.deleteMember(actor, userId)
+        deletedCount++
+      } catch (error) {
+        skipped.push({ id: userId, label, reason: error instanceof MembersError ? error.message : '删除失败' })
+      }
+    }
+    return { deletedCount, skipped }
+  }
+
+  /**
+   * Excel/表格批量导入成员：管理员确认为已验证成员，跳过 CAS 核验直接建账号
+   * （principal+user+profile+membershipTerm+member 角色）；逐行独立事务，单行失败
+   * 不影响其余行。导入账号首次 CAS 登录时按学号精确绑定稳定 subject（见
+   * auth.service.ts resolveIdentity 的预导入学生分支），之后与正常注册账号无区别。
+   */
+  async importMembers(
+    actor: SessionActor,
+    rows: Array<{ studentNo: string; realName: string; grade?: number; phone?: string; membershipStatus?: MembershipStatus }>,
+  ): Promise<{ createdCount: number; results: Array<{ row: number; studentNo: string; status: 'created' | 'skipped'; message?: string }> }> {
+    const results: Array<{ row: number; studentNo: string; status: 'created' | 'skipped'; message?: string }> = []
+    const seenInBatch = new Set<string>()
+    let createdCount = 0
+
+    for (let i = 0; i < rows.length; i++) {
+      const rowNo = i + 1
+      const studentNo = rows[i].studentNo.trim()
+      const realName = rows[i].realName.trim()
+
+      if (!/^[A-Za-z0-9._-]{1,64}$/.test(studentNo)) {
+        results.push({ row: rowNo, studentNo, status: 'skipped', message: '学号格式不合法（1-64 位字母/数字/._-）' })
+        continue
+      }
+      if (!realName) {
+        results.push({ row: rowNo, studentNo, status: 'skipped', message: '姓名为空' })
+        continue
+      }
+      if (seenInBatch.has(studentNo)) {
+        results.push({ row: rowNo, studentNo, status: 'skipped', message: '本次导入内学号重复' })
+        continue
+      }
+      seenInBatch.add(studentNo)
+
+      const existingUser = await this.db.user.findUnique({ where: { studentNo }, select: { id: true } })
+      if (existingUser) {
+        results.push({ row: rowNo, studentNo, status: 'skipped', message: '学号已存在（账号）' })
+        continue
+      }
+      const existingStaff = await this.db.staffProfile.findUnique({ where: { staffNo: studentNo }, select: { id: true } })
+      if (existingStaff) {
+        results.push({ row: rowNo, studentNo, status: 'skipped', message: '学号已属于教职工主体' })
+        continue
+      }
+
+      const grade = typeof rows[i].grade === 'number' && Number.isFinite(rows[i].grade) ? Math.trunc(rows[i].grade!) : null
+      const phone = rows[i].phone?.trim() || null
+      const membershipStatus: MembershipStatus =
+        rows[i].membershipStatus && MEMBERSHIP_STATUSES.includes(rows[i].membershipStatus!) ? rows[i].membershipStatus! : 'formal'
+
+      try {
+        const userId = newId()
+        const principalId = newId()
+        await this.db.$transaction(async (tx) => {
+          await tx.principal.create({ data: { id: principalId, kind: 'student' } })
+          await tx.user.create({ data: { id: userId, principalId, studentNo, verifiedRealName: realName, grade, phone } })
+          await tx.userProfile.create({ data: { userId, displayName: realName } })
+          await tx.membershipTerm.create({
+            data: {
+              id: newId(),
+              userId,
+              semesterId: await currentSemesterId(tx),
+              membershipStatus,
+              basis: 'Excel 批量导入（管理员确认为已验证成员，跳过 CAS 核验）',
+            },
+          })
+          await tx.roleGrant.create({ data: { id: newId(), principalId, role: 'member', grantedBy: actor.principalId, grantedAt: new Date() } })
+          await tx.auditLog.create({
+            data: {
+              id: newId(), actorPrincipalId: actor.principalId, action: 'members.import', resourceType: 'user', resourceId: userId,
+              summary: `Excel 批量导入成员（${studentNo} ${realName}，身份 ${membershipStatus}）`,
+            },
+          })
+        })
+        createdCount++
+        results.push({ row: rowNo, studentNo, status: 'created' })
+      } catch (error) {
+        results.push({ row: rowNo, studentNo, status: 'skipped', message: error instanceof Error ? error.message.slice(0, 200) : '创建失败' })
+      }
+    }
+    return { createdCount, results }
   }
 
   /** 月度身份评定预览（候选，不自动改身份；04 方案 7） */

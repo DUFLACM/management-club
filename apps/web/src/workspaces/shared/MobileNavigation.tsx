@@ -1,12 +1,13 @@
-import { CalendarDaysIcon, CoinsIcon, HouseIcon, TrophyIcon, UserRoundIcon } from 'lucide-react';
+import { CalendarDaysIcon, CoinsIcon, FileSignatureIcon, HouseIcon, TrophyIcon, UserRoundIcon } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
 
 /**
- * 手机五项底栏（320–767px）：首页 / 活动 / 竞赛 / 积分 / 我的。
+ * 手机六项底栏（320–767px）：首页 / 活动 / 竞赛 / 贡献 / 积分 / 我的。
  * - `attendance` 归入“活动”高亮；
  * - `ranking` 归入“积分”高亮（从积分页“榜单”标签进入）；
+ * - 标签均为两字，320px 下每项约 53px 可容纳；
  * - 高度 56px + 安全区，固定在底部。
  */
 
@@ -22,6 +23,7 @@ const ITEMS: readonly MobileNavItem[] = [
   { key: 'overview', label: '首页', icon: HouseIcon, matches: ['overview'] },
   { key: 'activities', label: '活动', icon: CalendarDaysIcon, matches: ['activities', 'attendance'] },
   { key: 'contests', label: '竞赛', icon: TrophyIcon, matches: ['contests'] },
+  { key: 'contributions', label: '贡献', icon: FileSignatureIcon, matches: ['contributions'] },
   { key: 'points', label: '积分', icon: CoinsIcon, matches: ['points', 'ranking'] },
   { key: 'profile', label: '我的', icon: UserRoundIcon, matches: ['profile'] },
 ];
