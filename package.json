@@ -9,7 +9,7 @@
   },
   "scripts": {
     "postinstall": "pnpm --filter @acm/db generate",
-    "dev": "pnpm run --parallel /^dev:/",
+    "dev": "pnpm --parallel --filter @acm/api --filter @acm/web --filter @acm/worker run dev",
     "dev:api": "pnpm --filter @acm/api dev",
     "dev:web": "pnpm --filter @acm/web dev",
     "dev:worker": "pnpm --filter @acm/worker dev",
