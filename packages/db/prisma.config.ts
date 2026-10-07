@@ -1,8 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { config as loadDotenv } from 'dotenv'
-import { defineConfig, env } from 'prisma/config'
-import { PrismaPg } from '@prisma/adapter-pg'
+import { defineConfig } from 'prisma/config'
 
 // Prisma 7 配置文件不自动加载仓库根 .env；从 cwd 向上查找（prisma 命令在 packages/db 下执行）。
 function findEnvFile(): string | undefined {
@@ -29,8 +28,7 @@ export default defineConfig({
     seed: 'pnpm --filter @acm/db seed',
   },
   datasource: {
-    url: env('DATABASE_URL'),
+    // postinstall 生成客户端时可能尚未配置数据库；需要连接的 CLI 命令会校验 URL。
+    url: process.env.DATABASE_URL,
   },
-  // 运行时通过 pg 驱动适配器连接（Prisma 7 无 Rust 引擎）
-  adapter: async () => new PrismaPg({ connectionString: env('DATABASE_URL') }),
 })
