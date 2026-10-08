@@ -59,6 +59,51 @@ export class TeamMeController {
     return ok({ left: true })
   }
 
+  /** 招募广场 */
+  @Get('team-recruitments')
+  async recruitments(@CurrentUser() user: { userId: string }, @Query('q') q?: string) {
+    return ok(await this.teams.listRecruitments(user.userId, q))
+  }
+
+  @Post('teams/:id/recruitment')
+  async upsertRecruitment(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ description: z.string().trim().min(5, '招募说明至少 5 字').max(1000), activityId: z.string().uuid().nullable().optional() }).safeParse(body)
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.teams.upsertRecruitment(user.userId, id, parsed.data))
+  }
+
+  @Post('teams/:id/recruitment/close')
+  async closeRecruitment(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string) {
+    await this.teams.closeRecruitment(user.userId, id)
+    return ok({ closed: true })
+  }
+
+  @Post('teams/:id/join-requests')
+  async apply(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ message: z.string().max(500).optional() }).safeParse(body ?? {})
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.teams.applyToTeam(user.userId, id, parsed.data.message))
+  }
+
+  @Get('team-join-requests')
+  async myJoinRequests(@CurrentUser() user: { userId: string }) {
+    return ok(await this.teams.myJoinRequests(user.userId))
+  }
+
+  @Post('team-join-requests/:id/cancel')
+  async cancelJoin(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string) {
+    await this.teams.cancelJoinRequest(user.userId, id)
+    return ok({ cancelled: true })
+  }
+
+  @Post('team-join-requests/:id/decision')
+  async decideJoin(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ decision: z.enum(['approve', 'reject']) }).safeParse(body)
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    await this.teams.decideJoinRequest(user.userId, id, parsed.data.decision)
+    return ok({ decided: parsed.data.decision })
+  }
+
   @Get('teams/:id/eligible-events')
   async eligibleEvents(@Param('id', ParseUUIDPipe) id: string) {
     return ok(await this.teams.eligibleEvents(id))

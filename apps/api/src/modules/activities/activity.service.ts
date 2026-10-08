@@ -42,6 +42,8 @@ export const activityInputSchema = z.object({
   remotePolicy: z.string().max(1000).optional(),
   leaveDeadline: z.string().datetime().nullable().optional(),
   requireValidSubmission: z.boolean().optional(),
+  /** 团队报名人数（2–10）；null/缺省为个人报名 */
+  teamSize: z.number().int().min(2).max(10).nullable().optional(),
   scoringConfig: z.record(z.string(), z.unknown()).nullable().optional(),
   contestMeta: z.record(z.string(), z.unknown()).nullable().optional(),
   platform: z.string().max(40).optional(),
@@ -167,6 +169,7 @@ export class ActivityService {
           remotePolicy: input.remotePolicy,
           leaveDeadline: input.leaveDeadline ? new Date(input.leaveDeadline) : null,
           requireValidSubmission: input.requireValidSubmission ?? CONTEST_TYPES.has(input.type),
+          teamSize: input.teamSize ?? null,
           scoringConfig: (input.scoringConfig ?? undefined) as never,
           contestMeta: (input.contestMeta ?? undefined) as never,
           venueVersionId: input.primaryVenueVersionId ?? input.venueVersionIds![0],
@@ -333,44 +336,62 @@ export class ActivityService {
   }
 
   /** 发布：校验地点绑定全部 approved/active/有效期覆盖 IN/OUT 窗口 + 策略能力匹配，固化围栏快照 */
-  /** 删除活动：仅草稿且无任何报名/参与/出勤/材料数据（已发布活动走取消/归档，保留记录） */
-  async deleteDraft(actor: SessionActor, activityId: string): Promise<void> {
+  /**
+   * 删除活动：任意状态均可删除，连同报名/参与/出勤/请假/远程/讲题/材料等全部关联记录一并清除。
+   * 积分流水（points_ledger）按 sourceKey 记账、不外键到活动，已入账积分不受影响，需撤销请走积分冲正。
+   */
+  async deleteActivity(actor: SessionActor, activityId: string): Promise<void> {
     const activity = await this.db.activity.findUnique({
       where: { id: activityId },
       include: {
-        policy: true,
-        _count: { select: { registrations: true, participants: true, checkpoints: true, materials: true, lectureRequests: true, leaveRequests: true, remotePermissions: true } },
+        _count: { select: { registrations: true, participants: true, checkpoints: true, leaveRequests: true } },
+        materials: { select: { storageKey: true } },
       },
     })
     if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
-    if (activity.status !== 'draft') throw new ActivityError('仅草稿可删除；已发布活动请取消或归档以保留报名与出勤记录', 'STATE_INVALID')
-    const used = activity._count.registrations + activity._count.participants + activity._count.checkpoints
-      + activity._count.materials + activity._count.lectureRequests + activity._count.leaveRequests + activity._count.remotePermissions
-    if (used > 0) throw new ActivityError('已有报名/参与/出勤/材料数据，不能删除；请改用取消或归档', 'STATE_INVALID')
     await this.db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT id FROM activities WHERE id = ${activityId}::uuid FOR UPDATE`
+      await tx.registrationHistory.deleteMany({ where: { registration: { activityId } } })
+      await tx.attendanceCorrection.deleteMany({ where: { result: { activityId } } })
+      await tx.lectureRequest.deleteMany({ where: { activityId } }) // lecture_ratings 级联删除
+      await tx.activityMaterial.deleteMany({ where: { activityId } })
+      await tx.activityRegistration.deleteMany({ where: { activityId } })
+      await tx.activityParticipant.deleteMany({ where: { activityId } })
+      await tx.leaveRequest.deleteMany({ where: { activityId } })
+      await tx.remotePermission.deleteMany({ where: { activityId } })
+      await tx.incidentReport.deleteMany({ where: { activityId } })
+      await tx.attendanceQrWindow.deleteMany({ where: { activityId } })
+      await tx.attendanceChallenge.deleteMany({ where: { activityId } })
+      await tx.attendanceAttempt.deleteMany({ where: { activityId } })
+      await tx.attendanceCheckpoint.deleteMany({ where: { activityId } })
+      await tx.attendanceAttendanceResult.deleteMany({ where: { activityId } })
       await tx.activityVenueBinding.deleteMany({ where: { activityId } })
       await tx.attendancePolicy.deleteMany({ where: { activityId } })
       await tx.activity.delete({ where: { id: activityId } })
     })
+    const fs = await import('node:fs/promises')
+    for (const material of activity.materials) {
+      await fs.rm(`${process.env.STORAGE_LOCAL_DIR ?? './storage'}/${material.storageKey}`, { force: true }).catch(() => undefined)
+    }
+    const c = activity._count
     await this.audit.log({
       actorPrincipalId: actor.principalId,
       action: 'activity.delete',
       resourceType: 'activity',
       resourceId: activityId,
-      summary: `删除草稿活动：${activity.title}`,
+      summary: `删除活动（${activity.status}）：${activity.title}；报名 ${c.registrations}、参与 ${c.participants}、签到 ${c.checkpoints}、请假 ${c.leaveRequests}、材料 ${activity.materials.length}`,
     })
   }
 
-  /** 批量删除草稿活动：逐项走删除校验，失败项跳过并汇总原因（部分成功） */
-  async batchDeleteDrafts(actor: SessionActor, activityIds: string[]): Promise<{ deletedCount: number; skipped: Array<{ id: string; label: string; reason: string }> }> {
+  /** 批量删除活动：逐项删除，失败项跳过并汇总原因（部分成功） */
+  async batchDeleteActivities(actor: SessionActor, activityIds: string[]): Promise<{ deletedCount: number; skipped: Array<{ id: string; label: string; reason: string }> }> {
     const skipped: Array<{ id: string; label: string; reason: string }> = []
     let deletedCount = 0
     for (const activityId of activityIds) {
       const activity = await this.db.activity.findUnique({ where: { id: activityId }, select: { title: true } })
       const label = activity?.title ?? activityId.slice(0, 8)
       try {
-        await this.deleteDraft(actor, activityId)
+        await this.deleteActivity(actor, activityId)
         deletedCount++
       } catch (error) {
         skipped.push({ id: activityId, label, reason: error instanceof ActivityError ? error.message : '删除失败' })
@@ -457,6 +478,7 @@ export class ActivityService {
       const now = new Date()
       if (activity.registerStartAt && activity.registerStartAt > now) throw new ActivityError('报名尚未开始', 'REG_NOT_OPEN')
       if (activity.registerDeadline && activity.registerDeadline < now) throw new ActivityError('报名已截止', 'REG_CLOSED')
+      if (activity.teamSize) throw new ActivityError(`本活动为 ${activity.teamSize} 人团队报名，请由队长以小队报名`, 'TEAM_ACTIVITY')
       // 平台赛靠绑定账号匹配榜单计分：没绑定就无法计成绩，报名前必须先绑定
       if (activity.platform && BINDABLE_PLATFORMS.has(activity.platform)) {
         const bound = await tx.platformAccount.findFirst({ where: { userId, platform: activity.platform, status: { not: 'revoked' } }, select: { id: true } })
@@ -513,6 +535,87 @@ export class ActivityService {
     })
   }
 
+  /**
+   * 团队报名：队长以满员小队（活跃人数 = activity.teamSize）报名，全队成员各得一条同状态报名记录。
+   * 容量与候补按队计；任一队员已有有效报名（个人或其他队）则拒绝。
+   */
+  async registerTeam(userId: string, activityId: string, teamId: string): Promise<{ status: string; waitlistSeq: number | null; message: string }> {
+    return this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM activities WHERE id = ${activityId}::uuid FOR UPDATE`
+      const activity = await tx.activity.findUnique({ where: { id: activityId } })
+      if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
+      if (!activity.teamSize) throw new ActivityError('本活动为个人报名', 'NOT_TEAM_ACTIVITY')
+      if (activity.status !== 'published') throw new ActivityError('活动未发布或已结束报名', 'NOT_PUBLISHED')
+      const now = new Date()
+      if (activity.registerStartAt && activity.registerStartAt > now) throw new ActivityError('报名尚未开始', 'REG_NOT_OPEN')
+      if (activity.registerDeadline && activity.registerDeadline < now) throw new ActivityError('报名已截止', 'REG_CLOSED')
+
+      const team = await tx.team.findUnique({
+        where: { id: teamId },
+        include: { members: { where: { status: 'active' }, include: { user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true } } } } } } },
+      })
+      if (!team || team.status === 'disbanded') throw new ActivityError('小队不存在或已解散', 'TEAM_NOT_FOUND')
+      if (team.captainUserId !== userId) throw new ActivityError('只有队长可以为小队报名', 'NOT_CAPTAIN')
+      if (team.members.length !== activity.teamSize) {
+        throw new ActivityError(`本活动要求 ${activity.teamSize} 人小队，「${team.name}」当前 ${team.members.length} 人`, 'TEAM_SIZE_MISMATCH')
+      }
+      const memberIds = team.members.map((m) => m.userId)
+      const ACTIVE = ['enrolled', 'waitlisted', 'pending_approval']
+      const existing = await tx.activityRegistration.findMany({ where: { activityId, userId: { in: memberIds } } })
+      const activeRows = existing.filter((r) => ACTIVE.includes(r.status))
+      if (activeRows.length === memberIds.length && activeRows.every((r) => r.teamId === teamId)) {
+        return { status: activeRows[0].status, waitlistSeq: activeRows[0].waitlistSeq, message: '小队已报名（幂等返回原结果）' }
+      }
+      const conflict = activeRows.find((r) => r.teamId !== teamId) ?? activeRows[0]
+      if (conflict) {
+        const who = team.members.find((m) => m.userId === conflict.userId)!
+        throw new ActivityError(`队员 ${memberName(who.user)} 已有本活动的报名，不能重复报名`, 'MEMBER_ALREADY_REGISTERED')
+      }
+      if (activity.platform && BINDABLE_PLATFORMS.has(activity.platform)) {
+        const bound = await tx.platformAccount.findMany({ where: { userId: { in: memberIds }, platform: activity.platform, status: { not: 'revoked' } }, select: { userId: true } })
+        const boundSet = new Set(bound.map((b) => b.userId))
+        const missing = team.members.filter((m) => !boundSet.has(m.userId)).map((m) => memberName(m.user))
+        if (missing.length) throw new ActivityError(`以下队员尚未绑定${PLATFORM_NAMES[activity.platform]}账号：${missing.join('、')}`, 'NEEDS_PLATFORM_BIND')
+      }
+
+      const { enrolled: enrolledTeams, waitlisted: waitlistedTeams } = await this.countTeams(tx, activityId)
+      let status: string
+      let waitlistSeq: number | null = null
+      const waitlistCap = activity.waitlistCapacity ?? 0
+      if (activity.capacity == null || enrolledTeams < activity.capacity) {
+        status = activity.approvalRequired ? 'pending_approval' : 'enrolled'
+      } else if (waitlistCap > 0 && waitlistedTeams < waitlistCap) {
+        status = 'waitlisted'
+        waitlistSeq = waitlistedTeams + 1
+      } else {
+        throw new ActivityError('队伍名额已满且候补已满', 'CAPACITY_FULL')
+      }
+      for (const memberId of memberIds) {
+        const prior = existing.find((r) => r.userId === memberId)
+        const data = { status, waitlistSeq, teamId, acceptedAt: status === 'enrolled' ? now : null, cancelledAt: null }
+        const reg = prior
+          ? await tx.activityRegistration.update({ where: { id: prior.id }, data: { ...data, revision: { increment: 1 } } })
+          : await tx.activityRegistration.create({ data: { id: newId(), activityId, userId: memberId, ...data } })
+        await tx.registrationHistory.create({ data: { id: newId(), registrationId: reg.id, toStatus: status, note: `小队「${team.name}」报名` } })
+      }
+      return {
+        status,
+        waitlistSeq,
+        message: status === 'enrolled' ? `小队「${team.name}」报名成功` : status === 'waitlisted' ? `小队已进入候补（第 ${waitlistSeq} 队）` : '小队报名已提交，等待审核',
+      }
+    })
+  }
+
+  /** 团队活动按队计数：同一 teamId 的多条记录算一队 */
+  private async countTeams(tx: Pick<Prisma.TransactionClient, 'activityRegistration'>, activityId: string): Promise<{ enrolled: number; waitlisted: number }> {
+    const rows = await tx.activityRegistration.findMany({
+      where: { activityId, status: { in: ['enrolled', 'waitlisted'] }, teamId: { not: null } },
+      select: { teamId: true, status: true },
+      distinct: ['teamId'],
+    })
+    return { enrolled: rows.filter((r) => r.status === 'enrolled').length, waitlisted: rows.filter((r) => r.status === 'waitlisted').length }
+  }
+
   /** 取消报名：公告期限内直接办理；超期提示走请假/负责人审核。释放名额后按规则递补。 */
   async cancelRegistration(userId: string, activityId: string, reason?: string): Promise<{ status: string; promoted?: string }> {
     return this.db.$transaction(async (tx) => {
@@ -529,23 +632,33 @@ export class ActivityService {
       if (activity.cancelDeadline && activity.cancelDeadline < now && reg.status === 'enrolled') {
         throw new ActivityError('已过取消截止，请提交请假申请由负责人审核', 'CANCEL_DEADLINE_PASSED')
       }
-      await tx.activityRegistration.update({
-        where: { id: reg.id },
+      // 团队报名：由队长整队取消
+      if (reg.teamId) {
+        const team = await tx.team.findUnique({ where: { id: reg.teamId }, select: { captainUserId: true } })
+        if (team && team.captainUserId !== userId) throw new ActivityError('团队报名需由队长取消整队报名', 'NOT_CAPTAIN')
+      }
+      await tx.activityRegistration.updateMany({
+        where: reg.teamId
+          ? { activityId, teamId: reg.teamId, status: { in: ['enrolled', 'waitlisted', 'pending_approval'] } }
+          : { id: reg.id },
         data: { status: 'cancelled', cancelledAt: now, cancelReason: reason, revision: { increment: 1 } },
       })
 
-      // 候补递补：未截止 + 按顺序第一位 + 容量允许
+      // 候补递补：未截止 + 按顺序第一位（团队活动为第一队）+ 容量允许
       let promoted: string | undefined
-      const enrolledCount = await tx.activityRegistration.count({ where: { activityId, status: 'enrolled' } })
+      const enrolledCount = activity.teamSize
+        ? (await this.countTeams(tx, activityId)).enrolled
+        : await tx.activityRegistration.count({ where: { activityId, status: 'enrolled' } })
       if (reg.status === 'enrolled' && (activity.capacity == null || enrolledCount < activity.capacity) && (!activity.registerDeadline || activity.registerDeadline >= now)) {
         const next = await tx.activityRegistration.findFirst({
           where: { activityId, status: 'waitlisted' },
           orderBy: [{ waitlistSeq: 'asc' }, { createdAt: 'asc' }],
         })
         if (next) {
+          const nextWhere = next.teamId ? { activityId, teamId: next.teamId, status: 'waitlisted' } : { id: next.id }
           if (activity.waitlistConfirmHours) {
-            await tx.activityRegistration.update({
-              where: { id: next.id },
+            await tx.activityRegistration.updateMany({
+              where: nextWhere,
               data: {
                 status: 'pending_approval',
                 confirmDeadline: new Date(now.getTime() + activity.waitlistConfirmHours * 3600_000),
@@ -554,8 +667,8 @@ export class ActivityService {
             })
             promoted = 'confirm_required'
           } else {
-            await tx.activityRegistration.update({
-              where: { id: next.id },
+            await tx.activityRegistration.updateMany({
+              where: nextWhere,
               data: { status: 'enrolled', acceptedAt: now, revision: { increment: 1 } },
             })
             promoted = 'enrolled'
@@ -654,8 +767,18 @@ export class ActivityService {
       },
     })
     const nextCursor = rows.length > 20 ? rows.pop()!.id : undefined
+    const teamActivityIds = rows.filter((a) => a.teamSize).map((a) => a.id)
+    const teamRows = teamActivityIds.length
+      ? await this.db.activityRegistration.findMany({
+        where: { activityId: { in: teamActivityIds }, status: 'enrolled', teamId: { not: null } },
+        select: { activityId: true, teamId: true },
+        distinct: ['activityId', 'teamId'],
+      })
+      : []
+    const enrolledTeams = new Map<string, number>()
+    for (const row of teamRows) enrolledTeams.set(row.activityId, (enrolledTeams.get(row.activityId) ?? 0) + 1)
     return {
-      items: rows.map((a) => this.toCardDto(a)),
+      items: rows.map((a) => this.toCardDto(a, a.teamSize ? enrolledTeams.get(a.id) ?? 0 : undefined)),
       nextCursor,
     }
   }
@@ -665,12 +788,13 @@ export class ActivityService {
     startAt: Date; endAt: Date; registerDeadline: Date | null; cancelDeadline: Date | null
     capacity: number | null; waitlistCapacity: number | null; remoteAllowed: boolean
     requireValidSubmission: boolean
+    teamSize: number | null
     registrations?: Array<{ status: string; waitlistSeq: number | null }>
     _count: { registrations: number; participants: number }
     policy: { policy: string } | null
     venueBindings: Array<{ venueVersion: { room: string | null; building: string | null; venue: { name: string } } }>
     venueVersion: { room: string | null; building: string | null; venue: { name: string } } | null
-  }) {
+  }, enrolledTeams?: number) {
     const primary = a.venueVersion ?? a.venueBindings[0]?.venueVersion ?? null
     return {
       id: a.id,
@@ -683,7 +807,9 @@ export class ActivityService {
       registerDeadline: a.registerDeadline?.toISOString() ?? null,
       cancelDeadline: a.cancelDeadline?.toISOString() ?? null,
       capacity: a.capacity,
-      enrolledCount: a._count.registrations,
+      teamSize: a.teamSize,
+      /** 团队活动按队计（capacity 也是队数），个人活动按人计 */
+      enrolledCount: enrolledTeams ?? a._count.registrations,
       requiredCount: a._count.participants,
       waitlistCapacity: a.waitlistCapacity,
       venue: primary ? { name: primary.venue.name, building: primary.building, room: primary.room } : null,
@@ -725,6 +851,8 @@ export class ActivityService {
     return Object.assign(activity, {
       lectureRatings,
       platformBinding,
+      checkedIn: await this.checkedInPeople(activityId),
+      team: activity.teamSize ? await this.teamContext(userId, activityId, activity.teamSize, activity.registrations?.[0]?.teamId ?? null) : null,
       activityPoints: {
         mine: mine.map((entry) => ({
           amount: Number(entry.amount),
@@ -738,6 +866,58 @@ export class ActivityService {
         totalAwarded: points.reduce((sum, entry) => sum + Number(entry.amount), 0),
       },
     })
+  }
+
+  /** 已签到成员（签到墙）：按签到先后，头像遵循主页可见性；上限 500 人，total 为真实人数 */
+  private async checkedInPeople(activityId: string) {
+    const where = { activityId, checkpoint: 'IN' }
+    const [total, rows] = await Promise.all([
+      this.db.attendanceCheckpoint.count({ where }),
+      this.db.attendanceCheckpoint.findMany({
+        where,
+        orderBy: { acceptedAt: 'asc' },
+        take: 500,
+        select: { acceptedAt: true, user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } },
+      }),
+    ])
+    return {
+      total,
+      people: rows.map((row) => ({
+        userId: row.user.id,
+        name: memberName(row.user),
+        avatarAssetId: visibleAvatar(row.user.profile),
+        checkedInAt: row.acceptedAt.toISOString(),
+      })),
+    }
+  }
+
+  /** 团队活动：已报名队数、本人所在报名小队，以及本人担任队长、可用于报名的小队 */
+  private async teamContext(userId: string, activityId: string, teamSize: number, registeredTeamId: string | null) {
+    const userSelect = { id: true, verifiedRealName: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } as const
+    const toTeam = (team: { id: string; name: string; captainUserId: string; members: Array<{ userId: string; role: string; user: { id: string; verifiedRealName: string; profile: { displayName: string | null; avatarAssetId: string | null; visibility: string } | null } }> }) => ({
+      id: team.id,
+      name: team.name,
+      captainUserId: team.captainUserId,
+      members: team.members.map((m) => ({ userId: m.userId, role: m.role, name: memberName(m.user), avatarAssetId: visibleAvatar(m.user.profile) })),
+    })
+    const [counts, registeredTeam, captainTeams] = await Promise.all([
+      this.countTeams(this.db, activityId),
+      registeredTeamId
+        ? this.db.team.findUnique({ where: { id: registeredTeamId }, include: { members: { where: { status: 'active' }, include: { user: { select: userSelect } } } } })
+        : null,
+      this.db.team.findMany({
+        where: { captainUserId: userId, status: { not: 'disbanded' } },
+        include: { members: { where: { status: 'active' }, include: { user: { select: userSelect } } } },
+        orderBy: { createdAt: 'desc' },
+      }),
+    ])
+    return {
+      teamSize,
+      enrolledTeams: counts.enrolled,
+      waitlistedTeams: counts.waitlisted,
+      myTeam: registeredTeam ? toTeam(registeredTeam) : null,
+      captainTeams: captainTeams.map((team) => ({ ...toTeam(team), ready: team.members.length === teamSize })),
+    }
   }
 
   /** 管理详情只读取配置；报名与出勤名单由各自授权接口提供。 */

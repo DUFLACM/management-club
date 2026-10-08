@@ -4,6 +4,7 @@ import { matrixTeamAssignment } from '@acm/scoring-core'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newId, memberName, visibleAvatar } from '../../common/utils.js'
+import type { Prisma } from '@acm/db'
 import type { SessionActor } from '../auth/session.service.js'
 
 /**
@@ -43,6 +44,12 @@ export class TeamService {
           include: {
             members: { where: { status: 'active' }, include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } } },
             entries: { include: { event: { select: { id: true, title: true, status: true } } } },
+            recruitment: { include: { activity: { select: { id: true, title: true } } } },
+            joinRequests: {
+              where: { status: 'pending' },
+              orderBy: { createdAt: 'asc' },
+              include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } },
+            },
           },
         },
       },
@@ -139,6 +146,8 @@ export class TeamService {
         create: { id: newId(), teamId: invite.teamId, userId, role: 'member' },
         update: { status: 'active', leftAt: null },
       })
+      await tx.teamJoinRequest.updateMany({ where: { teamId: invite.teamId, userId, status: 'pending' }, data: { status: 'cancelled', decidedAt: new Date() } })
+      await TeamService.closeRecruitmentIfFull(tx, invite.teamId)
     })
   }
 
@@ -151,6 +160,155 @@ export class TeamService {
         const next = team.members.find((m) => m.userId !== userId)
         if (next) await tx.team.update({ where: { id: teamId }, data: { captainUserId: next.userId } })
       }
+    })
+  }
+
+  // ---------------- 广场招募：队长发帖 → 成员申请 → 队长审批 ----------------
+
+  private static readonly MEMBER_USER_SELECT = {
+    id: true, verifiedRealName: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } },
+  } as const
+
+  /** 满员后自动关闭招募，并驳回剩余待处理申请 */
+  private static async closeRecruitmentIfFull(tx: Prisma.TransactionClient, teamId: string) {
+    const team = await tx.team.findUniqueOrThrow({ where: { id: teamId }, select: { teamSize: true } })
+    const active = await tx.teamMember.count({ where: { teamId, status: 'active' } })
+    if (active < team.teamSize) return
+    await tx.teamRecruitment.updateMany({ where: { teamId, status: 'open' }, data: { status: 'closed' } })
+    await tx.teamJoinRequest.updateMany({ where: { teamId, status: 'pending' }, data: { status: 'rejected', decidedAt: new Date() } })
+  }
+
+  private async assertCaptain(teamId: string, userId: string) {
+    const team = await this.db.team.findUnique({ where: { id: teamId }, include: { members: { where: { status: 'active' } } } })
+    if (!team) throw new TeamError('队伍不存在', 'NOT_FOUND')
+    if (team.captainUserId !== userId) throw new TeamError('只有队长可以操作招募', 'NOT_CAPTAIN')
+    return team
+  }
+
+  /** 招募广场：开放中的招募帖（不含已满员/已锁定队伍），附本人申请状态 */
+  async listRecruitments(viewerUserId: string, q?: string) {
+    const keyword = q?.trim()
+    const rows = await this.db.teamRecruitment.findMany({
+      where: {
+        status: 'open',
+        team: { status: 'forming', ...(keyword ? { name: { contains: keyword, mode: 'insensitive' as const } } : {}) },
+      },
+      orderBy: { updatedAt: 'desc' },
+      take: 100,
+      include: {
+        activity: { select: { id: true, title: true, startAt: true, teamSize: true } },
+        team: {
+          include: {
+            members: { where: { status: 'active' }, orderBy: { joinedAt: 'asc' }, include: { user: { select: TeamService.MEMBER_USER_SELECT } } },
+            joinRequests: { where: { userId: viewerUserId }, orderBy: { createdAt: 'desc' }, take: 1 },
+          },
+        },
+      },
+    })
+    return rows
+      .filter((row) => row.team.members.length < row.team.teamSize)
+      .map((row) => ({
+        id: row.id,
+        teamId: row.teamId,
+        teamName: row.team.name,
+        teamSize: row.team.teamSize,
+        description: row.description,
+        updatedAt: row.updatedAt.toISOString(),
+        activity: row.activity ? { id: row.activity.id, title: row.activity.title, startAt: row.activity.startAt.toISOString() } : null,
+        slotsLeft: row.team.teamSize - row.team.members.length,
+        members: row.team.members.map((m) => ({
+          userId: m.userId, role: m.role, name: memberName(m.user), avatarAssetId: visibleAvatar(m.user.profile),
+        })),
+        isMember: row.team.members.some((m) => m.userId === viewerUserId),
+        myRequest: row.team.joinRequests[0] ? { id: row.team.joinRequests[0].id, status: row.team.joinRequests[0].status } : null,
+      }))
+  }
+
+  /** 发布/更新招募帖（每队一条）；可选关联一个人数相同的团队活动 */
+  async upsertRecruitment(userId: string, teamId: string, input: { description: string; activityId?: string | null }) {
+    const team = await this.assertCaptain(teamId, userId)
+    if (team.status !== 'forming') throw new TeamError('队伍已锁定或解散，不能招募', 'STATE_INVALID')
+    if (team.members.length >= team.teamSize) throw new TeamError('队伍已满员，无需招募', 'TEAM_FULL')
+    if (input.activityId) {
+      const activity = await this.db.activity.findUnique({ where: { id: input.activityId }, select: { teamSize: true, status: true } })
+      if (!activity || activity.status !== 'published') throw new TeamError('关联的活动不存在或未发布', 'NOT_FOUND')
+      if (activity.teamSize !== team.teamSize) throw new TeamError('关联活动的组队人数与本队不一致', 'SIZE_MISMATCH')
+    }
+    const data = { description: input.description, activityId: input.activityId ?? null, status: 'open' }
+    const row = await this.db.teamRecruitment.upsert({
+      where: { teamId },
+      create: { id: newId(), teamId, createdBy: userId, ...data },
+      update: data,
+    })
+    return { recruitmentId: row.id }
+  }
+
+  async closeRecruitment(userId: string, teamId: string): Promise<void> {
+    await this.assertCaptain(teamId, userId)
+    await this.db.teamRecruitment.updateMany({ where: { teamId }, data: { status: 'closed' } })
+  }
+
+  /** 申请加入：招募开放 + 未满员 + 非本队成员；已有待处理申请时幂等返回 */
+  async applyToTeam(userId: string, teamId: string, message?: string): Promise<{ requestId: string }> {
+    return this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM teams WHERE id = ${teamId}::uuid FOR UPDATE`
+      const team = await tx.team.findUnique({ where: { id: teamId }, include: { members: { where: { status: 'active' } }, recruitment: true } })
+      if (!team) throw new TeamError('队伍不存在', 'NOT_FOUND')
+      if (!team.recruitment || team.recruitment.status !== 'open' || team.status !== 'forming') throw new TeamError('该队伍当前未开放招募', 'NOT_RECRUITING')
+      if (team.members.some((m) => m.userId === userId)) throw new TeamError('你已经是该队成员', 'ALREADY_MEMBER')
+      if (team.members.length >= team.teamSize) throw new TeamError('队伍人数已满', 'TEAM_FULL')
+      const pending = await tx.teamJoinRequest.findFirst({ where: { teamId, userId, status: 'pending' } })
+      if (pending) return { requestId: pending.id }
+      const id = newId()
+      await tx.teamJoinRequest.create({ data: { id, teamId, userId, message: message?.trim() || null } })
+      return { requestId: id }
+    })
+  }
+
+  async cancelJoinRequest(userId: string, requestId: string): Promise<void> {
+    const request = await this.db.teamJoinRequest.findUnique({ where: { id: requestId } })
+    if (!request || request.userId !== userId) throw new TeamError('申请不存在', 'NOT_FOUND')
+    if (request.status !== 'pending') throw new TeamError('该申请已处理', 'STATE_INVALID')
+    await this.db.teamJoinRequest.update({ where: { id: requestId }, data: { status: 'cancelled', decidedAt: new Date() } })
+  }
+
+  async myJoinRequests(userId: string) {
+    const rows = await this.db.teamJoinRequest.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+      include: { team: { select: { id: true, name: true, teamSize: true } } },
+    })
+    return rows.map((row) => ({
+      id: row.id, status: row.status, message: row.message,
+      createdAt: row.createdAt.toISOString(), decidedAt: row.decidedAt?.toISOString() ?? null,
+      team: row.team,
+    }))
+  }
+
+  /** 队长审批入队申请：批准时队伍行锁下校验人数，满员后自动关闭招募 */
+  async decideJoinRequest(captainUserId: string, requestId: string, decision: 'approve' | 'reject'): Promise<void> {
+    const request = await this.db.teamJoinRequest.findUnique({ where: { id: requestId } })
+    if (!request) throw new TeamError('申请不存在', 'NOT_FOUND')
+    await this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM teams WHERE id = ${request.teamId}::uuid FOR UPDATE`
+      const team = await tx.team.findUniqueOrThrow({ where: { id: request.teamId }, include: { members: { where: { status: 'active' } } } })
+      if (team.captainUserId !== captainUserId) throw new TeamError('只有队长可以审批入队申请', 'NOT_CAPTAIN')
+      const current = await tx.teamJoinRequest.findUniqueOrThrow({ where: { id: requestId } })
+      if (current.status !== 'pending') throw new TeamError('该申请已处理', 'STATE_INVALID')
+      if (decision === 'reject') {
+        await tx.teamJoinRequest.update({ where: { id: requestId }, data: { status: 'rejected', decidedBy: captainUserId, decidedAt: new Date() } })
+        return
+      }
+      if (team.status !== 'forming') throw new TeamError('队伍已锁定或解散，不能再加人', 'STATE_INVALID')
+      if (team.members.length >= team.teamSize) throw new TeamError('队伍人数已满', 'TEAM_FULL')
+      await tx.teamJoinRequest.update({ where: { id: requestId }, data: { status: 'approved', decidedBy: captainUserId, decidedAt: new Date() } })
+      await tx.teamMember.upsert({
+        where: { teamId_userId: { teamId: request.teamId, userId: request.userId } },
+        create: { id: newId(), teamId: request.teamId, userId: request.userId, role: 'member' },
+        update: { status: 'active', leftAt: null, role: 'member' },
+      })
+      await TeamService.closeRecruitmentIfFull(tx, request.teamId)
     })
   }
 

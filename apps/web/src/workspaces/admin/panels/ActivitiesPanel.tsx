@@ -91,6 +91,7 @@ interface ActivityDetailDto {
   remoteAllowed: boolean;
   remotePolicy: string | null;
   requireValidSubmission: boolean;
+  teamSize: number | null;
   scoringConfig: Record<string, unknown> | null;
   venueVersionId: string | null;
   policy: {
@@ -124,6 +125,7 @@ interface AttendanceListDto {
     checkout: string | null;
     resultStatus: string | null;
     leave: string | null;
+    teamName: string | null;
   }>;
   stats: {
     total: number;
@@ -434,9 +436,9 @@ function ActivitiesTab({ principalId }: { principalId: string }) {
                   ) : (
                     <Trash2Icon aria-hidden="true" />
                   )}
-                  {confirmBatch ? `确认删除 ${selected.size} 项（不可恢复）` : '批量删除（仅无数据草稿）'}
+                  {confirmBatch ? `确认删除 ${selected.size} 项及其全部报名/出勤记录（不可恢复）` : '批量删除'}
                 </Button>
-                <span className="text-xs text-muted-foreground">已发布或已有数据的活动会被自动跳过。</span>
+                <span className="text-xs text-muted-foreground">删除会连同报名、出勤、请假、材料等记录一并清除；已入账积分不受影响。</span>
               </div>
             )}
             <div className="overflow-x-auto">
@@ -701,22 +703,24 @@ function ActivityDetailSheet({
                   发布
                 </Button>
               )}
-              {query.data.status === 'draft' && (
-                <Button
-                  size="sm"
-                  variant={confirmDelete ? 'destructive' : 'outline'}
-                  disabled={deleteMutation.isPending}
-                  onClick={() => {
-                    if (confirmDelete) deleteMutation.mutate();
-                    else setConfirmDelete(true);
-                  }}
-                >
-                  {deleteMutation.isPending && (
-                    <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
-                  )}
-                  {confirmDelete ? '确认删除（不可恢复）' : '删除草稿'}
-                </Button>
-              )}
+              <Button
+                size="sm"
+                variant={confirmDelete ? 'destructive' : 'outline'}
+                disabled={deleteMutation.isPending}
+                onClick={() => {
+                  if (confirmDelete) deleteMutation.mutate();
+                  else setConfirmDelete(true);
+                }}
+              >
+                {deleteMutation.isPending && (
+                  <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                )}
+                {confirmDelete
+                  ? query.data.status === 'draft'
+                    ? '确认删除（不可恢复）'
+                    : '确认删除活动及全部报名/出勤记录（不可恢复）'
+                  : '删除活动'}
+              </Button>
               {query.data.policy && query.data.status === 'published' && (
                 <Button size="sm" variant="outline" onClick={() => {
                   setBoardWasFullscreen(Boolean(document.fullscreenElement));
@@ -815,6 +819,7 @@ function ActivityDetailSheet({
                 <TabsTrigger value="announcement">公告设置</TabsTrigger>
                 <TabsTrigger value="registrations">报名候补</TabsTrigger>
                 <TabsTrigger value="attendance">现场出勤</TabsTrigger>
+                <TabsTrigger value="leave">请假审批</TabsTrigger>
                 <TabsTrigger value="participants">参与核验</TabsTrigger>
                 <TabsTrigger value="lecture">讲题审批</TabsTrigger>
                 <TabsTrigger value="standings">比赛榜单</TabsTrigger>
@@ -835,6 +840,9 @@ function ActivityDetailSheet({
               </TabsContent>
               <TabsContent value="attendance" className="mt-3">
                 <AttendanceSection principalId={principalId} activityId={activityId} />
+              </TabsContent>
+              <TabsContent value="leave" className="mt-3">
+                <LeaveRequestsSection principalId={principalId} activityId={activityId} />
               </TabsContent>
               <TabsContent value="participants" className="mt-3">
                 <ParticipantsSection principalId={principalId} activityId={activityId} />
@@ -893,9 +901,12 @@ function AnnouncementSection({ detail }: { detail: ActivityDetailDto }) {
         <dd>
           {detail.cancelDeadline ? formatDateTime(detail.cancelDeadline) : '未设置'} / 未设置
         </dd>
+        <dt className="text-muted-foreground">报名方式</dt>
+        <dd>{detail.teamSize ? `${detail.teamSize} 人小队报名（容量与候补按队计）` : '个人报名'}</dd>
         <dt className="text-muted-foreground">容量 / 候补</dt>
         <dd className="tabular-nums">
           {detail.capacity ?? '不限'} / {detail.waitlistCapacity ?? 0}
+          {detail.teamSize ? ' 队' : ''}
         </dd>
         <dt className="text-muted-foreground">远程参赛</dt>
         <dd>
@@ -1216,6 +1227,128 @@ function LectureRequestsSection({
   );
 }
 
+interface LeaveRequestRow {
+  id: string;
+  reason: string;
+  status: string;
+  reviewNote: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  user: LectureRequestRow['user'];
+}
+
+function LeaveRequestsSection({
+  principalId,
+  activityId,
+}: {
+  principalId: string;
+  activityId: string;
+}) {
+  const queryClient = useQueryClient();
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const query = usePrivateQuery<LeaveRequestRow[], ApiError>(
+    principalId,
+    ['admin', 'activities', 'leave-requests', activityId],
+    async () => (await api.get<LeaveRequestRow[]>(`/admin/activities/${activityId}/leave-requests`)).data,
+  );
+
+  const decisionMutation = useMutation({
+    mutationFn: async (input: { requestId: string; decision: 'approve' | 'reject' }) => {
+      await api.post(`/admin/leave-requests/${input.requestId}/decision`, { decision: input.decision });
+      return input.decision;
+    },
+    onSuccess: () => {
+      setActionError(null);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'activities'] });
+    },
+    onError: (error: ApiError) => setActionError(error.message),
+  });
+
+  if (query.isPending) return <Skeleton className="h-40 rounded-xl" />;
+  if (query.isError) return <ErrorState description={query.error.message} onRetry={() => void query.refetch()} />;
+
+  const pendingCount = query.data.filter((request) => request.status === 'pending').length;
+
+  return (
+    <div className="flex flex-col gap-3">
+      {actionError && (
+        <Alert variant="destructive">
+          <AlertTitle>操作未完成</AlertTitle>
+          <AlertDescription>{actionError}</AlertDescription>
+        </Alert>
+      )}
+      {query.data.length === 0 ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">还没有成员提交本次活动的请假申请。</p>
+      ) : (
+        <>
+          <p className="text-xs text-muted-foreground">
+            共 {query.data.length} 条，待审批 {pendingCount} 条。
+          </p>
+          <ul className="flex flex-col divide-y divide-border">
+            {query.data.map((request) => {
+              const busy = decisionMutation.isPending && decisionMutation.variables?.requestId === request.id;
+              return (
+                <li key={request.id} className="flex flex-wrap items-center gap-3 py-2.5">
+                  <div className="min-w-0 flex-1">
+                    <p className="flex flex-wrap items-center gap-2 text-sm font-medium text-foreground">
+                      {memberName(request.user)}
+                      <span className="font-normal text-muted-foreground tabular-nums">{request.user.studentNo}</span>
+                      <StatusBadge
+                        kind="disclosure"
+                        value={
+                          request.status === 'approved' ? '已批准' : request.status === 'pending' ? '待审批' : '已驳回'
+                        }
+                      />
+                    </p>
+                    <p className="text-sm leading-[22px] break-words whitespace-pre-wrap text-foreground">{request.reason}</p>
+                    <p className="text-xs text-muted-foreground">
+                      提交于 {formatDateTime(request.createdAt)}
+                      {request.reviewedAt ? ` · 审批于 ${formatDateTime(request.reviewedAt)}` : ''}
+                      {request.reviewNote ? ` · 备注：${request.reviewNote}` : ''}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    {request.status !== 'approved' && (
+                      <Button
+                        size="sm"
+                        variant={request.status === 'pending' ? 'default' : 'outline'}
+                        disabled={decisionMutation.isPending}
+                        onClick={() => decisionMutation.mutate({ requestId: request.id, decision: 'approve' })}
+                      >
+                        {busy && decisionMutation.variables?.decision === 'approve' && (
+                          <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                        )}
+                        {request.status === 'pending' ? '批准' : '改为批准'}
+                      </Button>
+                    )}
+                    {request.status !== 'rejected' && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decisionMutation.isPending}
+                        onClick={() => decisionMutation.mutate({ requestId: request.id, decision: 'reject' })}
+                      >
+                        {busy && decisionMutation.variables?.decision === 'reject' && (
+                          <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                        )}
+                        {request.status === 'pending' ? '驳回' : '改为驳回'}
+                      </Button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+      <p className="text-xs text-muted-foreground">
+        批准后该成员本次出勤记为「请假通过」，不计缺席；驳回已批准的请假会把出勤结果退回待复核。
+      </p>
+    </div>
+  );
+}
+
 interface LectureRatingSummaryRow {
   lectureRequestId: string;
   lecturerName: string;
@@ -1415,6 +1548,11 @@ function AttendanceSection({
                     <span className="block truncate text-foreground">
                       {row.name ?? '（未实名）'}{' '}
                       <span className="text-xs text-muted-foreground tabular-nums">{row.studentNo}</span>
+                      {row.teamName && (
+                        <span className="ml-1.5 rounded-md bg-lilac-subtle px-1.5 py-0.5 text-xs text-lilac-foreground">
+                          {row.teamName}
+                        </span>
+                      )}
                     </span>
                     <span className="text-xs text-muted-foreground tabular-nums">
                       签到 {row.checkin ? formatDateTime(row.checkin) : '—'} · 签退{' '}
@@ -2649,6 +2787,7 @@ function ActivityFormFields({
     cancelDeadline: toLocalInputValue(draft?.cancelDeadline),
     capacity: draft?.capacity == null ? '' : String(draft.capacity),
     waitlistCapacity: String(draft?.waitlistCapacity ?? 0),
+    teamSize: draft?.teamSize == null ? '' : String(draft.teamSize),
     remoteAllowed: draft?.remoteAllowed ?? false,
     requireValidSubmission: draft?.requireValidSubmission ?? false,
     scoringCategory: String(draft?.scoringConfig?.category ?? 'activity'),
@@ -2706,6 +2845,7 @@ function ActivityFormFields({
         cancelDeadline: iso(form.cancelDeadline),
         capacity: form.capacity ? Number(form.capacity) : null,
         waitlistCapacity: Number(form.waitlistCapacity || 0),
+        teamSize: form.teamSize ? Number(form.teamSize) : null,
         remoteAllowed: form.remoteAllowed,
         requireValidSubmission: form.requireValidSubmission,
         scoringConfig: scoring,
@@ -2731,7 +2871,7 @@ function ActivityFormFields({
       if (draft) {
         // 只提交修改过的字段，保留秒级时间、平台来源与多地点绑定等原始配置。
         const changes: Record<string, unknown> = { expectedRevision: draft.revision };
-        const scalarKeys = ['type', 'title', 'announcement', 'joinNotes', 'startAt', 'endAt', 'registerDeadline', 'cancelDeadline', 'capacity', 'waitlistCapacity', 'remoteAllowed', 'requireValidSubmission'] as const;
+        const scalarKeys = ['type', 'title', 'announcement', 'joinNotes', 'startAt', 'endAt', 'registerDeadline', 'cancelDeadline', 'capacity', 'waitlistCapacity', 'teamSize', 'remoteAllowed', 'requireValidSubmission'] as const;
         for (const key of scalarKeys) if (form[key] !== initialForm[key]) changes[key] = body[key];
         if (form.scoringCategory !== initialForm.scoringCategory || form.scoringSpecialCap !== initialForm.scoringSpecialCap || form.scoringLambda !== initialForm.scoringLambda) changes.scoringConfig = scoring;
         const policyKeys = ['policy', 'checkinOpenAt', 'checkinCloseAt', 'checkoutOpenAt', 'checkoutCloseAt', 'maxAccuracyMeters', 'qrRotateSeconds', 'selfCheckout', 'autoCheckout'] as const;
@@ -2828,8 +2968,27 @@ function ActivityFormFields({
             onChange={(event) => set('cancelDeadline')(event.target.value)}
           />
         </div>
-        <Field label="容量（空=不限）" value={form.capacity} onChange={set('capacity')} type="number" id="activity-capacity" />
-        <Field label="候补容量" value={form.waitlistCapacity} onChange={set('waitlistCapacity')} type="number" id="activity-waitlist" />
+        <Field
+          label="组队人数（空=个人报名，2–10）"
+          value={form.teamSize}
+          onChange={set('teamSize')}
+          type="number"
+          id="activity-team-size"
+        />
+        <Field
+          label={form.teamSize ? '容量（队数，空=不限）' : '容量（空=不限）'}
+          value={form.capacity}
+          onChange={set('capacity')}
+          type="number"
+          id="activity-capacity"
+        />
+        <Field
+          label={form.teamSize ? '候补容量（队数）' : '候补容量'}
+          value={form.waitlistCapacity}
+          onChange={set('waitlistCapacity')}
+          type="number"
+          id="activity-waitlist"
+        />
 
         {!draft && (
           <fieldset className="grid gap-2 rounded-xl border border-border p-3 sm:col-span-2">

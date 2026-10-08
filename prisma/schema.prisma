@@ -67,6 +67,7 @@ model User {
   competitionShortlistRows CompetitionShortlistRow[]
   teamMemberships      TeamMember[]
   teamInvitesReceived  TeamInvite[]
+  teamJoinRequests     TeamJoinRequest[]
   evaluationRows       EvaluationRow[]
 
   @@index([studentNo])
@@ -527,6 +528,8 @@ model Activity {
   remotePolicy     String?  @map("remote_policy")
   leaveDeadline    DateTime? @db.Timestamptz(3) @map("leave_deadline")
   requireValidSubmission Boolean @default(false) @map("require_valid_submission")
+  /// 团队报名人数：null = 个人报名；非空时须以 teamSize 人小队报名，容量/候补按队计
+  teamSize         Int?      @map("team_size")
   ruleVersionId    String?   @map("rule_version_id") @db.Uuid
   ruleVersion      RuleVersion? @relation(fields: [ruleVersionId], references: [id])
   venueVersion     VenueVersion? @relation(fields: [venueVersionId], references: [id])
@@ -555,6 +558,7 @@ model Activity {
   incidents       IncidentReport[]
   lectureRequests LectureRequest[]
   materials       ActivityMaterial[]
+  teamRecruitments TeamRecruitment[]
 
   @@index([status, startAt])
   @@index([platform, platformContestId])
@@ -606,12 +610,15 @@ model ActivityRegistration {
   cancelledAt      DateTime? @db.Timestamptz(3) @map("cancelled_at")
   cancelReason     String?   @map("cancel_reason")
   idempotencyKey   String?   @map("idempotency_key")
+  /// 团队报名时所属小队（同队成员共享状态与候补序号）
+  teamId           String?   @map("team_id") @db.Uuid
   revision         Int       @default(1)
   createdAt        DateTime @db.Timestamptz(3)  @default(now()) @map("created_at")
   updatedAt        DateTime @db.Timestamptz(3)  @default(now()) @updatedAt @map("updated_at")
 
   activity Activity             @relation(fields: [activityId], references: [id])
   user     User                 @relation(fields: [userId], references: [id])
+  team     Team?                @relation(fields: [teamId], references: [id])
   history  RegistrationHistory[]
 
   @@unique([activityId, userId])
@@ -1478,6 +1485,9 @@ model Team {
   members TeamMember[]
   invites TeamInvite[]
   entries TeamCompetitionEntry[]
+  activityRegistrations ActivityRegistration[]
+  recruitment  TeamRecruitment?
+  joinRequests TeamJoinRequest[]
 
   @@map("teams")
 }
@@ -1516,6 +1526,43 @@ model TeamInvite {
 }
 
 // 队伍 ↔ 赛事报名：一个 Team 可报名多场团队赛
+/// 组队广场招募帖：每队至多一条，队长发布/关闭；满员自动关闭
+model TeamRecruitment {
+  id          String   @id @db.Uuid
+  teamId      String   @unique @map("team_id") @db.Uuid
+  activityId  String?  @map("activity_id") @db.Uuid // 可选：为某个团队活动招募
+  description String   @db.Text
+  status      String   @default("open") // open | closed
+  createdBy   String   @map("created_by") @db.Uuid
+  createdAt   DateTime @default(now()) @db.Timestamptz(3) @map("created_at")
+  updatedAt   DateTime @default(now()) @updatedAt @db.Timestamptz(3) @map("updated_at")
+
+  team     Team      @relation(fields: [teamId], references: [id])
+  activity Activity? @relation(fields: [activityId], references: [id])
+
+  @@index([status, updatedAt])
+  @@map("team_recruitments")
+}
+
+/// 入队申请：申请人提交留言，队长批准后入队
+model TeamJoinRequest {
+  id         String    @id @db.Uuid
+  teamId     String    @map("team_id") @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  message    String?
+  status     String    @default("pending") // pending | approved | rejected | cancelled
+  decidedBy  String?   @map("decided_by") @db.Uuid
+  decidedAt  DateTime? @db.Timestamptz(3) @map("decided_at")
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  team Team @relation(fields: [teamId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([teamId, status])
+  @@index([userId, status])
+  @@map("team_join_requests")
+}
+
 model TeamCompetitionEntry {
   id           String    @id @db.Uuid
   teamId       String    @map("team_id") @db.Uuid

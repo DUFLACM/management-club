@@ -71,6 +71,8 @@ interface ActivityCardDto {
   registerDeadline: string | null;
   cancelDeadline: string | null;
   capacity: number | null;
+  /** 团队活动每队人数；null 为个人报名（此时 capacity/enrolledCount 按人计，否则按队计） */
+  teamSize: number | null;
   enrolledCount: number;
   requiredCount: number;
   waitlistCapacity: number | null;
@@ -102,8 +104,9 @@ interface ActivityDetailDto {
   remoteAllowed: boolean;
   remotePolicy: string | null;
   requireValidSubmission: boolean;
+  teamSize: number | null;
   scoringConfig: Record<string, unknown> | null;
-  registrations: Array<{ status: string; waitlistSeq: number | null }>;
+  registrations: Array<{ status: string; waitlistSeq: number | null; teamId: string | null }>;
   participants: Array<{ required: boolean }>;
   leaveRequests: Array<{ status: string; reason: string }>;
   remotePermissions: Array<{ status: string; reason: string }>;
@@ -135,12 +138,32 @@ interface ActivityDetailDto {
   lectureRatings?: LectureRatingDto[];
   /** 平台赛（牛客 / CF / AtCoder）报名前须绑定对应平台账号 */
   platformBinding?: { platform: string; bound: boolean } | null;
+  /** 签到墙：已签到成员（按签到先后） */
+  checkedIn?: {
+    total: number;
+    people: Array<{ userId: string; name: string; avatarAssetId: string | null; checkedInAt: string }>;
+  };
+  /** 团队活动上下文；个人活动为 null */
+  team?: {
+    teamSize: number;
+    enrolledTeams: number;
+    waitlistedTeams: number;
+    myTeam: TeamBriefDto | null;
+    captainTeams: Array<TeamBriefDto & { ready: boolean }>;
+  } | null;
   activityPoints: {
     mine: Array<{ amount: number; category: string; scoreMonth: string; note: string | null; recordedAt: string }>;
     myTotal: number;
     board: Array<{ rank: number; userId: string; name: string; avatarAssetId?: string | null; total: number; count: number }>;
     totalAwarded: number;
   } | null;
+}
+
+interface TeamBriefDto {
+  id: string;
+  name: string;
+  captainUserId: string;
+  members: Array<{ userId: string; role: string; name: string; avatarAssetId: string | null }>;
 }
 
 interface LectureRatingDto {
@@ -504,6 +527,11 @@ function ActivityCardView({ item, onOpen }: { item: ActivityCardDto; onOpen: () 
           {item.requireValidSubmission && (
             <span className="rounded-md bg-warning-subtle px-1.5 py-0.5 text-warning-foreground">需有效提交</span>
           )}
+          {item.teamSize && (
+            <span className="rounded-md bg-lilac-subtle px-1.5 py-0.5 font-medium text-lilac-foreground">
+              {item.teamSize} 人组队
+            </span>
+          )}
         </div>
 
         <div className="flex flex-col gap-1.5 text-sm">
@@ -526,7 +554,7 @@ function ActivityCardView({ item, onOpen }: { item: ActivityCardDto; onOpen: () 
                 '名额不限'
               ) : (
                 <span className="tabular-nums">
-                  已报名 {item.enrolledCount}/{item.capacity}
+                  已报名 {item.enrolledCount}/{item.capacity}{item.teamSize ? ' 队' : ''}
                   {item.waitlistCapacity ? ` · 候补 ${item.waitlistCapacity}` : ''}
                 </span>
               )}
@@ -705,6 +733,9 @@ function ActivityDetailPage({
             </CardContent>
           </Card>
 
+          {/* 签到墙：已签到成员头像 */}
+          {detail.checkedIn && <CheckedInWall checkedIn={detail.checkedIn} />}
+
           {/* 报名与讲题申请 */}
           <RegistrationSection
             principalId={principalId}
@@ -774,9 +805,16 @@ function ActivityDetailPage({
                 <dd>{detail.cancelDeadline ? formatDateTime(detail.cancelDeadline) : '不限'}</dd>
                 <dt className="text-muted-foreground">请假截止</dt>
                 <dd>{detail.leaveDeadline ? formatDateTime(detail.leaveDeadline) : '不限'}</dd>
+                {detail.teamSize && (
+                  <>
+                    <dt className="text-muted-foreground">报名方式</dt>
+                    <dd>{detail.teamSize} 人小队报名</dd>
+                  </>
+                )}
                 <dt className="text-muted-foreground">容量 / 候补</dt>
                 <dd className="tabular-nums">
                   {detail.capacity ?? '不限'} / {detail.waitlistCapacity ?? 0}
+                  {detail.teamSize ? ' 队' : ''}
                 </dd>
                 {detail.policy && (
                   <>
@@ -810,6 +848,192 @@ function ActivityDetailPage({
           </Card>
         </aside>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 签到墙：已签到成员头像 + 名字。手机 5 列、平板 8 列、宽屏 10 列；默认展示前两行，可展开全部。
+ * 主页设为「仅自己可见」的成员只显示首字头像。
+ */
+function CheckedInWall({ checkedIn }: { checkedIn: NonNullable<ActivityDetailDto['checkedIn']> }) {
+  const [expanded, setExpanded] = useState(false);
+  const COLLAPSED = 20;
+  const people = expanded ? checkedIn.people : checkedIn.people.slice(0, COLLAPSED);
+  const hidden = checkedIn.people.length - people.length;
+
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-3 p-5">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="flex items-center gap-2 text-[15px] font-semibold text-foreground">
+            <UsersIcon className="size-4 text-muted-foreground" aria-hidden="true" />
+            已签到
+            <span className="text-sm font-normal text-muted-foreground tabular-nums">{checkedIn.total} 人</span>
+          </h2>
+        </div>
+        {checkedIn.total === 0 ? (
+          <p className="text-sm text-muted-foreground">还没有人签到。</p>
+        ) : (
+          <>
+            <ul className="grid grid-cols-5 gap-x-2 gap-y-3 sm:grid-cols-8 lg:grid-cols-10" aria-label="已签到成员">
+              {people.map((person) => (
+                <li
+                  key={person.userId}
+                  className="flex min-w-0 flex-col items-center gap-1"
+                  title={`${person.name} · ${formatDateTime(person.checkedInAt)} 签到`}
+                >
+                  <MemberAvatar assetId={person.avatarAssetId} name={person.name} size="md" />
+                  <span className="w-full truncate text-center text-[11px] leading-4 text-muted-foreground">
+                    {person.name}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {(hidden > 0 || expanded) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="self-center"
+                onClick={() => setExpanded((previous) => !previous)}
+              >
+                {expanded ? '收起' : `展开全部（还有 ${hidden} 人）`}
+              </Button>
+            )}
+            {checkedIn.total > checkedIn.people.length && (
+              <p className="text-center text-xs text-muted-foreground">
+                仅显示前 {checkedIn.people.length} 位签到成员。
+              </p>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 小队成员一行：头像 + 名字，队长标注 */
+function TeamMembersRow({ team }: { team: TeamBriefDto }) {
+  return (
+    <ul className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+      {team.members.map((member) => (
+        <li key={member.userId} className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+          <MemberAvatar assetId={member.avatarAssetId} name={member.name} size="xs" />
+          <span className="max-w-[8rem] truncate">{member.name}</span>
+          {member.role === 'captain' && <span className="text-primary">队长</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * 团队报名：已报名时展示报名小队；否则队长从自己带的、人数恰好满足要求的小队中选一个整队报名。
+ * 不是队长 / 没有合适小队时引导去组队广场建队或招募。
+ */
+function TeamRegistration({
+  activityId,
+  team,
+  registration,
+  principalId,
+  onDone,
+  onError,
+  disabled,
+}: {
+  activityId: string;
+  team: NonNullable<ActivityDetailDto['team']>;
+  registration: ActivityDetailDto['registrations'][number] | undefined;
+  principalId: string;
+  onDone: (message: string) => void;
+  onError: (message: string) => void;
+  disabled: boolean;
+}) {
+  const readyTeams = team.captainTeams.filter((candidate) => candidate.ready);
+  const [teamId, setTeamId] = useState(readyTeams[0]?.id ?? '');
+  const active = registration && ['enrolled', 'waitlisted', 'pending_approval'].includes(registration.status);
+
+  const registerMutation = useMutation({
+    mutationFn: async () =>
+      (
+        await api.post<{ status: string; waitlistSeq: number | null; message: string }>(
+          `/activities/${activityId}/team-registrations`,
+          { teamId },
+        )
+      ).data,
+    onSuccess: (result) => onDone(result.message),
+    onError: (error: ApiError) => onError(error.message),
+  });
+
+  return (
+    <div className="flex flex-col gap-3 rounded-xl border border-border bg-muted/30 p-3 sm:p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="flex items-center gap-2 text-sm font-medium text-foreground">
+          <UsersIcon className="size-4 text-muted-foreground" aria-hidden="true" />
+          {team.teamSize} 人小队报名
+        </p>
+        <span className="text-xs text-muted-foreground tabular-nums">
+          已报名 {team.enrolledTeams} 队{team.waitlistedTeams ? ` · 候补 ${team.waitlistedTeams} 队` : ''}
+        </span>
+      </div>
+
+      {active && team.myTeam ? (
+        <div className="flex flex-col gap-2">
+          <p className="text-sm text-foreground">
+            你随小队「<span className="font-medium">{team.myTeam.name}</span>」报名
+            {team.myTeam.captainUserId !== principalId && '，如需取消请联系队长'}。
+          </p>
+          <TeamMembersRow team={team.myTeam} />
+        </div>
+      ) : readyTeams.length > 0 ? (
+        <form
+          className="flex flex-col gap-2 sm:flex-row sm:items-center"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (teamId) registerMutation.mutate();
+          }}
+        >
+          <Select value={teamId} onValueChange={setTeamId}>
+            <SelectTrigger className="w-full sm:w-64" aria-label="选择报名小队">
+              <SelectValue placeholder="选择小队" />
+            </SelectTrigger>
+            <SelectContent>
+              {readyTeams.map((candidate) => (
+                <SelectItem key={candidate.id} value={candidate.id}>
+                  {candidate.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button type="submit" disabled={disabled || !teamId || registerMutation.isPending}>
+            {registerMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+            以小队报名
+          </Button>
+        </form>
+      ) : (
+        <p className="text-sm leading-[22px] text-muted-foreground">
+          {team.captainTeams.length > 0
+            ? `你带的小队还没凑满 ${team.teamSize} 人（${team.captainTeams
+                .map((candidate) => `${candidate.name} ${candidate.members.length}/${team.teamSize}`)
+                .join('、')}）。`
+            : `本活动需由队长带 ${team.teamSize} 人小队报名；队员无需单独报名，队长报名后全队自动报名。`}
+        </p>
+      )}
+
+      {!active && (
+        <div className="flex flex-wrap gap-2">
+          <Button asChild size="sm" variant="outline">
+            <a href="/app?section=contests&tab=teams">去组队广场建队 / 招募队友</a>
+          </Button>
+        </div>
+      )}
+      {readyTeams.length > 0 && !active && (
+        <p className="text-xs text-muted-foreground">报名后全体队员自动报名；容量与候补按队计算。</p>
+      )}
+      {team.captainTeams
+        .filter((candidate) => candidate.ready && candidate.id === teamId)
+        .map((candidate) => (
+          <TeamMembersRow key={candidate.id} team={candidate} />
+        ))}
     </div>
   );
 }
@@ -1043,8 +1267,27 @@ function RegistrationSection({
           }}
         />
 
+        {detail.team && (
+          <TeamRegistration
+            activityId={activityId}
+            team={detail.team}
+            registration={registration}
+            principalId={principalId}
+            onDone={(message) => {
+              setActionError(null);
+              setActionNotice(message);
+              invalidate();
+            }}
+            onError={(message) => {
+              setActionNotice(null);
+              setActionError(message);
+            }}
+            disabled={activityEnded}
+          />
+        )}
+
         <div className="flex flex-wrap gap-2">
-          {!required && (!registration ||
+          {!required && !detail.teamSize && (!registration ||
             !['enrolled', 'waitlisted', 'pending_approval'].includes(registration.status)) && (
             <Button
               onClick={() => (needsBinding ? setBindOpen(true) : registerMutation.mutate())}
@@ -1066,7 +1309,7 @@ function RegistrationSection({
                 {cancelMutation.isPending && (
                   <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
                 )}
-                取消报名
+                {registration.teamId ? '取消小队报名' : '取消报名'}
               </Button>
             )}
           {!showLeaveForm && (

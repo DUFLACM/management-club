@@ -12,7 +12,9 @@ import {
   FilterIcon,
   LoaderCircleIcon,
   PlusIcon,
+  MegaphoneIcon,
   RefreshCwIcon,
+  SearchIcon,
   SnowflakeIcon,
   UsersIcon,
   XIcon,
@@ -22,7 +24,7 @@ import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
-import { LoadMoreButton } from '@/lib/hooks';
+import { LoadMoreButton, useDebouncedValue } from '@/lib/hooks';
 import { formatDateTime, platformAccountBadge, platformLabel, memberName, memberAvatarId } from '@/lib/format';
 import {
   competitionsApi,
@@ -35,8 +37,10 @@ import {
   type InvitableMemberDto,
   type MemberCompetitionEventDto,
   type MemberShortlistBoardDto,
+  type MyJoinRequestDto,
   type TeamDto,
   type TeamInviteDto,
+  type TeamRecruitmentDto,
 } from '@/lib/competitions';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { BindPlatformAccountDialog } from '@/components/club/BindPlatformAccountDialog';
@@ -1219,6 +1223,25 @@ function ErrorInline({ message, onRetry }: { message: string; onRetry: () => voi
  * 建队 → 检索并邀请队员 → 满员后在可报名赛事中提交；A 类团队赛要求全体队员均已入围。
  */
 function TeamPlazaSection({ principalId }: { principalId: string }) {
+  const [view, setView] = useState<'board' | 'mine'>('board');
+  return (
+    <Tabs value={view} onValueChange={(value) => setView(value as 'board' | 'mine')}>
+      <TabsList aria-label="组队广场分区">
+        <TabsTrigger value="board">招募广场</TabsTrigger>
+        <TabsTrigger value="mine">我的小队</TabsTrigger>
+      </TabsList>
+      <TabsContent value="board" className="mt-4">
+        <RecruitmentBoard principalId={principalId} />
+      </TabsContent>
+      <TabsContent value="mine" className="mt-4">
+        <MyTeamsSection principalId={principalId} />
+      </TabsContent>
+    </Tabs>
+  );
+}
+
+/** 我的小队：建队、处理邀请、管理队员与招募 */
+function MyTeamsSection({ principalId }: { principalId: string }) {
   const queryClient = useQueryClient();
   const [createOpen, setCreateOpen] = useState(false);
   const [teamName, setTeamName] = useState('');
@@ -1242,6 +1265,7 @@ function TeamPlazaSection({ principalId }: { principalId: string }) {
     void queryClient.invalidateQueries({
       queryKey: ['principal', principalId, 'me', 'team-invites'],
     });
+    void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'team-recruitments'] });
   };
 
   const createMutation = useMutation({
@@ -1406,6 +1430,442 @@ function TeamPlazaSection({ principalId }: { principalId: string }) {
   );
 }
 
+/**
+ * 招募广场：浏览各队招募帖并申请加入（附留言），由队长审批；满员后招募自动关闭。
+ * 手机单列、平板两列、宽屏三列。
+ */
+function RecruitmentBoard({ principalId }: { principalId: string }) {
+  const [keyword, setKeyword] = useState('');
+  const debounced = useDebouncedValue(keyword.trim());
+
+  const boardQuery = usePrivateQuery<TeamRecruitmentDto[], ApiError>(
+    principalId,
+    ['me', 'team-recruitments', debounced],
+    () => competitionsApi.recruitments(debounced),
+  );
+  const requestsQuery = usePrivateQuery<MyJoinRequestDto[], ApiError>(
+    principalId,
+    ['me', 'team-join-requests'],
+    () => competitionsApi.myJoinRequests(),
+  );
+  const recentRequests = (requestsQuery.data ?? []).filter(
+    (request) => request.status !== 'cancelled',
+  ).slice(0, 5);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-sm leading-[22px] text-muted-foreground">
+          各队队长在这里发布招募，申请后等待队长审批；想自己招人，到「我的小队」里发布招募。
+        </p>
+        <div className="relative sm:w-64">
+          <SearchIcon
+            className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <Input
+            value={keyword}
+            onChange={(event) => setKeyword(event.target.value)}
+            placeholder="搜索队名"
+            aria-label="搜索队名"
+            className="pl-9"
+          />
+        </div>
+      </div>
+
+      {recentRequests.length > 0 && (
+        <Card>
+          <CardContent className="flex flex-col gap-2 p-4 sm:p-5">
+            <h2 className="text-sm font-semibold text-foreground">我的入队申请</h2>
+            <ul className="flex flex-col divide-y divide-border">
+              {recentRequests.map((request) => (
+                <MyJoinRequestRow key={request.id} principalId={principalId} request={request} />
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      )}
+
+      <QueryBoundary
+        query={boardQuery}
+        skeleton={
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {[0, 1, 2].map((key) => (
+              <Skeleton key={key} className="h-48 rounded-xl" />
+            ))}
+          </div>
+        }
+        isEmpty={(list) => list.length === 0}
+        emptyNode={
+          <Card>
+            <CardContent className="py-10 text-center text-sm text-muted-foreground">
+              {debounced ? '没有匹配的招募。' : '暂时没有队伍在招募；你可以在「我的小队」建队并发布招募。'}
+            </CardContent>
+          </Card>
+        }
+      >
+        {(list) => (
+          <ul className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {list.map((recruitment) => (
+              <li key={recruitment.id} className="min-w-0">
+                <RecruitmentCard principalId={principalId} recruitment={recruitment} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </QueryBoundary>
+    </div>
+  );
+}
+
+const JOIN_REQUEST_LABELS: Record<MyJoinRequestDto['status'], { label: string; variant: 'warning' | 'success' | 'destructive' | 'neutral' }> = {
+  pending: { label: '待队长审批', variant: 'warning' },
+  approved: { label: '已入队', variant: 'success' },
+  rejected: { label: '未通过', variant: 'destructive' },
+  cancelled: { label: '已撤回', variant: 'neutral' },
+};
+
+function MyJoinRequestRow({ principalId, request }: { principalId: string; request: MyJoinRequestDto }) {
+  const queryClient = useQueryClient();
+  const cancelMutation = useMutation({
+    mutationFn: () => competitionsApi.cancelJoinRequest(request.id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'team-join-requests'] });
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'team-recruitments'] });
+    },
+  });
+  const meta = JOIN_REQUEST_LABELS[request.status];
+  return (
+    <li className="flex flex-wrap items-center justify-between gap-2 py-2">
+      <span className="flex min-w-0 flex-wrap items-center gap-2 text-sm text-foreground">
+        <span className="truncate">{request.team.name}</span>
+        <Badge variant={meta.variant}>{meta.label}</Badge>
+        <span className="text-xs text-muted-foreground tabular-nums">{formatDateTime(request.createdAt)}</span>
+      </span>
+      {request.status === 'pending' && (
+        <Button size="sm" variant="ghost" disabled={cancelMutation.isPending} onClick={() => cancelMutation.mutate()}>
+          撤回
+        </Button>
+      )}
+    </li>
+  );
+}
+
+function RecruitmentCard({ principalId, recruitment }: { principalId: string; recruitment: TeamRecruitmentDto }) {
+  const queryClient = useQueryClient();
+  const [applyOpen, setApplyOpen] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const pending = recruitment.myRequest?.status === 'pending';
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'team-recruitments'] });
+    void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'team-join-requests'] });
+  };
+  const applyMutation = useMutation({
+    mutationFn: () => competitionsApi.applyToTeam(recruitment.teamId, message.trim() || undefined),
+    onSuccess: () => {
+      setError(null);
+      setApplyOpen(false);
+      setMessage('');
+      invalidate();
+    },
+    onError: (cause: ApiError) => setError(cause.message),
+  });
+  const cancelMutation = useMutation({
+    mutationFn: () => competitionsApi.cancelJoinRequest(recruitment.myRequest!.id),
+    onSuccess: invalidate,
+    onError: (cause: ApiError) => setError(cause.message),
+  });
+
+  return (
+    <Card className="h-full">
+      <CardContent className="flex h-full flex-col gap-3 p-4 sm:p-5">
+        <div className="flex items-start justify-between gap-2">
+          <h3 className="min-w-0 truncate text-[15px] font-semibold text-foreground">{recruitment.teamName}</h3>
+          <Badge variant="warning" className="shrink-0 tabular-nums">
+            缺 {recruitment.slotsLeft} 人
+          </Badge>
+        </div>
+        {recruitment.activity && (
+          <Link
+            to={`/app?section=activities&activity=${recruitment.activity.id}`}
+            className="flex min-w-0 items-center gap-1.5 text-xs text-primary hover:underline"
+          >
+            <MegaphoneIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span className="truncate">为「{recruitment.activity.title}」招募</span>
+          </Link>
+        )}
+        <p className="line-clamp-4 text-sm leading-[22px] break-words whitespace-pre-wrap text-foreground/90">
+          {recruitment.description}
+        </p>
+        <ul className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          {recruitment.members.map((member) => (
+            <li key={member.userId} className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+              <MemberAvatar assetId={member.avatarAssetId} name={member.name} size="xs" />
+              <span className="max-w-[8rem] truncate">{member.name}</span>
+              {member.role === 'captain' && <span className="text-primary">队长</span>}
+            </li>
+          ))}
+          {Array.from({ length: recruitment.slotsLeft }, (_, index) => (
+            <li
+              key={`slot-${index}`}
+              aria-label="空缺位置"
+              className="size-6 rounded-full border border-dashed border-muted-foreground/40"
+            />
+          ))}
+        </ul>
+
+        {error && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {applyOpen && (
+          <form
+            className="flex flex-col gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              applyMutation.mutate();
+            }}
+          >
+            <Label htmlFor={`apply-${recruitment.id}`}>给队长的留言（可选）</Label>
+            <Textarea
+              id={`apply-${recruitment.id}`}
+              value={message}
+              onChange={(event) => setMessage(event.target.value)}
+              rows={3}
+              maxLength={500}
+              placeholder="比如擅长的方向、能投入的时间"
+            />
+            <div className="flex gap-2">
+              <Button type="submit" size="sm" disabled={applyMutation.isPending}>
+                {applyMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+                提交申请
+              </Button>
+              <Button type="button" size="sm" variant="ghost" onClick={() => setApplyOpen(false)}>
+                取消
+              </Button>
+            </div>
+          </form>
+        )}
+
+        <div className="mt-auto flex items-center justify-between gap-2 border-t border-border/60 pt-3">
+          <span className="text-xs text-muted-foreground tabular-nums">
+            {recruitment.teamSize} 人队 · 更新于 {formatDateTime(recruitment.updatedAt)}
+          </span>
+          {recruitment.isMember ? (
+            <Badge variant="info">你在本队</Badge>
+          ) : pending ? (
+            <Button size="sm" variant="outline" disabled={cancelMutation.isPending} onClick={() => cancelMutation.mutate()}>
+              已申请 · 撤回
+            </Button>
+          ) : (
+            !applyOpen && (
+              <Button size="sm" onClick={() => setApplyOpen(true)}>
+                申请加入
+              </Button>
+            )
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/** 队长发布/编辑/关闭招募；可关联一个人数相同的团队活动 */
+function RecruitmentEditor({
+  principalId,
+  team,
+  onChanged,
+}: {
+  principalId: string;
+  team: TeamDto;
+  onChanged: () => void;
+}) {
+  const recruitment = team.recruitment;
+  const isOpen = recruitment?.status === 'open';
+  const [editing, setEditing] = useState(false);
+  const [description, setDescription] = useState(recruitment?.description ?? '');
+  const [activityId, setActivityId] = useState(recruitment?.activityId ?? 'none');
+  const [error, setError] = useState<string | null>(null);
+
+  const activitiesQuery = usePrivateQuery<{ items: Array<{ id: string; title: string; teamSize: number | null }> }, ApiError>(
+    principalId,
+    ['activities', 'list', 'open-team', team.teamSize],
+    async () => (await api.get<{ items: Array<{ id: string; title: string; teamSize: number | null }> }>('/activities?tab=open')).data,
+    { enabled: editing },
+  );
+  const teamActivities = (activitiesQuery.data?.items ?? []).filter((item) => item.teamSize === team.teamSize);
+
+  const saveMutation = useMutation({
+    mutationFn: () =>
+      competitionsApi.upsertRecruitment(team.id, {
+        description: description.trim(),
+        activityId: activityId === 'none' ? null : activityId,
+      }),
+    onSuccess: () => {
+      setError(null);
+      setEditing(false);
+      onChanged();
+    },
+    onError: (cause: ApiError) => setError(cause.message),
+  });
+  const closeMutation = useMutation({
+    mutationFn: () => competitionsApi.closeRecruitment(team.id),
+    onSuccess: () => {
+      setError(null);
+      onChanged();
+    },
+    onError: (cause: ApiError) => setError(cause.message),
+  });
+
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border border-border bg-muted/30 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="flex items-center gap-2 text-xs font-medium text-foreground">
+          <MegaphoneIcon className="size-3.5" aria-hidden="true" />
+          广场招募
+          <Badge variant={isOpen ? 'success' : 'neutral'}>{isOpen ? '招募中' : '未招募'}</Badge>
+        </p>
+        {!editing && (
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setDescription(recruitment?.description ?? '');
+                setActivityId(recruitment?.activityId ?? 'none');
+                setEditing(true);
+              }}
+            >
+              {isOpen ? '编辑招募' : '发布招募'}
+            </Button>
+            {isOpen && (
+              <Button size="sm" variant="ghost" disabled={closeMutation.isPending} onClick={() => closeMutation.mutate()}>
+                关闭招募
+              </Button>
+            )}
+          </div>
+        )}
+      </div>
+      {isOpen && !editing && recruitment && (
+        <p className="line-clamp-3 text-xs leading-5 break-words whitespace-pre-wrap text-muted-foreground">
+          {recruitment.activity ? `为「${recruitment.activity.title}」招募 · ` : ''}
+          {recruitment.description}
+        </p>
+      )}
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+      {editing && (
+        <form
+          className="flex flex-col gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            saveMutation.mutate();
+          }}
+        >
+          <Label htmlFor={`recruit-${team.id}`}>招募说明（至少 5 字）</Label>
+          <Textarea
+            id={`recruit-${team.id}`}
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            rows={3}
+            maxLength={1000}
+            placeholder="想找什么方向的队友、训练节奏、目标比赛等"
+          />
+          <Label htmlFor={`recruit-activity-${team.id}`}>关联团队活动（可选）</Label>
+          <Select value={activityId} onValueChange={setActivityId}>
+            <SelectTrigger id={`recruit-activity-${team.id}`} className="w-full">
+              <SelectValue placeholder="不关联" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">不关联</SelectItem>
+              {teamActivities.map((item) => (
+                <SelectItem key={item.id} value={item.id}>
+                  {item.title}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <div className="flex gap-2">
+            <Button type="submit" size="sm" disabled={saveMutation.isPending || description.trim().length < 5}>
+              {saveMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+              {isOpen ? '保存' : '发布到广场'}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setEditing(false)}>
+              取消
+            </Button>
+          </div>
+        </form>
+      )}
+    </div>
+  );
+}
+
+/** 待处理的入队申请：全队可见，队长审批 */
+function JoinRequestsList({ team, isCaptain, onChanged }: { team: TeamDto; isCaptain: boolean; onChanged: () => void }) {
+  const [error, setError] = useState<string | null>(null);
+  const decideMutation = useMutation({
+    mutationFn: (input: { requestId: string; decision: 'approve' | 'reject' }) =>
+      competitionsApi.decideJoinRequest(input.requestId, input.decision),
+    onSuccess: () => {
+      setError(null);
+      onChanged();
+    },
+    onError: (cause: ApiError) => setError(cause.message),
+  });
+  if (team.joinRequests.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1 border-t border-border pt-3">
+      <p className="text-xs font-medium text-foreground">入队申请（{team.joinRequests.length}）</p>
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+      <ul className="flex flex-col divide-y divide-border">
+        {team.joinRequests.map((request) => (
+          <li key={request.id} className="flex flex-col gap-2 py-2 sm:flex-row sm:items-center">
+            <div className="flex min-w-0 flex-1 items-start gap-2">
+              <MemberAvatar assetId={memberAvatarId(request.user)} name={memberName(request.user)} size="sm" />
+              <div className="min-w-0">
+                <p className="truncate text-sm text-foreground">{memberName(request.user)}</p>
+                <p className="text-xs break-words text-muted-foreground">
+                  {request.message ? request.message : '（无留言）'} · {formatDateTime(request.createdAt)}
+                </p>
+              </div>
+            </div>
+            {isCaptain && (
+              <div className="flex gap-2 sm:shrink-0">
+                <Button
+                  size="sm"
+                  disabled={decideMutation.isPending}
+                  onClick={() => decideMutation.mutate({ requestId: request.id, decision: 'approve' })}
+                >
+                  同意
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={decideMutation.isPending}
+                  onClick={() => decideMutation.mutate({ requestId: request.id, decision: 'reject' })}
+                >
+                  拒绝
+                </Button>
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function TeamCard({
   principalId,
   team,
@@ -1493,6 +1953,12 @@ function TeamCard({
             }}
           />
         )}
+
+        {isCaptain && team.status === 'forming' && (!isFull || team.recruitment?.status === 'open') && (
+          <RecruitmentEditor principalId={principalId} team={team} onChanged={onChanged} />
+        )}
+
+        <JoinRequestsList team={team} isCaptain={isCaptain} onChanged={onChanged} />
 
         {team.entries.length > 0 && (
           <div className="flex flex-col gap-1 border-t border-border pt-3">

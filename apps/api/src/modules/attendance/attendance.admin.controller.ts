@@ -236,7 +236,28 @@ export class AttendanceAdminController {
     return ok({ corrected: true })
   }
 
-  /** 请假审批 */
+  /** 请假申请队列（待审批优先，其次按提交时间倒序） */
+  @Get('activities/:id/leave-requests')
+  @RequireAction('attendance.review')
+  async leaveRequests(@Param('id', ParseUUIDPipe) id: string) {
+    const rows = await this.db.leaveRequest.findMany({
+      where: { activityId: id },
+      orderBy: { createdAt: 'desc' },
+      include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } } } },
+    })
+    const rank = (status: string) => (status === 'pending' ? 0 : 1)
+    return ok(rows.sort((a, b) => rank(a.status) - rank(b.status)).map((row) => ({
+      id: row.id,
+      reason: row.reason,
+      status: row.status,
+      reviewNote: row.reviewNote,
+      reviewedAt: row.reviewedAt?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+      user: row.user,
+    })))
+  }
+
+  /** 请假审批（可改判：驳回已批准的请假会撤回对应的 leave_approved 出勤结果） */
   @Post('leave-requests/:id/decision')
   @RequireAction('attendance.review')
   async leaveDecision(
@@ -247,17 +268,35 @@ export class AttendanceAdminController {
     const parsed = z.object({ decision: z.enum(['approve', 'reject']), note: z.string().max(500).optional() }).parse(body)
     const leave = await this.db.leaveRequest.findUnique({ where: { id }, include: { user: true } })
     if (!leave) throw new AttendanceError('请假申请不存在', 'NOT_FOUND')
-    await this.db.leaveRequest.update({
-      where: { id },
-      data: { status: parsed.decision === 'approve' ? 'approved' : 'rejected', reviewedBy: actor.principalId, reviewedAt: new Date(), reviewNote: parsed.note },
-    })
-    if (parsed.decision === 'approve') {
-      await this.db.attendanceAttendanceResult.upsert({
-        where: { activityId_userId: { activityId: leave.activityId, userId: leave.userId } },
-        create: { id: newId(), activityId: leave.activityId, userId: leave.userId, status: 'leave_approved', decidedBy: actor.principalId },
-        update: { status: 'leave_approved', decidedBy: actor.principalId, revision: { increment: 1 } },
+    await this.db.$transaction(async (tx) => {
+      await tx.leaveRequest.update({
+        where: { id },
+        data: { status: parsed.decision === 'approve' ? 'approved' : 'rejected', reviewedBy: actor.principalId, reviewedAt: new Date(), reviewNote: parsed.note },
       })
-    }
+      const resultKey = { activityId_userId: { activityId: leave.activityId, userId: leave.userId } }
+      if (parsed.decision === 'approve') {
+        await tx.attendanceAttendanceResult.upsert({
+          where: resultKey,
+          create: { id: newId(), activityId: leave.activityId, userId: leave.userId, status: 'leave_approved', decidedBy: actor.principalId },
+          update: { status: 'leave_approved', decidedBy: actor.principalId, revision: { increment: 1 } },
+        })
+      } else {
+        const result = await tx.attendanceAttendanceResult.findUnique({ where: resultKey, select: { status: true } })
+        if (result?.status === 'leave_approved') {
+          await tx.attendanceAttendanceResult.update({
+            where: resultKey,
+            data: { status: 'pending_review', decidedBy: actor.principalId, revision: { increment: 1 } },
+          })
+        }
+      }
+    })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: `leave.${parsed.decision}`,
+      resourceType: 'leave_request',
+      resourceId: id,
+      summary: `${parsed.decision === 'approve' ? '批准' : '驳回'}请假：${leave.user.verifiedRealName}${parsed.note ? `（${parsed.note.slice(0, 200)}）` : ''}`,
+    })
     return ok({ decided: parsed.decision })
   }
 

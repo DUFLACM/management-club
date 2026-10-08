@@ -320,6 +320,45 @@ export interface TeamDto {
     reviewNote: string | null;
     event: { id: string; title: string; status: string };
   }>;
+  recruitment: {
+    id: string;
+    description: string;
+    status: 'open' | 'closed';
+    activityId: string | null;
+    activity: { id: string; title: string } | null;
+    updatedAt: string;
+  } | null;
+  joinRequests: Array<{
+    id: string;
+    userId: string;
+    message: string | null;
+    createdAt: string;
+    user: NonNullable<TeamMemberDto['user']>;
+  }>;
+}
+
+/** 招募广场里的一条招募帖 */
+export interface TeamRecruitmentDto {
+  id: string;
+  teamId: string;
+  teamName: string;
+  teamSize: number;
+  description: string;
+  updatedAt: string;
+  activity: { id: string; title: string; startAt: string } | null;
+  slotsLeft: number;
+  members: Array<{ userId: string; role: string; name: string; avatarAssetId: string | null }>;
+  isMember: boolean;
+  myRequest: { id: string; status: string } | null;
+}
+
+export interface MyJoinRequestDto {
+  id: string;
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  message: string | null;
+  createdAt: string;
+  decidedAt: string | null;
+  team: { id: string; name: string; teamSize: number };
 }
 
 export interface TeamInviteDto {
@@ -423,6 +462,28 @@ export const competitionsApi = {
   },
   async leaveTeam(teamId: string) {
     await api.post(`/me/teams/${teamId}/leave`);
+  },
+  async recruitments(q?: string) {
+    const suffix = q?.trim() ? `?q=${encodeURIComponent(q.trim())}` : '';
+    return (await api.get<TeamRecruitmentDto[]>(`/me/team-recruitments${suffix}`)).data;
+  },
+  async upsertRecruitment(teamId: string, body: { description: string; activityId?: string | null }) {
+    return (await api.post<{ recruitmentId: string }>(`/me/teams/${teamId}/recruitment`, body)).data;
+  },
+  async closeRecruitment(teamId: string) {
+    await api.post(`/me/teams/${teamId}/recruitment/close`);
+  },
+  async applyToTeam(teamId: string, message?: string) {
+    return (await api.post<{ requestId: string }>(`/me/teams/${teamId}/join-requests`, message ? { message } : {})).data;
+  },
+  async myJoinRequests() {
+    return (await api.get<MyJoinRequestDto[]>('/me/team-join-requests')).data;
+  },
+  async cancelJoinRequest(requestId: string) {
+    await api.post(`/me/team-join-requests/${requestId}/cancel`);
+  },
+  async decideJoinRequest(requestId: string, decision: 'approve' | 'reject') {
+    await api.post(`/me/team-join-requests/${requestId}/decision`, { decision });
   },
   async eligibleEvents(teamId: string) {
     return (await api.get<EligibleEventDto[]>(`/me/teams/${teamId}/eligible-events`)).data;

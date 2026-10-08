@@ -25,6 +25,8 @@ const db = {
   pointsLedgerEntry: { findMany: vi.fn().mockResolvedValue([]) },
   // 讲题满意度区块：无获批讲题时提前返回，不再读取出勤口径
   lectureRequest: { findMany: vi.fn().mockResolvedValue([]) },
+  // 签到墙
+  attendanceCheckpoint: { count: vi.fn().mockResolvedValue(0), findMany: vi.fn().mockResolvedValue([]) },
   $executeRaw: vi.fn(),
   $transaction: async (callback: (tx: unknown) => unknown) => callback(db),
 }

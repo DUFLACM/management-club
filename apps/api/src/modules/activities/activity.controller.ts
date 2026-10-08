@@ -130,6 +130,14 @@ export class ActivityUserController {
     return ok(await this.activities.register(user.userId, id, idempotencyKey))
   }
 
+  /** 团队活动：队长以小队报名 */
+  @Post('activities/:id/team-registrations')
+  async registerTeam(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ teamId: z.string().uuid() }).safeParse(body)
+    if (!parsed.success) throw new ActivityError('请选择要报名的小队', 'INVALID_INPUT')
+    return ok(await this.activities.registerTeam(user.userId, id, parsed.data.teamId))
+  }
+
   @Delete('activities/:id/registrations/me')
   async cancelReg(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
     const { reason } = z.object({ reason: z.string().max(300).optional() }).parse(body ?? {})
@@ -250,21 +258,21 @@ export class ActivityAdminController {
     return ok({ published: true })
   }
 
-  /** 删除草稿活动（无任何业务数据；已发布活动走取消/归档） */
+  /** 删除活动（任意状态，连同全部关联记录；已入账积分不受影响） */
   @Delete(':id')
   @RequireAction('activity.manage')
   async remove(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
-    await this.activities.deleteDraft(actor, id)
+    await this.activities.deleteActivity(actor, id)
     return ok({ deleted: true })
   }
 
-  /** 批量删除草稿（逐项校验，失败项跳过并返回原因） */
+  /** 批量删除活动（逐项删除，失败项跳过并返回原因） */
   @Post('batch-delete')
   @RequireAction('activity.manage')
   async batchRemove(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
     const parsed = z.object({ activityIds: z.array(z.string().uuid()).min(1).max(100) }).safeParse(body)
     if (!parsed.success) throw new ActivityError(parsed.error.issues[0].message, 'INVALID_INPUT')
-    return ok(await this.activities.batchDeleteDrafts(actor, parsed.data.activityIds))
+    return ok(await this.activities.batchDeleteActivities(actor, parsed.data.activityIds))
   }
 
   @Post(':id/required-participants')
@@ -315,7 +323,7 @@ export class ActivityAdminController {
     })
     const registrations = await this.db.activityRegistration.findMany({
       where: { activityId: id },
-      include: { user: { select: { id: true, verifiedRealName: true, studentNo: true } } },
+      include: { user: { select: { id: true, verifiedRealName: true, studentNo: true } }, team: { select: { name: true } } },
     })
     const checkpoints = await this.db.attendanceCheckpoint.findMany({ where: { activityId: id } })
     const results = await this.db.attendanceAttendanceResult.findMany({ where: { activityId: id } })
@@ -335,6 +343,7 @@ export class ActivityAdminController {
       checkout: cpByUser.get(`${row.userId}:OUT`)?.acceptedAt.toISOString() ?? null,
       resultStatus: resultByUser.get(row.userId)?.status ?? null,
       leave: leaveByUser.get(row.userId)?.status ?? null,
+      teamName: registrationByUser.get(row.userId)?.team?.name ?? null,
     }))
     const filtered = group === 'not_checked_in' ? withStatus.filter((r) => !r.checkin) : withStatus
     return ok({

@@ -4,6 +4,8 @@ import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { ActivityService } from '../../modules/activities/activity.service.js'
 import { ActivityAdminController, ActivityUserController } from '../../modules/activities/activity.controller.js'
 import { AttendanceService } from '../../modules/attendance/attendance.service.js'
+import { AttendanceAdminController } from '../../modules/attendance/attendance.admin.controller.js'
+import { TeamService } from '../../modules/competitions/team.service.js'
 import type { ContestStandingsService } from '../../modules/activities/contest-standings.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
@@ -132,7 +134,7 @@ afterAll(async () => {
   await db.$disconnect()
 })
 
-async function createPublishedActivity(opts: { capacity: number; waitlist?: number; managerActor?: ReturnType<typeof makeActor> }): Promise<string> {
+async function createPublishedActivity(opts: { capacity: number; waitlist?: number; teamSize?: number; managerActor?: ReturnType<typeof makeActor> }): Promise<string> {
   const manager = opts.managerActor ?? makeActor()
   const verifier = makeActor()
   const { versionId } = await createApprovedVenue(venueService, manager, verifier, { name: `测试地点-${crypto.randomUUID().slice(0, 6)}` })
@@ -146,6 +148,7 @@ async function createPublishedActivity(opts: { capacity: number; waitlist?: numb
     cancelDeadline: minutesFromNow(10).toISOString(),
     capacity: opts.capacity,
     waitlistCapacity: opts.waitlist ?? 0,
+    teamSize: opts.teamSize ?? null,
     venueVersionIds: [versionId],
     primaryVenueVersionId: versionId,
     attendancePolicy: {
@@ -392,5 +395,120 @@ describe('讲题申请、活动材料与平台榜单', () => {
     expect(result.problems.find((problem) => problem.index === 'B')?.clubSolved).toBe(1)
     expect(result.totalEntries).toBe(3)
     expect((result as { entries?: unknown }).entries).toBeUndefined()
+  })
+})
+
+describe('请假审批与活动删除', () => {
+  it('请假队列可列出并审批；驳回已批准的请假会撤回请假出勤结果', async () => {
+    const activityId = await createPublishedActivity({ capacity: 5 })
+    const u = await createTestUser(db, { studentNo: '202604001' })
+    await activities.requestLeave(u.userId, activityId, '课程冲突')
+    const audit = new AuditService(db)
+    const controller = new AttendanceAdminController(new AttendanceService(db, audit), db, audit)
+    const actor = makeActor()
+    const list = await controller.leaveRequests(activityId)
+    expect(list.data).toHaveLength(1)
+    expect(list.data[0]).toMatchObject({ status: 'pending', reason: '课程冲突', user: { id: u.userId } })
+    const resultKey = { activityId_userId: { activityId, userId: u.userId } }
+    await controller.leaveDecision(actor, list.data[0].id, { decision: 'approve' })
+    expect(await db.attendanceAttendanceResult.findUnique({ where: resultKey })).toMatchObject({ status: 'leave_approved' })
+    await controller.leaveDecision(actor, list.data[0].id, { decision: 'reject' })
+    expect(await db.leaveRequest.findUnique({ where: resultKey })).toMatchObject({ status: 'rejected' })
+    expect(await db.attendanceAttendanceResult.findUnique({ where: resultKey })).toMatchObject({ status: 'pending_review' })
+  })
+
+  it('已发布且有报名/请假/出勤数据的活动也能删除，关联记录一并清除', async () => {
+    const activityId = await createPublishedActivity({ capacity: 5 })
+    const a = await createTestUser(db, { studentNo: '202604002' })
+    const b = await createTestUser(db, { studentNo: '202604003' })
+    await activities.register(a.userId, activityId)
+    await activities.cancelRegistration(a.userId, activityId)
+    await activities.register(b.userId, activityId)
+    await activities.requestLeave(a.userId, activityId, '生病请假')
+    await db.attendanceAttendanceResult.create({ data: { id: crypto.randomUUID(), activityId, userId: b.userId, status: 'ontime', decidedBy: crypto.randomUUID() } })
+    await activities.deleteActivity(makeActor(), activityId)
+    expect(await db.activity.count({ where: { id: activityId } })).toBe(0)
+    expect(await db.activityRegistration.count({ where: { activityId } })).toBe(0)
+    expect(await db.leaveRequest.count({ where: { activityId } })).toBe(0)
+    expect(await db.attendanceAttendanceResult.count({ where: { activityId } })).toBe(0)
+    expect(await db.attendancePolicy.count({ where: { activityId } })).toBe(0)
+  })
+})
+
+describe('团队报名、签到墙与广场招募', () => {
+  async function makeTeam(prefix: string, size: number) {
+    const teams = new TeamService(db, new AuditService(db))
+    const users = []
+    for (let i = 0; i < size; i++) users.push(await createTestUser(db, { studentNo: `${prefix}${i}` }))
+    const { teamId } = await teams.createTeam(users[0].userId, { name: `队伍${prefix}`, teamSize: size })
+    for (const u of users.slice(1)) await db.teamMember.create({ data: { id: crypto.randomUUID(), teamId, userId: u.userId, role: 'member' } })
+    return { teams, teamId, users }
+  }
+
+  it('团队活动只能由队长整队报名；容量按队计，候补整队递补，非队长不能取消', async () => {
+    const activityId = await createPublishedActivity({ capacity: 1, waitlist: 1, teamSize: 2 })
+    const a = await makeTeam('2026050', 2)
+    const b = await makeTeam('2026051', 2)
+    await expect(activities.register(a.users[0].userId, activityId)).rejects.toMatchObject({ code: 'TEAM_ACTIVITY' })
+    await expect(activities.registerTeam(a.users[1].userId, activityId, a.teamId)).rejects.toMatchObject({ code: 'NOT_CAPTAIN' })
+
+    expect(await activities.registerTeam(a.users[0].userId, activityId, a.teamId)).toMatchObject({ status: 'enrolled' })
+    expect(await db.activityRegistration.count({ where: { activityId, teamId: a.teamId, status: 'enrolled' } })).toBe(2)
+    // 幂等
+    expect(await activities.registerTeam(a.users[0].userId, activityId, a.teamId)).toMatchObject({ status: 'enrolled' })
+    expect(await activities.registerTeam(b.users[0].userId, activityId, b.teamId)).toMatchObject({ status: 'waitlisted', waitlistSeq: 1 })
+
+    const card = (await activities.listForUser(a.users[0].userId, {})).items.find((item) => item.id === activityId)!
+    expect(card).toMatchObject({ teamSize: 2, enrolledCount: 1 })
+
+    await expect(activities.cancelRegistration(a.users[1].userId, activityId)).rejects.toMatchObject({ code: 'NOT_CAPTAIN' })
+    expect(await activities.cancelRegistration(a.users[0].userId, activityId)).toMatchObject({ promoted: 'enrolled' })
+    expect(await db.activityRegistration.count({ where: { activityId, teamId: a.teamId, status: 'cancelled' } })).toBe(2)
+    expect(await db.activityRegistration.count({ where: { activityId, teamId: b.teamId, status: 'enrolled' } })).toBe(2)
+
+    const detail = (await activities.detailForUser(b.users[1].userId, activityId)) as unknown as { team: unknown }
+    expect(detail.team).toMatchObject({ teamSize: 2, enrolledTeams: 1, myTeam: { id: b.teamId } })
+  })
+
+  it('人数不符或队员已单独报名时拒绝团队报名', async () => {
+    const activityId = await createPublishedActivity({ capacity: 5, teamSize: 3 })
+    const t = await makeTeam('2026052', 2)
+    await expect(activities.registerTeam(t.users[0].userId, activityId, t.teamId)).rejects.toMatchObject({ code: 'TEAM_SIZE_MISMATCH' })
+  })
+
+  it('详情返回签到墙（遵循头像可见性）', async () => {
+    const activityId = await createPublishedActivity({ capacity: 5 })
+    const u = await createTestUser(db, { studentNo: '202605300' })
+    const viewer = await createTestUser(db, { studentNo: '202605301' })
+    await db.userProfile.update({ where: { userId: u.userId }, data: { displayName: '签到者', avatarAssetId: crypto.randomUUID(), visibility: 'self_only' } })
+    await db.attendanceCheckpoint.create({ data: { id: crypto.randomUUID(), activityId, userId: u.userId, checkpoint: 'IN', method: 'QR', acceptedAt: new Date() } })
+    const detail = (await activities.detailForUser(viewer.userId, activityId)) as unknown as {
+      checkedIn: { total: number; people: Array<{ userId: string; avatarAssetId: string | null }> }
+    }
+    expect(detail.checkedIn.total).toBe(1)
+    expect(detail.checkedIn.people[0]).toMatchObject({ userId: u.userId, avatarAssetId: null })
+  })
+
+  it('广场招募：申请 → 队长审批入队，满员自动关闭招募并驳回其余申请', async () => {
+    const { teams, teamId, users } = await makeTeam('2026054', 1)
+    await db.team.update({ where: { id: teamId }, data: { teamSize: 2 } })
+    const x = await createTestUser(db, { studentNo: '202605490' })
+    const y = await createTestUser(db, { studentNo: '202605491' })
+    await expect(teams.applyToTeam(x.userId, teamId)).rejects.toMatchObject({ code: 'NOT_RECRUITING' })
+    await expect(teams.upsertRecruitment(x.userId, teamId, { description: '招一名图论选手' })).rejects.toMatchObject({ code: 'NOT_CAPTAIN' })
+    await teams.upsertRecruitment(users[0].userId, teamId, { description: '招一名图论选手' })
+    const board = await teams.listRecruitments(x.userId)
+    expect(board.find((row) => row.teamId === teamId)).toMatchObject({ slotsLeft: 1, myRequest: null })
+
+    const { requestId } = await teams.applyToTeam(x.userId, teamId, '我会网络流')
+    expect(await teams.applyToTeam(x.userId, teamId)).toEqual({ requestId })
+    const { requestId: other } = await teams.applyToTeam(y.userId, teamId)
+    await expect(teams.decideJoinRequest(x.userId, requestId, 'approve')).rejects.toMatchObject({ code: 'NOT_CAPTAIN' })
+    await teams.decideJoinRequest(users[0].userId, requestId, 'approve')
+
+    expect(await db.teamMember.count({ where: { teamId, status: 'active' } })).toBe(2)
+    expect(await db.teamRecruitment.findUnique({ where: { teamId } })).toMatchObject({ status: 'closed' })
+    expect(await db.teamJoinRequest.findUnique({ where: { id: other } })).toMatchObject({ status: 'rejected' })
+    expect((await teams.listRecruitments(y.userId)).some((row) => row.teamId === teamId)).toBe(false)
   })
 })
