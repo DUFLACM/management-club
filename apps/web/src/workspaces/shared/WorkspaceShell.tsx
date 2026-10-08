@@ -195,7 +195,7 @@ function SidebarNavItem({
  * 本地管理员回 /admin/login；校园账号走 CAS 联动登出（共用机器上必须把 CAS 会话也断掉）。
  * 接口失败也照常清本地状态并跳走——用户的意图是离开，不能把人卡在已登录界面。
  */
-async function performLogout(principalKind: string | null): Promise<void> {
+export async function performLogout(principalKind: string | null): Promise<void> {
   let casLogoutUrl: string | null = null;
   try {
     const { data } = await api.post<{ casLogoutUrl?: string }>('/auth/logout', {});

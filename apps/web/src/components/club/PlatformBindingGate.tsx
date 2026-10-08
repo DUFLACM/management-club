@@ -1,0 +1,80 @@
+import type { ReactNode } from 'react';
+import { LinkIcon, LoaderCircleIcon } from 'lucide-react';
+
+import { api, type ApiError } from '@/lib/api';
+import { usePrivateQuery } from '@/lib/query';
+import type { CsrfSession } from '@/lib/session';
+import { ErrorState } from '@/components/club/ErrorState';
+import { BindForm, BindingGuide, useBindPlatformAccount } from '@/components/club/BindPlatformAccountDialog';
+import { performLogout } from '@/workspaces/shared/WorkspaceShell';
+
+/**
+ * 登录绑定门：校园账号（学生）登录后若没有任何未解绑的平台账号（牛客 / Codeforces / AtCoder），
+ * 整个工作台替换为绑定页（默认展开教程），只能提交绑定或退出登录。
+ * 提交后状态为待核验即可放行——历史成绩导入与平台赛计分都按绑定账号自动匹配。
+ * 教职工与本地管理员没有平台账号，不拦截。
+ */
+export function PlatformBindingGate({ principal, children }: { principal: CsrfSession; children: ReactNode }) {
+  const isStudent = principal.principalKind === 'student' && principal.userId != null;
+  const accountsQuery = usePrivateQuery<Array<{ id: string }>, ApiError>(
+    principal.principalId,
+    ['me', 'platform-accounts'],
+    async () => (await api.get<Array<{ id: string }>>('/me/platform-accounts')).data,
+    { enabled: isStudent },
+  );
+
+  if (!isStudent) return <>{children}</>;
+
+  if (accountsQuery.isPending) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-background px-4 text-sm text-muted-foreground" role="status">
+        <LoaderCircleIcon className="mr-2 animate-spin" aria-hidden="true" />
+        正在检查平台账号绑定…
+      </div>
+    );
+  }
+
+  if (accountsQuery.isError) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-background px-4">
+        <ErrorState
+          title="无法检查平台账号绑定"
+          description={accountsQuery.error.message}
+          onRetry={() => void accountsQuery.refetch()}
+          retrying={accountsQuery.isFetching}
+        />
+      </div>
+    );
+  }
+
+  if (accountsQuery.data.length > 0) return <>{children}</>;
+
+  return <BindingRequired principalId={principal.principalId!} principalKind={principal.principalKind} />;
+}
+
+function BindingRequired({ principalId, principalKind }: { principalId: string; principalKind: string | null }) {
+  const mutation = useBindPlatformAccount(principalId);
+  return (
+    <main className="flex min-h-dvh justify-center bg-background px-4 py-8 sm:py-14">
+      <div className="flex w-full max-w-lg flex-col gap-5">
+        <header className="flex flex-col gap-2">
+          <span className="flex size-10 items-center justify-center rounded-xl bg-primary/10 text-primary">
+            <LinkIcon className="size-5" aria-hidden="true" />
+          </span>
+          <h1 className="text-xl font-semibold text-foreground">先绑定平台账号</h1>
+          <p className="text-sm text-muted-foreground">
+            比赛成绩和历史积分都按绑定的平台账号自动计分，绑定后才能进入系统。牛客、Codeforces、AtCoder 任选其一即可，其余平台以后可在「竞赛」页补绑。
+          </p>
+        </header>
+        <BindingGuide defaultOpen />
+        <BindForm
+          submitting={mutation.isPending}
+          onSubmit={(input) => mutation.mutate(input)}
+          onCancel={() => void performLogout(principalKind)}
+          cancelLabel="退出登录"
+          error={mutation.isError ? (mutation.error as ApiError).message : null}
+        />
+      </div>
+    </main>
+  );
+}

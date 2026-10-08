@@ -2,7 +2,7 @@
  * 管理端 · 历史积分导入（points.review），全部基于 Excel 模板：
  * 1. 下载模板 → 填写 → 上传，本地校验格式；参与分留空按活动类型默认，加分项从固定选项里选；
  * 2. POST /admin/history-import/excel/preview：核对学号；表格里填了平台 + 比赛场次的行，
- *    抓取这些比赛的榜单、按表格里的平台账号查成绩，积分留空的按 W 公式计算，比赛名称 / 日期留空的用平台数据补全；
+ *    抓取这些比赛的榜单、按平台账号查成绩（表格留空则用成员在系统绑定的账号），积分留空的按 W 公式计算，比赛名称 / 日期留空的用平台数据补全；
  * 3. POST /admin/history-import/excel 入账：按活动建归档存档（同一场平台比赛归为一个活动），成员端活动详情与流水可见。
  */
 import { useState, type ReactNode } from 'react';
@@ -45,6 +45,8 @@ interface PreviewRow extends HistoryImportRow {
   memberName: string | null;
   /** 参与分来源：表格手填 / 按活动类型默认 / 按榜单 W 公式 */
   amountSource?: 'sheet' | 'default' | 'formula';
+  /** 平台账号来源：表格手填 / 成员在系统绑定的账号 */
+  handleSource?: 'sheet' | 'bound';
   /** 加分来源：表格手填 / 加分项标准分 */
   bonusSource?: 'sheet' | 'standard';
   contestStartAt?: string;
@@ -272,7 +274,7 @@ export function HistoryImportDialog({
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              普通行必填：学号、活动名称、活动日期、活动类型（参与分留空按类型给默认分）。平台比赛行填「平台 + 比赛场次 + 平台账号」，比赛分 / 名称 / 日期由系统补全。
+              普通行必填：学号、活动名称、活动日期、活动类型（参与分留空按类型给默认分）。平台比赛行填「平台 + 比赛场次」即可，平台账号留空自动用成员在系统绑定的账号，比赛分 / 名称 / 日期由系统补全。
               加分项可选：{HISTORY_BONUS_ITEMS.map((item) => `${item.label}${item.amount != null ? ` +${item.amount}` : ''}`).join('、')}。模板里有逐列说明。
             </p>
 
@@ -442,6 +444,7 @@ function PreviewTable({ rows }: { rows: PreviewRow[] }) {
                       <span className="block text-foreground">{platformLabel(row.platform)} {row.contestId}</span>
                       <span className="block">
                         {row.handle ?? '—'}
+                        {row.handleSource === 'bound' && <SourceTag>绑定</SourceTag>}
                         {row.computed && ` · 第 ${row.computed.platformRank ?? '—'} 名 · 过 ${row.computed.solvedCount} 题`}
                       </span>
                     </>

@@ -1045,12 +1045,26 @@ function EvaluationDialog({
   );
 }
 
-const IMPORT_HEADER_ALIASES: Record<string, 'studentNo' | 'realName' | 'grade' | 'phone'> = {
+const IMPORT_HEADER_ALIASES: Record<string, 'studentNo' | 'realName' | 'grade' | 'phone' | 'rank' | 'status'> = {
   学号: 'studentNo', studentno: 'studentNo', student_no: 'studentNo',
   姓名: 'realName', 真实姓名: 'realName', realname: 'realName', real_name: 'realName', name: 'realName',
   年级: 'grade', grade: 'grade',
   手机: 'phone', 电话: 'phone', 手机号: 'phone', phone: 'phone',
+  名次: 'rank', 录取名次: 'rank', 排名: 'rank', 序号: 'rank', rank: 'rank',
+  身份: 'status', 成员身份: 'status', 成员状态: 'status', status: 'status',
 };
+
+/** 「身份」列取值 → 成员状态（留空用弹窗里选的默认身份） */
+const IMPORT_STATUS_ALIASES: Record<string, string> = {
+  ...Object.fromEntries(STATUS_OPTIONS.flatMap((option) => [[option.label, option.value], [option.value, option.value]])),
+  正式社员: 'formal', 正式: 'formal', 预备社员: 'provisional', 预备: 'provisional', 考察社员: 'observing', 考察: 'observing',
+};
+
+/** 入社基础分（成员管理办法第八条，与服务端 initialPoints 一致，仅用于预览）：I = 18 + 12 × (1 - (r-1)/max(1, m-1))，仅一人时 30 */
+function admissionInitialPoints(rank: number, total: number): number {
+  if (total <= 1) return 30;
+  return 18 + 12 * (1 - (rank - 1) / (total - 1));
+}
 
 interface ImportMemberRow {
   row: number;
@@ -1058,6 +1072,10 @@ interface ImportMemberRow {
   realName: string;
   grade?: number;
   phone?: string;
+  /** 本批次录取名次 r：填了即自动记入社基础分 */
+  rank?: number;
+  /** 「身份」列解析出的成员状态；留空用弹窗默认身份 */
+  membershipStatus?: string;
   error?: string;
 }
 
@@ -1078,11 +1096,17 @@ function parseMemberSheet(workbook: XLSX.WorkBook): ImportMemberRow[] {
     const gradeText = mapped.grade ?? '';
     const grade = /^\d+$/.test(gradeText) ? Number(gradeText) : undefined;
     const phone = mapped.phone || undefined;
+    const rankText = mapped.rank ?? '';
+    const rank = /^\d+$/.test(rankText) && Number(rankText) >= 1 ? Number(rankText) : undefined;
+    const statusText = mapped.status ?? '';
+    const membershipStatus = statusText ? IMPORT_STATUS_ALIASES[statusText] ?? IMPORT_STATUS_ALIASES[statusText.toLowerCase()] : undefined;
     let error: string | undefined;
     if (!studentNo) error = '缺少学号';
     else if (!/^[A-Za-z0-9._-]{1,64}$/.test(studentNo)) error = '学号格式不合法';
     else if (!realName) error = '缺少姓名';
-    return { row: index + 2, studentNo, realName, grade, phone, error };
+    else if (rankText && rank == null) error = '名次须为正整数';
+    else if (statusText && !membershipStatus) error = `身份「${statusText}」无法识别`;
+    return { row: index + 2, studentNo, realName, grade, phone, rank, membershipStatus, error };
   });
 }
 
@@ -1091,6 +1115,14 @@ interface ImportMemberResult {
   studentNo: string;
   status: 'created' | 'skipped';
   message?: string;
+  initialPoints?: string;
+}
+
+interface ImportMembersResponse {
+  createdCount: number;
+  initialCount: number;
+  admissionTotal: number | null;
+  results: ImportMemberResult[];
 }
 
 /** Excel 批量导入成员：管理员确认为已验证成员，跳过 CAS 核验直接建账号（members.manage） */
@@ -1107,28 +1139,39 @@ function ImportMembersDialog({
   const [fileName, setFileName] = useState<string | null>(null);
   const [membershipStatus, setMembershipStatus] = useState('formal');
   const [parseError, setParseError] = useState<string | null>(null);
-  const [results, setResults] = useState<{ createdCount: number; results: ImportMemberResult[] } | null>(null);
+  const [results, setResults] = useState<ImportMembersResponse | null>(null);
+  // 入社基础分：本批次录取总人数 m（留空按表格推算）与入社月份
+  const [admissionTotalText, setAdmissionTotalText] = useState('');
+  const [admissionMonth, setAdmissionMonth] = useState(currentMonthKey());
 
   const validRows = rows.filter((row) => !row.error);
   const invalidRows = rows.filter((row) => row.error);
+  const rankedRows = validRows.filter((row) => row.rank != null);
+  const inferredTotal = rankedRows.length === 0 ? 0 : Math.max(rankedRows.length, ...rankedRows.map((row) => row.rank!));
+  const admissionTotal = /^\d+$/.test(admissionTotalText) && Number(admissionTotalText) >= 1 ? Number(admissionTotalText) : inferredTotal;
+  const rankOverflow = rankedRows.some((row) => row.rank! > admissionTotal);
+  const statusColumnUsed = rows.some((row) => row.membershipStatus);
 
   const reset = () => {
     setRows([]);
     setFileName(null);
     setParseError(null);
     setResults(null);
+    setAdmissionTotalText('');
   };
 
   const importMutation = useMutation({
     mutationFn: async () => {
-      const { data } = await api.post<{ createdCount: number; results: ImportMemberResult[] }>('/admin/members/import', {
+      const { data } = await api.post<ImportMembersResponse>('/admin/members/import', {
         rows: validRows.map((row) => ({
           studentNo: row.studentNo,
           realName: row.realName,
           grade: row.grade,
           phone: row.phone,
-          membershipStatus,
+          membershipStatus: row.membershipStatus ?? membershipStatus,
+          admissionRank: row.rank,
         })),
+        ...(rankedRows.length > 0 ? { admissionTotal, admissionMonth } : {}),
       });
       return data;
     },
@@ -1150,14 +1193,17 @@ function ImportMembersDialog({
         <DialogHeader>
           <DialogTitle>Excel 导入成员</DialogTitle>
           <DialogDescription>
-            适用于迁移历史名册：直接建立已验证成员账号，跳过 CAS 校验。表格需含「学号」「姓名」列（可选「年级」「手机」），
-            首行为表头。导入账号首次通过校园认证登录时会按学号自动绑定身份。
+            适用于迁移历史名册：直接建立已验证成员账号，跳过 CAS 校验。表格需含「学号」「姓名」列（可选「年级」「手机」「身份」「名次」），
+            首行为表头。填了「名次」（录取名次，也认「序号」）的成员自动记入社基础分。导入账号首次通过校园认证登录时会按学号自动绑定身份。
           </DialogDescription>
         </DialogHeader>
 
         {results ? (
           <div className="flex flex-col gap-3 text-sm">
-            <p className="font-medium text-foreground">成功创建 {results.createdCount} / {rows.length} 个成员账号</p>
+            <p className="font-medium text-foreground">
+              成功创建 {results.createdCount} / {rows.length} 个成员账号
+              {results.initialCount > 0 && `，${results.initialCount} 人记入社基础分（m = ${results.admissionTotal}，计入 ${admissionMonth}）`}
+            </p>
             {results.results.some((r) => r.status === 'skipped') && (
               <ul className="flex max-h-48 flex-col gap-0.5 overflow-y-auto text-xs text-muted-foreground">
                 {results.results
@@ -1206,7 +1252,7 @@ function ImportMembersDialog({
             </div>
 
             <div className="grid gap-1.5">
-              <Label htmlFor="import-members-status">导入账号身份</Label>
+              <Label htmlFor="import-members-status">{statusColumnUsed ? '默认身份（「身份」列留空的行）' : '导入账号身份'}</Label>
               <Select value={membershipStatus} onValueChange={setMembershipStatus}>
                 <SelectTrigger id="import-members-status" aria-label="导入账号身份">
                   <SelectValue />
@@ -1219,8 +1265,40 @@ function ImportMembersDialog({
                   ))}
                 </SelectContent>
               </Select>
-              <p className="text-xs text-muted-foreground">本次导入的所有成员统一设为该身份，不支持按行单独指定。</p>
+              <p className="text-xs text-muted-foreground">
+                表格有「身份」列（正式社员 / 预备社员 / 考察成员）时按行设置，留空的行用这里的身份。
+              </p>
             </div>
+
+            {rankedRows.length > 0 && (
+              <div className="grid gap-3 rounded-xl border border-border bg-muted/30 p-3 sm:grid-cols-2">
+                <p className="text-xs text-muted-foreground sm:col-span-2">
+                  入社基础分 I = 18 + 12 × (1 − (r − 1) ÷ max(1, m − 1))，仅录取一人时 30 分；r 为「名次」列，每人只记一次。
+                </p>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="import-members-total">本批次录取总人数 m</Label>
+                  <Input
+                    id="import-members-total"
+                    inputMode="numeric"
+                    value={admissionTotalText}
+                    onChange={(event) => setAdmissionTotalText(event.target.value.trim())}
+                    placeholder={`留空按表格推算：${inferredTotal}`}
+                  />
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="import-members-month">入社月份（计分月）</Label>
+                  <Input
+                    id="import-members-month"
+                    type="month"
+                    value={admissionMonth}
+                    onChange={(event) => setAdmissionMonth(event.target.value)}
+                  />
+                </div>
+                {rankOverflow && (
+                  <p className="text-xs text-destructive sm:col-span-2">有名次大于 m = {admissionTotal}，这些行会被跳过，请调大 m。</p>
+                )}
+              </div>
+            )}
 
             {parseError && (
               <Alert variant="destructive">
@@ -1242,6 +1320,9 @@ function ImportMembersDialog({
                         <TableHead>姓名</TableHead>
                         <TableHead>年级</TableHead>
                         <TableHead>手机</TableHead>
+                        <TableHead>身份</TableHead>
+                        <TableHead>名次</TableHead>
+                        <TableHead>基础分</TableHead>
                         <TableHead>状态</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -1253,6 +1334,13 @@ function ImportMembersDialog({
                           <TableCell>{row.realName || '—'}</TableCell>
                           <TableCell className="tabular-nums">{row.grade ?? '—'}</TableCell>
                           <TableCell className="tabular-nums">{row.phone ?? '—'}</TableCell>
+                          <TableCell className="whitespace-nowrap">{membershipLabel(row.membershipStatus ?? membershipStatus)}</TableCell>
+                          <TableCell className="tabular-nums">{row.rank ?? '—'}</TableCell>
+                          <TableCell className="tabular-nums">
+                            {row.rank != null && !row.error && row.rank <= admissionTotal
+                              ? admissionInitialPoints(row.rank, admissionTotal).toFixed(2)
+                              : '—'}
+                          </TableCell>
                           <TableCell className="text-muted-foreground">
                             {row.error ? <span className="text-destructive">{row.error}</span> : '有效'}
                           </TableCell>
@@ -1277,7 +1365,7 @@ function ImportMembersDialog({
                 取消
               </Button>
               <Button
-                disabled={validRows.length === 0 || importMutation.isPending}
+                disabled={validRows.length === 0 || importMutation.isPending || (rankedRows.length > 0 && !/^\d{4}-\d{2}$/.test(admissionMonth))}
                 onClick={() => importMutation.mutate()}
               >
                 {importMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}

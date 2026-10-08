@@ -4,7 +4,7 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newInvitationSecret } from '../auth/auth.service.js'
 import { newId, sha256Hex, monthKey } from '../../common/utils.js'
-import { computeEffectiveScore, formalQuota, graceMonths } from '@acm/scoring-core'
+import { computeEffectiveScore, formalQuota, graceMonths, initialPoints } from '@acm/scoring-core'
 import {
   RANKED_MEMBERSHIPS,
   rankEligibleMembers,
@@ -17,6 +17,15 @@ import type { SessionActor } from '../auth/session.service.js'
 /**
  * 成员管理、概览、邀请管理、训练室（01/02/03 方案）。
  */
+
+export interface ImportMemberResult {
+  row: number
+  studentNo: string
+  status: 'created' | 'skipped'
+  message?: string
+  /** 本行入账的入社基础分 */
+  initialPoints?: string
+}
 
 export class MembersError extends DomainError {
   constructor(message: string, readonly code: string) {
@@ -432,14 +441,39 @@ export class MembersService {
    * （principal+user+profile+membershipTerm+member 角色）；逐行独立事务，单行失败
    * 不影响其余行。导入账号首次 CAS 登录时按学号精确绑定稳定 subject（见
    * auth.service.ts resolveIdentity 的预导入学生分支），之后与正常注册账号无区别。
+   *
+   * 入社基础分（成员管理办法第八条）：填了录取名次 r 的行自动入一条 initial 流水，
+   * I = 18 + 12 × (1 - (r-1)/max(1, m-1))，仅一人时 30；m 为本批次录取总人数
+   * （默认取 max(有名次的行数, 最大名次)），计入入社月份（默认导入当月）。
+   * sourceKey = initial:{userId}，每人一次性；学号已存在的行不重复建号，但仍补记基础分。
    */
   async importMembers(
     actor: SessionActor,
-    rows: Array<{ studentNo: string; realName: string; grade?: number; phone?: string; membershipStatus?: MembershipStatus }>,
-  ): Promise<{ createdCount: number; results: Array<{ row: number; studentNo: string; status: 'created' | 'skipped'; message?: string }> }> {
-    const results: Array<{ row: number; studentNo: string; status: 'created' | 'skipped'; message?: string }> = []
+    rows: Array<{ studentNo: string; realName: string; grade?: number; phone?: string; membershipStatus?: MembershipStatus; admissionRank?: number }>,
+    options: { admissionTotal?: number; admissionMonth?: string } = {},
+  ): Promise<{ createdCount: number; initialCount: number; admissionTotal: number | null; results: ImportMemberResult[] }> {
+    const results: ImportMemberResult[] = []
     const seenInBatch = new Set<string>()
     let createdCount = 0
+    let initialCount = 0
+
+    const ranks = rows.map((row) => row.admissionRank).filter((rank): rank is number => rank != null)
+    const admissionTotal = ranks.length === 0 ? null : options.admissionTotal ?? Math.max(ranks.length, ...ranks)
+    const admissionMonth = options.admissionMonth ?? monthKey(new Date())
+    /** 入社基础分流水（每人一次，已有则跳过）；返回本次入账分值 */
+    const postInitial = async (tx: Prisma.TransactionClient, userId: string, rank: number): Promise<string | null> => {
+      const sourceKey = `initial:${userId}`
+      if (await tx.pointsLedgerEntry.findFirst({ where: { sourceKey, status: 'approved' }, select: { id: true } })) return null
+      const amount = initialPoints(rank, admissionTotal!).toFixed(2)
+      await tx.pointsLedgerEntry.create({
+        data: {
+          id: newId(), userId, sourceKey, category: 'initial', amount, scoreMonth: admissionMonth, recordedAt: new Date(),
+          status: 'approved', approvedBy: actor.principalId, idempotencyKey: `src:${sourceKey}`,
+          detail: { source: 'members_import', rank, total: admissionTotal, formula: 'I = 18 + 12 × (1 - (r-1)/max(1, m-1))' },
+        },
+      })
+      return amount
+    }
 
     for (let i = 0; i < rows.length; i++) {
       const rowNo = i + 1
@@ -459,10 +493,21 @@ export class MembersService {
         continue
       }
       seenInBatch.add(studentNo)
+      const rank = rows[i].admissionRank
+      if (rank != null && (!Number.isInteger(rank) || rank < 1 || rank > admissionTotal!)) {
+        results.push({ row: rowNo, studentNo, status: 'skipped', message: `录取名次须为 1–${admissionTotal} 的整数` })
+        continue
+      }
 
       const existingUser = await this.db.user.findUnique({ where: { studentNo }, select: { id: true } })
       if (existingUser) {
-        results.push({ row: rowNo, studentNo, status: 'skipped', message: '学号已存在（账号）' })
+        const initial = rank == null ? null : await this.db.$transaction((tx) => postInitial(tx, existingUser.id, rank))
+        if (initial) initialCount++
+        results.push({
+          row: rowNo, studentNo, status: 'skipped',
+          message: initial ? `学号已存在（账号），已补记入社基础分 ${initial}` : '学号已存在（账号）',
+          ...(initial ? { initialPoints: initial } : {}),
+        })
         continue
       }
       const existingStaff = await this.db.staffProfile.findUnique({ where: { staffNo: studentNo }, select: { id: true } })
@@ -479,7 +524,7 @@ export class MembersService {
       try {
         const userId = newId()
         const principalId = newId()
-        await this.db.$transaction(async (tx) => {
+        const initial = await this.db.$transaction(async (tx) => {
           await tx.principal.create({ data: { id: principalId, kind: 'student' } })
           await tx.user.create({ data: { id: userId, principalId, studentNo, verifiedRealName: realName, grade, phone } })
           await tx.userProfile.create({ data: { userId, displayName: realName } })
@@ -499,14 +544,16 @@ export class MembersService {
               summary: `Excel 批量导入成员（${studentNo} ${realName}，身份 ${membershipStatus}）`,
             },
           })
+          return rank == null ? null : postInitial(tx, userId, rank)
         })
         createdCount++
-        results.push({ row: rowNo, studentNo, status: 'created' })
+        if (initial) initialCount++
+        results.push({ row: rowNo, studentNo, status: 'created', ...(initial ? { initialPoints: initial } : {}) })
       } catch (error) {
         results.push({ row: rowNo, studentNo, status: 'skipped', message: error instanceof Error ? error.message.slice(0, 200) : '创建失败' })
       }
     }
-    return { createdCount, results }
+    return { createdCount, initialCount, admissionTotal, results }
   }
 
   /** 月度身份评定预览（候选，不自动改身份；04 方案 7） */

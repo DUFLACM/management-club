@@ -39,7 +39,8 @@ describe('历史积分 Excel 解析', () => {
       { 学号: '202400005', 平台: '洛谷', 比赛场次: '1' },
     ]);
     expect(rows[0]).toEqual({ row: 2, studentNo: '202400002', name: '', category: 'contest', platform: 'codeforces', contestId: '2043', handle: 'lisi_cf' });
-    expect(rows[1]?.error).toBe('参与分留空时须填写平台账号（按榜单计分）');
+    // 平台账号留空：由服务端取成员绑定账号，前端不再拦截
+    expect(rows[1]?.error).toBeUndefined();
     expect(rows[2]?.error).toBe('填写了比赛场次 / 平台账号时请同时填写平台');
     expect(rows[3]?.error).toContain('平台「洛谷」无法识别');
   });

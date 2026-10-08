@@ -15,8 +15,9 @@ import type { SessionActor } from '../auth/session.service.js'
  * - 普通行：学号 + 活动名称 + 活动日期，按「活动名称 + 日期」归组建归档活动存档；
  *   参与分留空时按活动类型给默认参与分（参加即得，见 PARTICIPATION_DEFAULTS）；
  * - 加分项：讲题 / 分享 / 题解 / 出题 / 工作人员 / 主持等按规则标准分额外入一条流水（加分列可覆盖）；
- * - 平台比赛行：填写 平台 + 比赛场次 + 平台账号，系统只抓表格里出现的比赛榜单、
- *   只按表格里填写的平台账号查成绩；积分列留空时按 W 公式自动计算（社内名次按同场表格内的成员排），
+ * - 平台比赛行：填写 平台 + 比赛场次（平台账号选填），系统只抓表格里出现的比赛榜单；
+ *   平台账号留空时取该成员在系统里绑定的该平台账号（未解绑的，已核验优先），填了以表格为准；
+ *   积分列留空时按 W 公式自动计算（社内名次按同场表格内的成员排），
  *   比赛名称 / 日期留空时取平台元数据；同一场比赛的行挂到同一个活动（已有该比赛活动则复用，否则建归档存档）。
  * - 两步：preview 抓榜单并补全积分 / 名称 / 日期（不入账）→ importExcel 入账。
  * - 幂等：普通行 sourceKey = history:{活动}:{成员}:{类别}；比赛行与结算引擎共用 contest:{平台}:{比赛}:W:{成员}；
@@ -170,19 +171,35 @@ export class HistoryImportService {
   ) {}
 
   /**
-   * 预览：核对学号；对平台比赛行抓取表格中出现的比赛榜单，按表格里的平台账号查成绩，
+   * 预览：核对学号；对平台比赛行抓取表格中出现的比赛榜单，按平台账号查成绩（表格留空用成员绑定账号），
    * 积分留空的按 W 公式计算，比赛名称 / 日期留空的用平台元数据补全。不入账。
    */
   async preview(input: HistoryPreviewInput) {
     const studentNos = [...new Set(input.rows.map((row) => row.studentNo))]
     const users = await this.db.user.findMany({
       where: { studentNo: { in: studentNos } },
-      select: { studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } },
+      select: {
+        studentNo: true,
+        verifiedRealName: true,
+        profile: { select: { displayName: true } },
+        platformAccounts: { where: { status: { not: 'revoked' } }, select: { platform: true, externalId: true, status: true } },
+      },
     })
     const nameByNo = new Map(users.map((user) => [user.studentNo, user.profile?.displayName ?? user.verifiedRealName]))
+    // 成员在系统里绑定的平台账号：每平台一个活跃绑定，已核验优先
+    const boundHandle = new Map<string, string>()
+    for (const user of users) {
+      const accounts = [...user.platformAccounts].sort((a, b) => Number(b.status === 'verified') - Number(a.status === 'verified'))
+      for (const account of accounts) {
+        const key = `${user.studentNo}\u0000${account.platform}`
+        if (!boundHandle.has(key)) boundHandle.set(key, account.externalId)
+      }
+    }
 
     type Resolved = (typeof input.rows)[number] & {
       memberName: string | null
+      /** 平台账号来源：表格手填 / 成员在系统绑定的账号 */
+      handleSource?: 'sheet' | 'bound'
       /** 参与分来源：表格手填 / 按活动类型默认 / 按榜单 W 公式 */
       amountSource?: 'sheet' | 'default' | 'formula'
       /** 加分来源：表格手填 / 加分项标准分 */
@@ -192,12 +209,16 @@ export class HistoryImportService {
       computed?: { platformRank: number | null; solvedCount: number; score: number; formula: ContestFormulaResult | null }
       error?: string
     }
-    const resolved: Resolved[] = input.rows.map((row) => ({
-      ...row,
-      ...(row.amount != null ? { amountSource: 'sheet' as const } : {}),
-      memberName: nameByNo.get(row.studentNo) ?? null,
-      ...(nameByNo.has(row.studentNo) ? {} : { error: '成员不存在（学号未注册，可先在成员管理导入）' }),
-    }))
+    const resolved: Resolved[] = input.rows.map((row) => {
+      const bound = row.platform && !row.handle ? boundHandle.get(`${row.studentNo}\u0000${row.platform}`) : undefined
+      return {
+        ...row,
+        ...(row.handle ? { handleSource: 'sheet' as const } : bound ? { handle: bound, handleSource: 'bound' as const } : {}),
+        ...(row.amount != null ? { amountSource: 'sheet' as const } : {}),
+        memberName: nameByNo.get(row.studentNo) ?? null,
+        ...(nameByNo.has(row.studentNo) ? {} : { error: '成员不存在（学号未注册，可先在成员管理导入）' }),
+      }
+    })
 
     const groups = new Map<string, Resolved[]>()
     for (const row of resolved) {
@@ -256,7 +277,7 @@ export class HistoryImportService {
           row.error = !summary.info.available
             ? `榜单抓取失败：${summary.info.reason}；可在积分列手填`
             : !row.handle
-              ? '缺少平台账号，无法从榜单查成绩（或在积分列手填）'
+              ? '成员未在系统绑定该平台账号，表格也没填，无法从榜单查成绩（可填平台账号或在积分列手填）'
               : `榜单中未找到账号「${row.handle}」，请核对平台账号`
         }
       }

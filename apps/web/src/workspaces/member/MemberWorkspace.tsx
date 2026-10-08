@@ -19,6 +19,7 @@ import {
   MEMBER_SECTION_KEYS,
 } from '@/workspaces/lazy-panels';
 import { resolveSection, SectionRouter } from '@/workspaces/shared/SectionRouter';
+import { PlatformBindingGate } from '@/components/club/PlatformBindingGate';
 import {
   WorkspaceShell,
   type WorkspaceSection,
@@ -128,19 +129,21 @@ export function MemberWorkspace({ user: providedUser, manageAccess }: MemberWork
   }
 
   return (
-    <WorkspaceShell
-      variant="member"
-      currentSection={currentSection}
-      sections={MEMBER_SECTIONS}
-      onNavigate={handleNavigate}
-      user={user}
-      manageAccess={canManage}
-    >
-      <SectionRouter
+    <PlatformBindingGate principal={session.principal}>
+      <WorkspaceShell
+        variant="member"
         currentSection={currentSection}
-        panels={MemberPanels}
-        defaultSection={MEMBER_DEFAULT_SECTION}
-      />
-    </WorkspaceShell>
+        sections={MEMBER_SECTIONS}
+        onNavigate={handleNavigate}
+        user={user}
+        manageAccess={canManage}
+      >
+        <SectionRouter
+          currentSection={currentSection}
+          panels={MemberPanels}
+          defaultSection={MEMBER_DEFAULT_SECTION}
+        />
+      </WorkspaceShell>
+    </PlatformBindingGate>
   );
 }

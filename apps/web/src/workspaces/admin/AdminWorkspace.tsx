@@ -22,6 +22,7 @@ import {
   ADMIN_DEFAULT_SECTION,
 } from '@/workspaces/lazy-panels';
 import { resolveSection, SectionRouter } from '@/workspaces/shared/SectionRouter';
+import { PlatformBindingGate } from '@/components/club/PlatformBindingGate';
 import {
   WorkspaceShell,
   type WorkspaceSection,
@@ -112,22 +113,24 @@ export function AdminWorkspace({ user: providedUser }: AdminWorkspaceProps) {
   }
 
   return (
-    <WorkspaceShell
-      variant="admin"
-      currentSection={currentSection}
-      sections={sections}
-      onNavigate={handleNavigate}
-      user={user}
-    >
-      {isManager ? (
-        <SectionRouter
-          currentSection={currentSection}
-          panels={AdminPanels}
-          defaultSection={ADMIN_DEFAULT_SECTION}
-        />
-      ) : (
-        <EmptyState kind="forbidden" title="暂无管理权限" description="当前账号没有管理工作台授权。" />
-      )}
-    </WorkspaceShell>
+    <PlatformBindingGate principal={session.principal}>
+      <WorkspaceShell
+        variant="admin"
+        currentSection={currentSection}
+        sections={sections}
+        onNavigate={handleNavigate}
+        user={user}
+      >
+        {isManager ? (
+          <SectionRouter
+            currentSection={currentSection}
+            panels={AdminPanels}
+            defaultSection={ADMIN_DEFAULT_SECTION}
+          />
+        ) : (
+          <EmptyState kind="forbidden" title="暂无管理权限" description="当前账号没有管理工作台授权。" />
+        )}
+      </WorkspaceShell>
+    </PlatformBindingGate>
   );
 }

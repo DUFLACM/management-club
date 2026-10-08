@@ -13,7 +13,7 @@ import { createTestUser, makeActor } from './helpers.js'
  * 历史积分导入（真实 PostgreSQL）：
  * - Excel 行按「活动名称 + 日期」建归档存档活动，积分挂到活动；整份重导不重复计分、不重复建活动；
  * - 未注册学号逐行失败，不影响其它行；
- * - 平台比赛行：只抓表格里的比赛、只按表格里的平台账号查成绩，积分留空按 W 公式补全；
+ * - 平台比赛行：只抓表格里的比赛；平台账号表格填了以表格为准，留空用成员在系统绑定的账号；积分留空按 W 公式补全；
  *   与结算引擎共用 sourceKey，重复导入不重复入账。
  */
 
@@ -121,7 +121,7 @@ describe('Excel 平台比赛行', () => {
     const top = await createTestUser(db, { studentNo: '202605010', name: '甲同学' })
     const second = await createTestUser(db, { studentNo: '202605011', name: '乙同学' })
     await createTestUser(db, { studentNo: '202605012', name: '丙同学' })
-    // 系统里绑定的账号与表格无关：故意绑一个榜上不存在的 handle，证明不按系统绑定匹配
+    // 表格填了平台账号以表格为准：故意绑一个榜上不存在的 handle，证明不会被系统绑定覆盖
     await db.platformAccount.create({ data: { id: randomUUID(), platform: 'codeforces', externalId: 'not-on-board', userId: top.userId, status: 'verified' } })
     const cell = (solved: boolean) => ({ index: 'A', score: solved ? 1 : 0, solved, failedCount: 0 })
     snapshot = {
@@ -190,5 +190,35 @@ describe('Excel 平台比赛行', () => {
     })
     expect(preview.rows[0].error).toContain('榜单抓取失败')
     expect(preview.rows[1].error).toBeUndefined()
+  })
+
+  it('平台账号留空时用成员在系统绑定的账号查榜单（已解绑的不算）', async () => {
+    const bound = await createTestUser(db, { studentNo: '202605030' })
+    const revoked = await createTestUser(db, { studentNo: '202605031' })
+    await createTestUser(db, { studentNo: '202605032' })
+    await db.platformAccount.create({ data: { id: randomUUID(), platform: 'codeforces', externalId: 'Alpha', userId: bound.userId, status: 'pending_review' } })
+    await db.platformAccount.create({ data: { id: randomUUID(), platform: 'codeforces', externalId: 'beta', userId: revoked.userId, status: 'revoked' } })
+    const cell = (solved: boolean) => ({ index: 'A', score: solved ? 1 : 0, solved, failedCount: 0 })
+    snapshot = {
+      platform: 'codeforces', contestId: '2001', available: true, fetchedAt: new Date().toISOString(), note: null,
+      problems: [{ index: 'A', name: null, fullScore: null, url: null }],
+      entries: [
+        { handle: 'Alpha', displayName: null, rank: 1, score: 1, solvedCount: 1, cells: [cell(true)] },
+        { handle: 'beta', displayName: null, rank: 2, score: 1, solvedCount: 1, cells: [cell(true)] },
+      ],
+      contest: { name: 'Codeforces Round 2001', startAt: '2025-07-01T14:35:00.000Z', endAt: '2025-07-01T16:35:00.000Z' },
+    }
+    const preview = await history.preview({
+      lambdaKey: 'B', cap: 20,
+      rows: ['202605030', '202605031', '202605032'].map((studentNo, i) =>
+        ({ row: i + 2, studentNo, category: 'contest' as const, platform: 'codeforces' as const, contestId: '2001' })),
+    })
+    const [a, b, c] = preview.rows
+    expect(a).toMatchObject({ handle: 'Alpha', handleSource: 'bound', activityTitle: 'Codeforces Round 2001' })
+    expect(a.error).toBeUndefined()
+    expect(a.amount).toBeDefined()
+    expect(b.handle).toBeUndefined()
+    expect(b.error).toContain('未在系统绑定')
+    expect(c.error).toContain('未在系统绑定')
   })
 })

@@ -36,6 +36,22 @@ interface BindPlatformAccountDialogProps {
   defaultPlatform?: string;
 }
 
+/** 提交绑定申请；成功后刷新「我的平台账号」与概览缓存（弹窗与登录绑定门共用） */
+export function useBindPlatformAccount(principalId: string, onSuccess?: () => void) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: { platform: string; externalId: string; proofNote: string }) =>
+      (await api.post<{ accountId: string }>('/me/platform-accounts', input)).data,
+    onSuccess: async () => {
+      onSuccess?.();
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'platform-accounts'] }),
+        queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'dashboard'] }),
+      ]);
+    },
+  });
+}
+
 export function BindPlatformAccountDialog({
   principalId,
   open,
@@ -43,20 +59,9 @@ export function BindPlatformAccountDialog({
   onSuccess,
   defaultPlatform,
 }: BindPlatformAccountDialogProps) {
-  const queryClient = useQueryClient();
-  const mutation = useMutation({
-    mutationFn: async (input: { platform: string; externalId: string; proofNote: string }) =>
-      (await api.post<{ accountId: string }>('/me/platform-accounts', input)).data,
-    onSuccess: () => {
-      onOpenChange(false);
-      onSuccess?.();
-      void queryClient.invalidateQueries({
-        queryKey: ['principal', principalId, 'me', 'platform-accounts'],
-      });
-      void queryClient.invalidateQueries({
-        queryKey: ['principal', principalId, 'me', 'dashboard'],
-      });
-    },
+  const mutation = useBindPlatformAccount(principalId, () => {
+    onOpenChange(false);
+    onSuccess?.();
   });
 
   return (
@@ -89,17 +94,19 @@ export function BindPlatformAccountDialog({
   );
 }
 
-function BindForm({
+export function BindForm({
   defaultPlatform,
   submitting,
   onSubmit,
   onCancel,
+  cancelLabel = '取消',
   error,
 }: {
   defaultPlatform?: string;
   submitting: boolean;
   onSubmit: (input: { platform: string; externalId: string; proofNote: string }) => void;
   onCancel: () => void;
+  cancelLabel?: string;
   error: string | null;
 }) {
   const [platform, setPlatform] = useState(defaultPlatform ?? 'nowcoder');
@@ -162,7 +169,7 @@ function BindForm({
       </div>
       <DialogFooter className="flex-row justify-end border-t border-border pt-4">
         <Button type="button" variant="outline" onClick={onCancel}>
-          取消
+          {cancelLabel}
         </Button>
         <Button type="submit" disabled={submitting || externalId.trim().length < 2}>
           {submitting && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
@@ -173,9 +180,9 @@ function BindForm({
   );
 }
 
-/** 绑定教程（src/content/platform-binding-guide.md，Markdown 渲染）：默认收起，首次绑定可展开对照 */
-function BindingGuide() {
-  const [open, setOpen] = useState(false);
+/** 绑定教程（src/content/platform-binding-guide.md，Markdown 渲染）：弹窗里默认收起，登录绑定门默认展开 */
+export function BindingGuide({ defaultOpen = false }: { defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
     <div className="rounded-xl border border-border bg-muted/30">
       <button

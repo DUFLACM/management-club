@@ -145,10 +145,19 @@ export class MembersAdminController {
       grade: z.number().int().optional(),
       phone: z.string().max(32).optional(),
       membershipStatus: z.enum(MEMBERSHIP_STATUSES).optional(),
+      /** 本批次录取名次 r：填了即自动记入社基础分 */
+      admissionRank: z.number().int().min(1).optional(),
     })
-    const parsed = z.object({ rows: z.array(rowSchema).min(1).max(500) }).safeParse(body)
+    const parsed = z.object({
+      rows: z.array(rowSchema).min(1).max(500),
+      /** 本批次录取总人数 m（默认 max(有名次的行数, 最大名次)） */
+      admissionTotal: z.number().int().min(1).max(1000).optional(),
+      /** 入社月份 YYYY-MM（默认导入当月） */
+      admissionMonth: z.string().regex(/^\d{4}-\d{2}$/, '入社月份格式为 YYYY-MM').optional(),
+    }).safeParse(body)
     if (!parsed.success) throw new MembersError(parsed.error.issues[0].message, 'INVALID_INPUT')
-    return ok(await this.members.importMembers(actor, parsed.data.rows))
+    const { rows, ...options } = parsed.data
+    return ok(await this.members.importMembers(actor, rows, options))
   }
 
   /** 更改成员平台绑定账号（换绑账号回到待核验；仅改显示名保持原状态） */
