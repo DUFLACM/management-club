@@ -1,11 +1,11 @@
 /**
  * 管理端 · 历史积分导入（points.review），全部基于 Excel 模板：
- * 1. 下载模板 → 填写 → 上传，本地校验格式；
+ * 1. 下载模板 → 填写 → 上传，本地校验格式；参与分留空按活动类型默认，加分项从固定选项里选；
  * 2. POST /admin/history-import/excel/preview：核对学号；表格里填了平台 + 比赛场次的行，
  *    抓取这些比赛的榜单、按表格里的平台账号查成绩，积分留空的按 W 公式计算，比赛名称 / 日期留空的用平台数据补全；
  * 3. POST /admin/history-import/excel 入账：按活动建归档存档（同一场平台比赛归为一个活动），成员端活动详情与流水可见。
  */
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import * as XLSX from 'xlsx';
 import { CheckCircle2Icon, DownloadIcon, ExternalLinkIcon, LoaderCircleIcon, RefreshCwIcon, TriangleAlertIcon } from 'lucide-react';
@@ -14,10 +14,13 @@ import { api, ApiError } from '@/lib/api';
 import { usePrincipal } from '@/lib/session';
 import { platformLabel } from '@/lib/format';
 import {
+  HISTORY_BONUS_ITEMS,
   HISTORY_CATEGORY_LABELS,
   HISTORY_TEMPLATE_EXAMPLES,
   HISTORY_TEMPLATE_GUIDE,
   HISTORY_TEMPLATE_HEADERS,
+  HISTORY_TEMPLATE_TEXT_COLUMNS,
+  bonusLabel,
   parseHistoryRows,
   type HistoryImportRow,
 } from '@/lib/history-import';
@@ -40,6 +43,10 @@ const LAMBDA_OPTIONS = [
 
 interface PreviewRow extends HistoryImportRow {
   memberName: string | null;
+  /** 参与分来源：表格手填 / 按活动类型默认 / 按榜单 W 公式 */
+  amountSource?: 'sheet' | 'default' | 'formula';
+  /** 加分来源：表格手填 / 加分项标准分 */
+  bonusSource?: 'sheet' | 'standard';
   contestStartAt?: string;
   contestEndAt?: string;
   computed?: {
@@ -81,12 +88,11 @@ interface ImportResult {
 function downloadTemplate() {
   const workbook = XLSX.utils.book_new();
   const sheet = XLSX.utils.aoa_to_sheet([[...HISTORY_TEMPLATE_HEADERS], ...HISTORY_TEMPLATE_EXAMPLES]);
-  sheet['!cols'] = [12, 8, 8, 8, 24, 12, 12, 16, 14, 12, 10, 24].map((wch) => ({ wch }));
+  sheet['!cols'] = [12, 8, 22, 12, 12, 8, 12, 8, 10, 12, 16, 14, 10, 30].map((wch) => ({ wch }));
   // 学号、日期、场次、账号、月份按文本存，避免 Excel 吞掉前导零或自动转日期 / 数字
-  const textColumns = [0, 5, 7, 8, 10];
   const range = XLSX.utils.decode_range(sheet['!ref'] ?? 'A1');
   for (let r = 1; r <= range.e.r; r++) {
-    for (const c of textColumns) {
+    for (const c of HISTORY_TEMPLATE_TEXT_COLUMNS) {
       const cell = sheet[XLSX.utils.encode_cell({ r, c })];
       if (cell) {
         cell.t = 's';
@@ -98,13 +104,21 @@ function downloadTemplate() {
   const guide = XLSX.utils.aoa_to_sheet(HISTORY_TEMPLATE_GUIDE);
   guide['!cols'] = [{ wch: 12 }, { wch: 18 }, { wch: 80 }];
   XLSX.utils.book_append_sheet(workbook, guide, '填写说明');
+  const bonus = XLSX.utils.aoa_to_sheet([
+    ['加分项（复制到「加分项」列）', '标准加分', '记入类别', '说明'],
+    ...HISTORY_BONUS_ITEMS.map((item) => [item.label, item.amount ?? '手填', item.category, item.note]),
+    [],
+    ['讲题 / 分享按满意度 V = 1.0 取基础分；「加分」列填了数字则以表格为准。'],
+  ]);
+  bonus['!cols'] = [{ wch: 26 }, { wch: 10 }, { wch: 10 }, { wch: 28 }];
+  XLSX.utils.book_append_sheet(workbook, bonus, '加分项');
   XLSX.writeFile(workbook, '历史积分导入模板.xlsx');
 }
 
 /** 发给服务端的行字段（去掉本地展示用字段） */
 function toPayload(row: PreviewRow | HistoryImportRow) {
-  const { row: line, studentNo, amount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note } = row;
-  const base = { row: line, studentNo, amount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note };
+  const { row: line, studentNo, amount, bonus, bonusAmount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note } = row;
+  const base = { row: line, studentNo, amount, bonus, bonusAmount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note };
   if ('contestStartAt' in row) return { ...base, contestStartAt: row.contestStartAt, contestEndAt: row.contestEndAt };
   return base;
 }
@@ -184,8 +198,8 @@ export function HistoryImportDialog({
         <DialogHeader>
           <DialogTitle>历史积分导入</DialogTitle>
           <DialogDescription>
-            导入系统上线前已有的积分。每条积分对应一个活动，导入时自动在「活动管理」建立已归档的活动存档，成员可在活动详情和积分流水里看到来源。
-            填写了「平台 + 比赛场次」的行，系统会抓取该场比赛榜单，按表格中的平台账号查成绩并自动计分。重复导入不会重复计分。
+            导入系统上线前已有的积分。每行对应成员参加的一个活动，导入时自动在「活动管理」建立已归档的活动存档，成员可在活动详情和积分流水里看到来源。
+            参加即得默认参与分（按活动类型）；填写了「平台 + 比赛场次」的行按榜单成绩自动计分；讲题、主持等额外加分在「加分项」列选择，单独记一条。重复导入不会重复计分。
           </DialogDescription>
         </DialogHeader>
 
@@ -258,8 +272,8 @@ export function HistoryImportDialog({
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              普通行必填：学号、积分、活动名称、活动日期。平台比赛行填「平台 + 比赛场次 + 平台账号」，积分 / 活动名称 / 日期可留空由系统补全。
-              模板第二个工作表有逐列说明。
+              普通行必填：学号、活动名称、活动日期、活动类型（参与分留空按类型给默认分）。平台比赛行填「平台 + 比赛场次 + 平台账号」，比赛分 / 名称 / 日期由系统补全。
+              加分项可选：{HISTORY_BONUS_ITEMS.map((item) => `${item.label}${item.amount != null ? ` +${item.amount}` : ''}`).join('、')}。模板里有逐列说明。
             </p>
 
             {parseError && (
@@ -377,7 +391,9 @@ function PreviewTable({ rows }: { rows: PreviewRow[] }) {
           <TableRow className="h-8">
             <TableHead className="pl-3 text-xs">行</TableHead>
             <TableHead className="text-xs">成员</TableHead>
-            <TableHead className="text-xs">积分</TableHead>
+            <TableHead className="text-xs">参与分</TableHead>
+            <TableHead className="text-xs">加分项</TableHead>
+            <TableHead className="text-xs">合计</TableHead>
             <TableHead className="text-xs">类别</TableHead>
             <TableHead className="text-xs">活动</TableHead>
             <TableHead className="text-xs">日期</TableHead>
@@ -400,9 +416,22 @@ function PreviewTable({ rows }: { rows: PreviewRow[] }) {
                   title={formula ? `W = B ${formula.B} + λ ${formula.lambda} × (4×S ${formula.S} + 6×R ${formula.R}) + X ${formula.X}` : undefined}
                 >
                   {row.amount ?? '—'}
-                  {formula && row.amount === formula.W.toFixed(2) && (
-                    <span className="ml-1 rounded bg-primary/10 px-1 text-[10px] text-primary">自动</span>
-                  )}
+                  {row.amountSource === 'formula' && <SourceTag>榜单</SourceTag>}
+                  {row.amountSource === 'default' && <SourceTag>默认</SourceTag>}
+                </TableCell>
+                <TableCell className="py-1.5 text-xs">
+                  {row.bonus ? (
+                    <>
+                      <span className="block">{bonusLabel(row.bonus)}</span>
+                      <span className="block tabular-nums text-success">
+                        {row.bonusAmount != null ? `额外 +${row.bonusAmount}` : '—'}
+                        {row.bonusSource === 'standard' && <SourceTag>标准</SourceTag>}
+                      </span>
+                    </>
+                  ) : '—'}
+                </TableCell>
+                <TableCell className="py-1.5 text-xs font-medium tabular-nums">
+                  {row.error ? '—' : rowTotal(row)}
                 </TableCell>
                 <TableCell className="py-1.5 text-xs">{HISTORY_CATEGORY_LABELS[row.category] ?? '—'}</TableCell>
                 <TableCell className="max-w-48 truncate py-1.5 text-xs" title={row.activityTitle}>{row.activityTitle ?? '—'}</TableCell>
@@ -428,6 +457,16 @@ function PreviewTable({ rows }: { rows: PreviewRow[] }) {
       </Table>
     </div>
   );
+}
+
+function SourceTag({ children }: { children: ReactNode }) {
+  return <span className="ml-1 rounded bg-primary/10 px-1 text-[10px] text-primary">{children}</span>;
+}
+
+/** 参与分 + 加分（两位小数以内，去掉多余的 0） */
+function rowTotal(row: PreviewRow): string {
+  const total = Number(row.amount ?? 0) + Number(row.bonusAmount ?? 0);
+  return String(Math.round(total * 100) / 100);
 }
 
 function ImportResultView({ result, onAgain }: { result: ImportResult; onAgain: () => void }) {

@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common'
 import { z } from 'zod'
 import { fetchNowcoderContestMeta } from '@acm/integrations'
+import { SHARING_BASE, TEACHING_BASE, staffBonus } from '@acm/scoring-core'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { ContestStandingsService, contestExternalUrl, type StandingsEntry } from '../activities/contest-standings.service.js'
@@ -11,18 +12,60 @@ import type { SessionActor } from '../auth/session.service.js'
 
 /**
  * 历史积分导入（系统上线前已有的积分），全部来自 Excel 模板：
- * - 普通行：学号 + 积分 + 活动名称 + 活动日期，按「活动名称 + 日期」归组建归档活动存档；
+ * - 普通行：学号 + 活动名称 + 活动日期，按「活动名称 + 日期」归组建归档活动存档；
+ *   参与分留空时按活动类型给默认参与分（参加即得，见 PARTICIPATION_DEFAULTS）；
+ * - 加分项：讲题 / 分享 / 题解 / 出题 / 工作人员 / 主持等按规则标准分额外入一条流水（加分列可覆盖）；
  * - 平台比赛行：填写 平台 + 比赛场次 + 平台账号，系统只抓表格里出现的比赛榜单、
  *   只按表格里填写的平台账号查成绩；积分列留空时按 W 公式自动计算（社内名次按同场表格内的成员排），
  *   比赛名称 / 日期留空时取平台元数据；同一场比赛的行挂到同一个活动（已有该比赛活动则复用，否则建归档存档）。
  * - 两步：preview 抓榜单并补全积分 / 名称 / 日期（不入账）→ importExcel 入账。
- * - 幂等：普通行 sourceKey = history:{活动}:{成员}:{类别}；比赛行与结算引擎共用 contest:{平台}:{比赛}:W:{成员}，
- *   整份文件重导、或该场已被结算引擎计过分，都不会重复入账。
+ * - 幂等：普通行 sourceKey = history:{活动}:{成员}:{类别}；比赛行与结算引擎共用 contest:{平台}:{比赛}:W:{成员}；
+ *   加分 history:{活动}:{成员}:bonus:{加分项}。整份文件重导、或该场已被结算引擎计过分，都不会重复入账。
  */
 
 export const HISTORY_CATEGORIES = ['contest', 'remote_contest', 'activity', 'contribution', 'service', 'award', 'initial', 'penalty'] as const
 export const HISTORY_ACTIVITY_TYPES = ['weekly_contest', 'monthly_contest', 'custom_contest', 'lecture', 'training', 'meeting', 'gathering', 'camp', 'service'] as const
 export const CONTEST_PLATFORMS = ['nowcoder', 'codeforces', 'atcoder'] as const
+
+/**
+ * 参加即得的默认参与分（积分办法附录二第五节）：必到活动准时到场 +2；宣讲 / 分享 / 复盘等普通参会 +1.5；
+ * 未接平台榜单的比赛按线下到场基础分 B = 2（平台比赛行按榜单算 W，不用这里）。
+ */
+export const PARTICIPATION_DEFAULTS: Record<(typeof HISTORY_ACTIVITY_TYPES)[number], string> = {
+  meeting: '2',
+  training: '2',
+  camp: '2',
+  lecture: '1.5',
+  gathering: '1.5',
+  service: '1.5',
+  weekly_contest: '2',
+  monthly_contest: '2',
+  custom_contest: '2',
+}
+/** 只有参加类积分有默认参与分；远程赛 / 贡献 / 奖励 / 期初 / 扣分须手填 */
+const PARTICIPATION_CATEGORIES = new Set(['activity', 'contest', 'service'])
+
+/**
+ * 加分项（积分办法附录二第五节）。历史活动没有满意度投票，讲题 / 分享按 V = 1.0 取基础分；
+ * 题解 2 分/题（同场上限 2 题）、出题 8 分/题（同场上限 2 题）。amount 为 null 的须在「加分」列手填。
+ */
+export const HISTORY_BONUS_ITEMS = {
+  lecture_basic: { label: '讲题·基础', amount: TEACHING_BASE.basic, category: 'contribution' },
+  lecture_intermediate: { label: '讲题·中档', amount: TEACHING_BASE.intermediate, category: 'contribution' },
+  lecture_advanced: { label: '讲题·高档', amount: TEACHING_BASE.advanced, category: 'contribution' },
+  sharing_club: { label: '分享·社级', amount: SHARING_BASE.club, category: 'contribution' },
+  sharing_college: { label: '分享·院级', amount: SHARING_BASE.college, category: 'contribution' },
+  sharing_school: { label: '分享·校级', amount: SHARING_BASE.school, category: 'contribution' },
+  solution_1: { label: '题解·1题', amount: 2, category: 'contribution' },
+  solution_2: { label: '题解·2题', amount: 4, category: 'contribution' },
+  problem_setting_1: { label: '出题·1题', amount: 8, category: 'contribution' },
+  problem_setting_2: { label: '出题·2题', amount: 16, category: 'contribution' },
+  staff: { label: '工作人员', amount: staffBonus('staff').toNumber(), category: 'service' },
+  host: { label: '主持', amount: staffBonus('host').toNumber(), category: 'service' },
+  other: { label: '其他加分', amount: null, category: 'award' },
+} as const satisfies Record<string, { label: string; amount: number | null; category: string }>
+export type HistoryBonus = keyof typeof HISTORY_BONUS_ITEMS
+const BONUS_CODES = Object.keys(HISTORY_BONUS_ITEMS) as [HistoryBonus, ...HistoryBonus[]]
 
 const amountSchema = z.string().regex(/^-?\d+(\.\d+)?$/, '积分为十进制数字（可负）')
 const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '活动日期格式为 YYYY-MM-DD')
@@ -37,6 +80,8 @@ const baseRowSchema = z.object({
   platform: z.enum(CONTEST_PLATFORMS).optional(),
   contestId: z.string().trim().min(1).max(64).optional(),
   handle: z.string().trim().min(1).max(64).optional(),
+  bonus: z.enum(BONUS_CODES).optional(),
+  bonusAmount: amountSchema.optional(),
 })
 
 const previewRowSchema = baseRowSchema.extend({
@@ -54,13 +99,18 @@ export type HistoryPreviewInput = z.infer<typeof historyPreviewSchema>
 
 export const historyExcelSchema = z.object({
   rows: z.array(baseRowSchema.extend({
-    amount: amountSchema,
+    /** 参与分 / 比赛分；留空或 0 表示只记加分 */
+    amount: amountSchema.optional(),
     activityTitle: z.string().trim().min(2, '活动名称至少 2 个字').max(120),
     activityDate: dateSchema,
     /** 平台比赛行：预览阶段取到的比赛起止时间，用于新建存档 */
     contestStartAt: z.string().datetime().optional(),
     contestEndAt: z.string().datetime().optional(),
-  }).refine((row) => !row.platform || row.contestId, { message: '填写了平台就必须填写比赛场次', path: ['contestId'] })).min(1).max(2000),
+  })
+    .refine((row) => !row.platform || row.contestId, { message: '填写了平台就必须填写比赛场次', path: ['contestId'] })
+    .refine((row) => row.amount != null || row.bonusAmount != null, { message: '参与分与加分不能都为空', path: ['amount'] })
+    .refine((row) => (row.bonus == null) === (row.bonusAmount == null), { message: '加分项与加分须同时提供', path: ['bonusAmount'] }),
+  ).min(1).max(2000),
 })
 export type HistoryExcelInput = z.infer<typeof historyExcelSchema>
 
@@ -133,6 +183,10 @@ export class HistoryImportService {
 
     type Resolved = (typeof input.rows)[number] & {
       memberName: string | null
+      /** 参与分来源：表格手填 / 按活动类型默认 / 按榜单 W 公式 */
+      amountSource?: 'sheet' | 'default' | 'formula'
+      /** 加分来源：表格手填 / 加分项标准分 */
+      bonusSource?: 'sheet' | 'standard'
       contestStartAt?: string
       contestEndAt?: string
       computed?: { platformRank: number | null; solvedCount: number; score: number; formula: ContestFormulaResult | null }
@@ -140,6 +194,7 @@ export class HistoryImportService {
     }
     const resolved: Resolved[] = input.rows.map((row) => ({
       ...row,
+      ...(row.amount != null ? { amountSource: 'sheet' as const } : {}),
       memberName: nameByNo.get(row.studentNo) ?? null,
       ...(nameByNo.has(row.studentNo) ? {} : { error: '成员不存在（学号未注册，可先在成员管理导入）' }),
     }))
@@ -192,8 +247,10 @@ export class HistoryImportService {
           })
           row.computed = { platformRank: entry.rank, solvedCount: entry.solvedCount, score: entry.score, formula }
           if (row.amount == null) {
-            if (formula) row.amount = formula.W.toFixed(2)
-            else row.error = '榜上无有效提交，不自动计分（如需计分请在积分列手填）'
+            if (formula) {
+              row.amount = formula.W.toFixed(2)
+              row.amountSource = 'formula'
+            } else row.error = '榜上无有效提交，不自动计分（如需计分请在积分列手填）'
           }
         } else if (row.amount == null) {
           row.error = !summary.info.available
@@ -205,9 +262,35 @@ export class HistoryImportService {
       }
     }
 
+    // 同一活动同一成员同类别只发一次默认参与分（多写一行用来记另一个加分项）
+    const participated = new Set<string>()
     for (const row of resolved) {
       if (row.error) continue
-      if (row.amount == null) row.error = '缺少积分'
+      const key = `${row.platform ? `${row.platform}:${row.contestId}` : `${row.activityTitle}\u0000${row.activityDate}`}\u0000${row.studentNo}\u0000${row.category}`
+      if (row.amount == null && !row.platform && PARTICIPATION_CATEGORIES.has(row.category) && !participated.has(key)) {
+        row.amount = PARTICIPATION_DEFAULTS[row.activityType ?? (defaultActivityType(row.category) as keyof typeof PARTICIPATION_DEFAULTS)]
+        row.amountSource = 'default'
+      }
+      if (row.amount != null && Number(row.amount) !== 0) participated.add(key)
+
+      if (row.bonusAmount != null) {
+        row.bonus ??= 'other'
+        row.bonusSource = 'sheet'
+      } else if (row.bonus) {
+        const standard = HISTORY_BONUS_ITEMS[row.bonus].amount
+        if (standard == null) {
+          row.error = '加分项为「其他加分」时请在「加分」列填写分值'
+          continue
+        }
+        row.bonusAmount = String(standard)
+        row.bonusSource = 'standard'
+      }
+
+      if (row.amount == null && row.bonusAmount == null) {
+        row.error = participated.has(key)
+          ? '同一活动已计过参与分，这一行没有加分项（重复行）'
+          : '该类别没有默认参与分（只有活动 / 比赛 / 服务类有），请在「参与分」列填写'
+      } else if (Number(row.amount ?? 0) === 0 && row.bonusAmount == null) row.error = '参与分为 0 且没有加分项'
       else if (!row.activityTitle || row.activityTitle.length < 2) row.error = row.platform ? '无法获取比赛名称，请在「活动名称」列填写' : '缺少活动名称'
       else if (!row.activityDate) row.error = row.platform ? '无法获取比赛日期，请在「活动日期」列填写' : '缺少活动日期'
     }
@@ -307,33 +390,67 @@ export class HistoryImportService {
         : await this.ensureHistoryActivity(actor, first.activityTitle, first.activityDate, first.activityType ?? defaultActivityType(first.category))
       activities.push({ id: activityId, title, date: first.activityDate, created })
       for (const row of rows) {
-        try {
-          const result = await this.scoring.postLedgerEntry(actor, {
-            userId: row.userId,
-            sourceKey: isContest
-              ? `contest:${row.platform}:${row.contestId}:W:${row.userId}`
-              : `history:${activityId}:${row.userId}:${row.category}`,
-            category: row.category,
-            amount: row.amount,
-            scoreMonth: row.scoreMonth ?? row.activityDate.slice(0, 7),
-            detail: {
-              activityId,
-              activityTitle: title,
-              note: row.note ?? null,
-              source: isContest ? 'history_excel_contest' : 'history_excel',
-              importBatchId: batchId,
-              sheetRow: row.row,
-              ...(isContest ? { platform: row.platform, contestId: row.contestId, handle: row.handle ?? null } : {}),
-            },
+        const base = {
+          activityId,
+          activityTitle: title,
+          note: row.note ?? null,
+          source: isContest ? 'history_excel_contest' : 'history_excel',
+          importBatchId: batchId,
+          sheetRow: row.row,
+          ...(isContest ? { platform: row.platform, contestId: row.contestId, handle: row.handle ?? null } : {}),
+        }
+        const scoreMonth = row.scoreMonth ?? row.activityDate.slice(0, 7)
+        // 一行最多两条流水：参与分 / 比赛分 + 加分项
+        const parts: Array<{ label: string; post: () => Promise<{ deduplicated: boolean }> }> = []
+        if (row.amount != null && Number(row.amount) !== 0) {
+          parts.push({
+            label: isContest ? '比赛积分' : '参与分',
+            post: () => this.scoring.postLedgerEntry(actor, {
+              userId: row.userId,
+              sourceKey: isContest
+                ? `contest:${row.platform}:${row.contestId}:W:${row.userId}`
+                : `history:${activityId}:${row.userId}:${row.category}`,
+              category: row.category,
+              amount: row.amount!,
+              scoreMonth,
+              detail: base,
+            }),
           })
+        }
+        if (row.bonus && row.bonusAmount != null) {
+          const item = HISTORY_BONUS_ITEMS[row.bonus]
+          parts.push({
+            label: item.label,
+            post: () => this.scoring.postLedgerEntry(actor, {
+              userId: row.userId,
+              sourceKey: `history:${activityId}:${row.userId}:bonus:${row.bonus}`,
+              category: item.category,
+              amount: row.bonusAmount!,
+              scoreMonth,
+              detail: { ...base, bonus: row.bonus, bonusLabel: item.label },
+            }),
+          })
+        }
+        const results: Array<'posted' | 'duplicate' | string> = []
+        for (const part of parts) {
+          try {
+            results.push((await part.post()).deduplicated ? 'duplicate' : 'posted')
+          } catch (error) {
+            results.push(`${part.label}入账失败：${error instanceof Error ? error.message : '未知错误'}`)
+          }
+        }
+        const failures = results.filter((r) => r !== 'posted' && r !== 'duplicate')
+        if (results.includes('posted')) {
+          outcomes.push({ row: row.row, studentNo: row.studentNo, status: 'posted', ...(failures.length ? { error: failures.join('；') } : {}) })
+        } else if (failures.length > 0) {
+          outcomes.push({ row: row.row, studentNo: row.studentNo, status: 'failed', error: failures.join('；') })
+        } else {
           outcomes.push({
             row: row.row,
             studentNo: row.studentNo,
-            status: result.deduplicated ? 'duplicate' : 'posted',
-            ...(result.deduplicated ? { error: isContest ? '该成员本场比赛积分已入账，已跳过' : '该成员在此活动的同类积分已入账，已跳过' } : {}),
+            status: 'duplicate',
+            error: isContest ? '该成员本场比赛积分已入账，已跳过' : '该成员在此活动的积分已入账，已跳过',
           })
-        } catch (error) {
-          outcomes.push({ row: row.row, studentNo: row.studentNo, status: 'failed', error: error instanceof Error ? error.message : '入账失败' })
         }
       }
     }

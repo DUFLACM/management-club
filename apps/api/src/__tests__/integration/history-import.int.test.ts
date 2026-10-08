@@ -73,6 +73,49 @@ describe('Excel 历史积分导入', () => {
   })
 })
 
+describe('默认参与分 + 加分项', () => {
+  it('参与分留空按活动类型给默认分，加分项按标准分另记一条；同活动多行只发一次参与分', async () => {
+    const a = await createTestUser(db, { studentNo: '202605101' })
+    const b = await createTestUser(db, { studentNo: '202605102' })
+    await createTestUser(db, { studentNo: '202605103' })
+    const lecture = { activityTitle: '历史图论讲座', activityDate: '2025-05-01', activityType: 'lecture' as const, category: 'activity' as const }
+    const preview = await history.preview({
+      lambdaKey: 'auto', cap: 20,
+      rows: [
+        { row: 2, studentNo: '202605101', ...lecture, bonus: 'lecture_intermediate' },
+        { row: 3, studentNo: '202605101', ...lecture, bonus: 'host' },
+        { row: 4, studentNo: '202605102', ...lecture, bonus: 'other', bonusAmount: '3.5' },
+        { row: 5, studentNo: '202605103', activityTitle: '历史例会', activityDate: '2025-05-02', activityType: 'meeting', category: 'activity' },
+        { row: 6, studentNo: '202605103', activityTitle: '历史例会', activityDate: '2025-05-02', activityType: 'meeting', category: 'activity' },
+        { row: 7, studentNo: '202605103', activityTitle: '期初', activityDate: '2025-02-28', category: 'initial' },
+        { row: 8, studentNo: '202605103', ...lecture, bonus: 'other' },
+      ],
+    })
+    const byRow = new Map(preview.rows.map((r) => [r.row, r]))
+    expect(byRow.get(2)).toMatchObject({ amount: '1.5', amountSource: 'default', bonusAmount: '6', bonusSource: 'standard' })
+    // 同成员同活动第二行：不再发参与分，只记主持加分
+    expect(byRow.get(3)).toMatchObject({ bonusAmount: '2', bonusSource: 'standard' })
+    expect(byRow.get(3)?.amount).toBeUndefined()
+    expect(byRow.get(4)).toMatchObject({ amount: '1.5', bonusAmount: '3.5', bonusSource: 'sheet' })
+    expect(byRow.get(5)).toMatchObject({ amount: '2', amountSource: 'default' })
+    expect(byRow.get(6)?.error).toContain('重复行')
+    expect(byRow.get(7)?.error).toContain('没有默认参与分')
+    expect(byRow.get(8)?.error).toContain('其他加分')
+
+    const commitRows = historyExcelSchema.parse({ rows: preview.rows.filter((r) => !r.error) }).rows
+    const first = await history.importExcel(makeActor(), { rows: commitRows })
+    expect(first).toMatchObject({ posted: 4, duplicate: 0, failed: 0 })
+    const entriesA = await db.pointsLedgerEntry.findMany({ where: { userId: a.userId }, orderBy: { amount: 'asc' } })
+    expect(entriesA.map((e) => [e.category, Number(e.amount)])).toEqual([['activity', 1.5], ['service', 2], ['contribution', 6]])
+    expect((entriesA[2].detail as { bonusLabel: string }).bonusLabel).toBe('讲题·中档')
+    const entriesB = await db.pointsLedgerEntry.findMany({ where: { userId: b.userId }, orderBy: { amount: 'asc' } })
+    expect(entriesB.map((e) => [e.category, Number(e.amount)])).toEqual([['activity', 1.5], ['award', 3.5]])
+
+    const again = await history.importExcel(makeActor(), { rows: commitRows })
+    expect(again).toMatchObject({ posted: 0, duplicate: 4 })
+  })
+})
+
 describe('Excel 平台比赛行', () => {
   it('按表格中的平台 / 场次 / 账号抓榜单补全积分、名称、日期；导入建存档且幂等', async () => {
     const top = await createTestUser(db, { studentNo: '202605010', name: '甲同学' })
