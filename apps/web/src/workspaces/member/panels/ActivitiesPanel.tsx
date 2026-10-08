@@ -37,18 +37,7 @@ import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { BindPlatformAccountDialog } from '@/components/club/BindPlatformAccountDialog';
 import { useDebouncedValue, LoadMoreButton } from '@/lib/hooks';
-import {
-  ACTIVITY_TYPE_LABELS,
-  activityTypeBadgeClass,
-  activityTypeLabel,
-  formatDateTime,
-  formatStartEnd,
-  formatVenue,
-  platformContestUrl,
-  platformLabel,
-  policyLabel,
-  relativeDeadline,
-} from '@/lib/format';
+import { ACTIVITY_TYPE_LABELS, activityTypeBadgeClass, activityTypeLabel, formatDateTime, formatStartEnd, formatVenue, platformContestUrl, platformLabel, policyLabel, relativeDeadline, memberName } from '@/lib/format';
 import { ActivityCheckinCard } from '@/components/club/ActivityCheckinCard';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { MemberGate } from '@/components/club/QueryBoundary';
@@ -1331,7 +1320,7 @@ function MaterialsSection({
                   <p className="truncate text-sm font-medium text-foreground">{material.title}</p>
                   <p className="text-xs text-muted-foreground">
                     {MATERIAL_KIND_LABELS[material.kind] ?? material.kind} · {formatSize(material.sizeBytes)} ·{' '}
-                    {material.user?.profile?.displayName ?? material.user?.verifiedRealName ?? '成员'} ·{' '}
+                    {memberName(material.user)} ·{' '}
                     {formatDateTime(material.createdAt)}
                   </p>
                 </div>

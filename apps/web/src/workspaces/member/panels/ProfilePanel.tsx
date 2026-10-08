@@ -14,14 +14,7 @@ import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { LoadMoreButton } from '@/lib/hooks';
-import {
-  attendanceResultBadge,
-  formatDateTime,
-  formatStartEnd,
-  membershipLabel,
-  platformAccountBadge,
-  platformLabel,
-} from '@/lib/format';
+import { attendanceResultBadge, formatDateTime, formatStartEnd, membershipLabel, platformAccountBadge, platformLabel, memberName, formatMemberName } from '@/lib/format';
 import {
   competitionsApi,
   entryStatusLabel,
@@ -164,7 +157,7 @@ function ProfileBody({ principalId }: { principalId: string }) {
                   </Avatar>
                   <div className="flex min-w-0 flex-1 flex-col gap-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <h2 className="text-lg font-semibold text-foreground">{displayName}</h2>
+                      <h2 className="text-lg font-semibold text-foreground">{'verified' in profile ? formatMemberName(displayName, profile.verified.realName) : displayName}</h2>
                       <Badge variant="info">{membershipLabel(profile.membership)}</Badge>
                     </div>
                     <p className="text-sm leading-[22px] text-muted-foreground">
@@ -789,6 +782,10 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
   });
 
   async function handleAvatar(file: File) {
+    if (file.size > 10 * 1024 * 1024) {
+      setAvatarState({ phase: 'error', message: '图片超过 10 MiB，请压缩或截图后再上传。' });
+      return;
+    }
     setAvatarState({ phase: 'uploading' });
     try {
       const token = await fetchCsrfToken();
@@ -952,7 +949,7 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
                 <AvatarFallback>{(profile.displayName || '我').slice(0, 1).toUpperCase()}</AvatarFallback>
               </Avatar>
               <p className="text-xs leading-5 text-muted-foreground">
-                支持 JPEG/PNG/WebP，≤2MiB；上传后自动裁剪并剥离 EXIF，处理完成才设为头像。
+                支持 JPEG/PNG/WebP，≤10MiB；上传后自动裁剪并剥离 EXIF，处理完成才设为头像。
                 {profile.avatarAssetId ? '（当前已设置头像）' : ''}
               </p>
             </div>
@@ -1098,10 +1095,7 @@ function CompetitionsSection({ principalId }: { principalId: string }) {
                   <span className="text-xs text-muted-foreground">
                     {team.members
                       .map(
-                        (member) =>
-                          member.user?.profile?.displayName ??
-                          member.user?.verifiedRealName ??
-                          '队员',
+                        (member) => memberName(member.user, '队员'),
                       )
                       .join(' · ')}
                   </span>

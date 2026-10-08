@@ -23,15 +23,7 @@ import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { useDebouncedValue, LoadMoreButton } from '@/lib/hooks';
-import {
-  ACTIVITY_TYPE_LABELS,
-  activityTypeLabel,
-  formatDateTime,
-  formatStartEnd,
-  policyLabel,
-  toLocalInputValue,
-  fromLocalInputValue,
-} from '@/lib/format';
+import { ACTIVITY_TYPE_LABELS, activityTypeLabel, formatDateTime, formatStartEnd, policyLabel, toLocalInputValue, fromLocalInputValue, memberName } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { AttendanceQrBoard } from '@/components/club/AttendanceQrBoard';
 import { PrincipalGate } from '@/components/club/QueryBoundary';
@@ -1165,7 +1157,7 @@ function LectureRequestsSection({
             <li key={request.id} className="flex flex-wrap items-center gap-3 py-2.5">
               <div className="min-w-0 flex-1">
                 <p className="flex flex-wrap items-center gap-2 text-sm font-medium text-foreground">
-                  {request.user.profile?.displayName ?? request.user.verifiedRealName}
+                  {memberName(request.user)}
                   <span className="font-normal text-muted-foreground tabular-nums">
                     {request.user.studentNo}
                   </span>

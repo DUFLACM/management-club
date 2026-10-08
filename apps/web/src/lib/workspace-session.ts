@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { api, type ApiError } from './api';
 import { usePrincipalQuery } from './session';
 import type { WorkspaceUser } from '@/workspaces/shared/WorkspaceShell';
+import { formatMemberName } from '@/lib/format';
 
 interface SessionDetails {
   principalId: string;
@@ -32,7 +33,7 @@ export function useWorkspaceSession() {
       : '校园账号';
   // 资料页改过展示名时侧栏同步跟随，没设过则回退真实姓名
   const displayName =
-    details.data?.displayName || details.data?.realName || (principal?.authenticated ? fallbackName : '未登录');
+    formatMemberName(details.data?.displayName, details.data?.realName) || (principal?.authenticated ? fallbackName : '未登录');
   const user: WorkspaceUser = {
     displayName,
     avatarText: displayName.slice(0, 1),

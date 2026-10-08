@@ -4,7 +4,7 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { VenueService } from '../venues/venue.service.js'
-import { newId } from '../../common/utils.js'
+import { newId, memberName } from '../../common/utils.js'
 import { actorCan } from '../../common/guards.js'
 import { ContestStandingsService, contestExternalUrl, type StandingsSnapshot } from './contest-standings.service.js'
 import type { SessionActor } from '../auth/session.service.js'
@@ -714,7 +714,7 @@ export class ActivityService {
     })
     const byUser = new Map<string, { userId: string; name: string; total: number; count: number }>()
     for (const entry of points) {
-      const name = entry.user.profile?.displayName ?? entry.user.verifiedRealName
+      const name = memberName(entry.user)
       const current = byUser.get(entry.userId) ?? { userId: entry.userId, name, total: 0, count: 0 }
       current.total += Number(entry.amount)
       current.count += 1
@@ -863,7 +863,7 @@ export class ActivityService {
       return {
         lectureRequestId: lecture.id,
         lecturerUserId: lecture.userId,
-        lecturerName: lecture.user.profile?.displayName ?? lecture.user.verifiedRealName,
+        lecturerName: memberName(lecture.user),
         topic: lecture.topic,
         isLecturer,
         canRate: blockedReason === null,
@@ -900,7 +900,7 @@ export class ActivityService {
     return lectures.map((lecture) => ({
       lectureRequestId: lecture.id,
       lecturerUserId: lecture.userId,
-      lecturerName: lecture.user.profile?.displayName ?? lecture.user.verifiedRealName,
+      lecturerName: memberName(lecture.user),
       studentNo: lecture.user.studentNo,
       topic: lecture.topic,
       stats: summarizeRatings(lecture.ratings),
@@ -1116,7 +1116,7 @@ export class ActivityService {
         return {
           userId: account.userId,
           studentNo: account.user.studentNo,
-          name: account.user.profile?.displayName ?? account.user.verifiedRealName,
+          name: memberName(account.user),
           handle: entry.handle,
           displayName: entry.displayName,
           platformRank: entry.rank,

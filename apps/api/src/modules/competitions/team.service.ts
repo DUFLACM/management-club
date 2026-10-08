@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common'
 import { matrixTeamAssignment } from '@acm/scoring-core'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
-import { newId } from '../../common/utils.js'
+import { newId, memberName } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 
 /**
@@ -70,7 +70,7 @@ export class TeamService {
     })
     return users.map((u) => ({
       userId: u.id,
-      displayName: u.profile?.displayName ?? u.verifiedRealName,
+      displayName: memberName(u),
       studentNoMasked: u.studentNo.length > 4 ? `***${u.studentNo.slice(-4)}` : u.studentNo,
     }))
   }

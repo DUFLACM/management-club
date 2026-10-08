@@ -2,7 +2,7 @@ import { DomainError } from '../../common/domain-error.js'
 import { Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
-import { newId } from '../../common/utils.js'
+import { newId, memberName } from '../../common/utils.js'
 import { z } from 'zod'
 import type { SessionActor } from '../auth/session.service.js'
 
@@ -112,7 +112,7 @@ export class ProfilesService {
     // 学号仅本人/授权视图；普通个人主页不返回
     return {
       userId: user.id,
-      displayName: profile.displayName ?? user.verifiedRealName,
+      displayName: memberName({ verifiedRealName: user.verifiedRealName, profile }),
       bio: profile.bio ?? null,
       avatarAssetId: profile.avatarAssetId ?? null,
       membership: user.membershipTerms[0]?.membershipStatus ?? 'applicant',

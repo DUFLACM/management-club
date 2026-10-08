@@ -24,17 +24,7 @@ import {
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrincipal } from '@/lib/session';
-import {
-  activityTypeLabel,
-  formatDateTime,
-  formatMonthDay,
-  formatWeekday,
-  membershipLabel,
-  monthLabel,
-  platformAccountBadge,
-  platformLabel,
-  relativeDeadline,
-} from '@/lib/format';
+import { activityTypeLabel, formatDateTime, formatMonthDay, formatWeekday, membershipLabel, monthLabel, platformAccountBadge, platformLabel, relativeDeadline, formatMemberName } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { BindPlatformAccountDialog } from '@/components/club/BindPlatformAccountDialog';
 import { MemberGate, QueryBoundary } from '@/components/club/QueryBoundary';
@@ -257,7 +247,7 @@ function OverviewBody({ principalId }: { principalId: string }) {
                           {membershipLabel(data.user.membership)}
                         </p>
                         <h2 className="mt-1 text-lg font-semibold text-foreground">
-                          下午好，{data.user.displayName}
+                          下午好，{formatMemberName(data.user.displayName, data.user.realName)}
                         </h2>
                       </div>
                       <div className="flex flex-wrap items-end gap-x-8 gap-y-3">

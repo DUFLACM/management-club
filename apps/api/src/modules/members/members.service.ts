@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newInvitationSecret } from '../auth/auth.service.js'
-import { newId, sha256Hex, monthKey } from '../../common/utils.js'
+import { newId, sha256Hex, monthKey, memberName } from '../../common/utils.js'
 import { computeEffectiveScore, formalQuota, graceMonths, initialPoints } from '@acm/scoring-core'
 import {
   RANKED_MEMBERSHIPS,
@@ -124,7 +124,7 @@ export class MembersService {
     const membership = user.membershipTerms[0]?.membershipStatus ?? 'applicant'
     return {
       user: {
-        displayName: user.profile?.displayName ?? user.verifiedRealName,
+        displayName: memberName(user),
         studentNo: user.studentNo,
         realName: user.verifiedRealName,
         membership,
@@ -237,7 +237,7 @@ export class MembersService {
         const eff = computeEffectiveScore({ monthlyScores: byUser.get(u.id) ?? {}, currentMonth }, { effectiveWeights: [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
         return {
           id: u.id,
-          displayName: u.profile?.displayName ?? u.verifiedRealName,
+          displayName: memberName(u),
           studentNo: u.studentNo,
           grade: u.grade,
           membership: u.membershipTerms[0]?.membershipStatus ?? 'applicant',

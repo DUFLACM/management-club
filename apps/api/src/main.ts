@@ -13,7 +13,10 @@ export class StableErrorFilter implements ExceptionFilter {
     const ctx = host.switchToHttp()
     const res = ctx.getResponse<Response>()
     const status = exception instanceof HttpException ? exception.getStatus() : 500
-    const body = exception instanceof HttpException ? exception.getResponse() : { message: '服务器内部错误' }
+    // multer 超限抛 413「File too large」：换成中文提示，避免前端显示英文 / 被当成服务器错误
+    const body = status === 413
+      ? { code: 'PAYLOAD_TOO_LARGE', message: '上传文件过大，请压缩后重试' }
+      : exception instanceof HttpException ? exception.getResponse() : { message: '服务器内部错误' }
     const errorCode =
       typeof body === 'object' && body !== null && 'code' in body && typeof (body as { code?: unknown }).code === 'string'
         ? (body as { code: string }).code
@@ -23,7 +26,11 @@ export class StableErrorFilter implements ExceptionFilter {
             ? 'FORBIDDEN'
             : status === 400
               ? 'BAD_REQUEST'
-              : 'INTERNAL'
+              : status === 404
+                ? 'NOT_FOUND'
+                : status < 500
+                  ? 'REQUEST_FAILED'
+                  : 'INTERNAL'
     res.status(status).json({
       error: {
         code: errorCode,

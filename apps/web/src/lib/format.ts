@@ -352,3 +352,22 @@ export function fromLocalInputValue(value: string): string | null {
   );
   return Number.isNaN(utc.getTime()) ? null : utc.toISOString();
 }
+
+/**
+ * 成员显示名：展示名后面括号带实名，如「Alice（张三）」；没设展示名或与实名相同时只显示实名
+ * （与服务端 common/utils memberName 一致；接口已拼好的 displayName 字段不要再套一次）。
+ */
+export function memberName(
+  user: { verifiedRealName?: string | null; profile?: { displayName?: string | null } | null } | null | undefined,
+  fallback = '成员',
+): string {
+  return formatMemberName(user?.profile?.displayName, user?.verifiedRealName) || fallback;
+}
+
+/** 已知展示名与实名两个字段时拼接显示名 */
+export function formatMemberName(displayName: string | null | undefined, realName: string | null | undefined): string {
+  const display = displayName?.trim() || '';
+  const real = realName?.trim() || '';
+  if (display && real && display !== real) return `${display}（${real}）`;
+  return display || real;
+}

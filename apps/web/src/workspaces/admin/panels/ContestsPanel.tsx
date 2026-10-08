@@ -21,7 +21,7 @@ import {
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrincipal } from '@/lib/session';
-import { formatDateTime } from '@/lib/format';
+import { formatDateTime, memberName } from '@/lib/format';
 import {
   competitionsAdminApi,
   contestTierLabel,
@@ -81,13 +81,6 @@ function toIso(value: string): string | undefined {
 
 function categoryBadge(category: string) {
   return category === 'A' ? 'info' : 'success';
-}
-
-function memberName(user: {
-  verifiedRealName: string;
-  profile: { displayName: string | null } | null;
-}): string {
-  return user.profile?.displayName ?? user.verifiedRealName;
 }
 
 export default function ContestsPanel() {

@@ -17,7 +17,7 @@ import { ContestStandingsService } from '../activities/contest-standings.service
 import { rankEligibleMembers } from './effective-ranking.js'
 import { mergeRuleParams } from './rule-params.js'
 import { computeContestW, hasValidSubmission, type LambdaKey } from './contest-formula.js'
-import { newId, monthKey, monthKeyPlus } from '../../common/utils.js'
+import { newId, monthKey, monthKeyPlus, memberName } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { z } from 'zod'
 
@@ -505,7 +505,7 @@ export class ScoringService {
         await tx.disclosureRow.create({
           data: {
             id: newId(), disclosureId, userId: row.user.id, rank,
-            displayName: row.user.profile?.displayName ?? row.user.verifiedRealName,
+            displayName: memberName(row.user),
             studentNo: row.user.studentNo, grade: row.user.grade,
             membership: row.user.membershipTerms[0]?.membershipStatus ?? 'unknown',
             lastMonthE: (row.e - row.monthAdded).toFixed(4),

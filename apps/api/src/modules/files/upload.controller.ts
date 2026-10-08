@@ -10,14 +10,15 @@ import { newId } from '../../common/utils.js'
 
 /**
  * 私有附件：头像与贡献申报佐证图的上传与读取（08 方案 3.2）。受控本地存储（开发）/对象存储引用（生产）。
- * - 头像：仅 JPEG/PNG/WebP 白名单（魔数检测），≤2MiB；处理内联完成（worker 队列不再必需，
- *   worker 中 media.process_avatar 保留用于历史排队任务的幂等兜底）。
+ * - 头像：仅 JPEG/PNG/WebP 白名单（魔数检测），源文件 ≤10MiB（手机原图常见 3–8MB，派生后只留 ≤512px 的 WebP）；
+ *   处理内联完成，派生后删除源文件（剥除 EXIF/GPS 不留存）；worker 中 media.process_avatar 保留用于历史排队任务的幂等兜底。
  * - 佐证图：同一白名单，≤5MiB，重编码为 WebP（剥除 EXIF/GPS）并派生缩略图；
  *   读取限本人与具 claims.review 的审核方。
  * - 变体读取走授权媒体入口，private 缓存；所有附件不直接公开。
  */
 
 const IMAGE_MIME_WHITELIST = ['image/jpeg', 'image/png', 'image/webp']
+const AVATAR_MAX_BYTES = 10 * 1024 * 1024
 
 /** 声明类型须在白名单内，且文件头与之一致（阻止改扩展名的 SVG/HTML 等） */
 function assertImageMagic(file: { buffer: Buffer; mimetype: string }): void {
@@ -37,10 +38,10 @@ export class UploadController {
   constructor(private readonly db: PrismaService) {}
 
   @Post('profile/avatar')
-  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 2 * 1024 * 1024, files: 1 } }))
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: AVATAR_MAX_BYTES, files: 1 } }))
   async uploadAvatar(@CurrentUser() user: { userId: string }, @UploadedFile() file?: { buffer: Buffer; mimetype: string; size: number }) {
     if (!file) throw new BadRequestException('缺少上传文件')
-    if (file.size > 2 * 1024 * 1024) throw new BadRequestException('头像源文件不超过 2 MiB')
+    if (file.size > AVATAR_MAX_BYTES) throw new BadRequestException('头像图片不超过 10 MiB')
     assertImageMagic(file)
 
     const assetId = newId()
@@ -67,11 +68,11 @@ export class UploadController {
     // 内联派生变体：方向修正 → 裁剪缩放 → WebP 重编码（剥除 EXIF/GPS）；失败即时报错
     try {
       const sharp = (await import('sharp')).default
-      const image = sharp(file.buffer, { limitInputPixels: 16_000_000 })
+      const image = sharp(file.buffer, { limitInputPixels: 50_000_000 })
       const meta = await image.metadata()
       if (meta.pages && meta.pages > 1) throw new BadRequestException('多帧/动画图片不支持')
-      if (!meta.width || !meta.height || meta.width < 64 || meta.height < 64 || meta.width > 4096 || meta.height > 4096) {
-        throw new BadRequestException('图片尺寸须在 64–4096px')
+      if (!meta.width || !meta.height || meta.width < 64 || meta.height < 64 || meta.width > 10_000 || meta.height > 10_000) {
+        throw new BadRequestException('图片尺寸须在 64–10000px')
       }
       const variants: Record<string, string> = {}
       for (const size of [64, 128, 256, 512]) {
@@ -79,9 +80,11 @@ export class UploadController {
         await image.rotate().resize(size, size, { fit: 'cover' }).webp({ quality: size <= 128 ? 78 : 82 }).toFile(path.join(storageRoot, outKey))
         variants[String(size)] = outKey
       }
+      // 原图已派生出剥离元数据的变体，不再保留（避免 EXIF/GPS 与大文件长期占用存储）
+      await fs.rm(sourcePath, { force: true })
       await this.db.mediaAsset.update({
         where: { id: assetId },
-        data: { status: 'ready', width: meta.width, height: meta.height, frames: 1, variants: variants as never, mimeType: 'image/webp' },
+        data: { status: 'ready', width: meta.width, height: meta.height, frames: 1, variants: variants as never, mimeType: 'image/webp', storageKey: variants['512'] },
       })
     } catch (error) {
       await this.db.mediaAsset.update({ where: { id: assetId }, data: { status: 'failed' } }).catch(() => undefined)

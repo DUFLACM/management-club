@@ -85,3 +85,14 @@ export function isValidInviteCodeFormat(input: string): boolean {
 export function clamp(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n))
 }
+
+/**
+ * 成员对外显示名：展示名可自定义，后面括号带实名，如「Alice（张三）」；
+ * 没设展示名或与实名相同时只显示实名。系统内凡是展示成员名称的接口都用它拼。
+ */
+export function memberName(user: { verifiedRealName: string | null; profile?: { displayName: string | null } | null }): string {
+  const display = user.profile?.displayName?.trim() || null
+  const real = user.verifiedRealName?.trim() || null
+  if (display && real && display !== real) return `${display}（${real}）`
+  return display ?? real ?? ''
+}

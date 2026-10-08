@@ -23,11 +23,7 @@ import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { LoadMoreButton } from '@/lib/hooks';
-import {
-  formatDateTime,
-  platformAccountBadge,
-  platformLabel,
-} from '@/lib/format';
+import { formatDateTime, platformAccountBadge, platformLabel, memberName } from '@/lib/format';
 import {
   competitionsApi,
   contestTierLabel,
@@ -1479,7 +1475,7 @@ function TeamCard({
         <ul className="flex flex-wrap gap-x-4 gap-y-1">
           {team.members.map((member) => (
             <li key={member.id} className="text-xs text-muted-foreground">
-              {member.user?.profile?.displayName ?? member.user?.verifiedRealName ?? '队员'}
+              {memberName(member.user, '队员')}
               {member.role === 'captain' && <span className="ml-1 text-primary">队长</span>}
             </li>
           ))}

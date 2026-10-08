@@ -1,6 +1,7 @@
 import { computeEffectiveScore, defaultRuleParams } from '@acm/scoring-core'
 import { mergeRuleParams } from './rule-params.js'
 import type { PrismaService } from '../../infrastructure/database/database.module.js'
+import { memberName } from '../../common/utils.js'
 
 /**
  * 当前有效榜的唯一口径（首页「当前有效榜排名」与榜单页「当前有效榜」共用，保证两处名次一致）。
@@ -47,7 +48,7 @@ export async function rankEligibleMembers(
   const eligible = users
     .map((u) => ({
       id: u.id,
-      displayName: u.profile?.displayName ?? u.verifiedRealName,
+      displayName: memberName(u),
       membership: u.membershipTerms[0]?.membershipStatus ?? 'applicant',
     }))
     .filter((u) => RANKED_MEMBERSHIPS.includes(u.membership))

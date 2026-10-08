@@ -100,6 +100,7 @@ export function BindForm({
   onSubmit,
   onCancel,
   cancelLabel = '取消',
+  lockPlatform = false,
   error,
 }: {
   defaultPlatform?: string;
@@ -107,6 +108,8 @@ export function BindForm({
   onSubmit: (input: { platform: string; externalId: string; proofNote: string }) => void;
   onCancel: () => void;
   cancelLabel?: string;
+  /** 锁定为 defaultPlatform，不可切换（登录绑定门强制牛客） */
+  lockPlatform?: boolean;
   error: string | null;
 }) {
   const [platform, setPlatform] = useState(defaultPlatform ?? 'nowcoder');
@@ -130,7 +133,7 @@ export function BindForm({
       )}
       <div className="grid gap-1.5">
         <Label htmlFor="bind-platform">平台</Label>
-        <Select value={platform} onValueChange={setPlatform} disabled={submitting}>
+        <Select value={platform} onValueChange={setPlatform} disabled={submitting || lockPlatform}>
           <SelectTrigger id="bind-platform">
             <SelectValue />
           </SelectTrigger>

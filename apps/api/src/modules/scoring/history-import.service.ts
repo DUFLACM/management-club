@@ -7,7 +7,7 @@ import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { ContestStandingsService, contestExternalUrl, type StandingsEntry } from '../activities/contest-standings.service.js'
 import { ScoringService, ScoringError } from './scoring.service.js'
 import { computeContestW, hasValidSubmission, type ContestFormulaResult, type LambdaKey } from './contest-formula.js'
-import { newId } from '../../common/utils.js'
+import { newId, memberName } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 
 /**
@@ -185,7 +185,7 @@ export class HistoryImportService {
         platformAccounts: { where: { status: { not: 'revoked' } }, select: { platform: true, externalId: true, status: true } },
       },
     })
-    const nameByNo = new Map(users.map((user) => [user.studentNo, user.profile?.displayName ?? user.verifiedRealName]))
+    const nameByNo = new Map(users.map((user) => [user.studentNo, memberName(user)]))
     // 成员在系统里绑定的平台账号：每平台一个活跃绑定，已核验优先
     const boundHandle = new Map<string, string>()
     for (const user of users) {

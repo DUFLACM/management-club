@@ -20,7 +20,7 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { ScoringService } from '../scoring/scoring.service.js'
 import { ContestStandingsService, contestExternalUrl } from '../activities/contest-standings.service.js'
-import { newId, monthKey } from '../../common/utils.js'
+import { newId, monthKey, memberName } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 
 /**
@@ -567,7 +567,7 @@ export class CompetitionEventService {
       })
       for (const reg of regs) {
         const entry = reg.platformAccount ? entryByHandle.get(reg.platformAccount.externalId) : undefined
-        const name = reg.user.profile?.displayName ?? reg.user.verifiedRealName
+        const name = memberName(reg.user)
         if (!entry) { skipped.push({ name, reason: '榜上未匹配到已核验平台账号' }); continue }
         rows.push({
           subjectLabel: name, handle: entry.handle, solvedCount: entry.solvedCount, score: entry.score, platformRank: entry.rank,
