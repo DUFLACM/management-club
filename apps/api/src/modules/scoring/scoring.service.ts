@@ -14,10 +14,10 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { ActivityService } from '../activities/activity.service.js'
 import { ContestStandingsService } from '../activities/contest-standings.service.js'
-import { rankEligibleMembers } from './effective-ranking.js'
+import { initialSummary, rankEligibleMembers } from './effective-ranking.js'
 import { mergeRuleParams } from './rule-params.js'
 import { computeContestW, hasValidSubmission, type LambdaKey } from './contest-formula.js'
-import { newId, monthKey, monthKeyPlus, memberName } from '../../common/utils.js'
+import { newId, monthKey, monthKeyPlus, memberName, visibleAvatar } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { z } from 'zod'
 
@@ -369,23 +369,30 @@ export class ScoringService {
       select: { amount: true, scoreMonth: true, category: true },
     })
     const monthlyRaw = new Map<string, number>()
+    // 入社基础分（initial）按第八条计入入社当月并参与 E 衰减，但展示上从「当月积分」里拆出来单独显示
+    const initialByMonth = new Map<string, number>()
     for (const e of entries) {
       monthlyRaw.set(e.scoreMonth, (monthlyRaw.get(e.scoreMonth) ?? 0) + Number(e.amount))
+      if (e.category === 'initial') initialByMonth.set(e.scoreMonth, (initialByMonth.get(e.scoreMonth) ?? 0) + Number(e.amount))
     }
+    const round6 = (v: number) => Math.round(v * 1e6) / 1e6
     const monthlyScores: Record<string, number> = {}
     for (const [k, v] of monthlyRaw) monthlyScores[k] = Math.round(v * 1e6) / 1e6
     const rule = await this.currentRuleVersion()
     const effective = computeEffectiveScore({ monthlyScores, currentMonth }, { effectiveWeights: rule.params.effectiveWeights ?? [1, 0.85, 0.7, 0.55, 0.4, 0.25] })
-    const sixMonths: Array<{ month: string; raw: number; m: number | null }> = effective.windowMonths.map((month) => ({
+    // raw = 当月积分（不含入社基础分），initial = 该月计入的入社基础分；两者相加才是该月计入 E 的原始分
+    const sixMonths: Array<{ month: string; raw: number; initial: number; m: number | null }> = effective.windowMonths.map((month) => ({
       month,
-      raw: monthlyScores[month] ?? 0,
+      raw: round6((monthlyScores[month] ?? 0) - (initialByMonth.get(month) ?? 0)),
+      initial: initialByMonth.get(month) ?? 0,
       m: null, // 正式 M 依 R01 取整策略确认
     }))
+    const eComponents = effective.components.map((c) => ({ month: c.month, m: Number(c.m), weight: Number(c.weight), contribution: Number(c.contribution) }))
     return {
       e: effective.eDisplay,
-      eComponents: effective.components.map((c) => ({ month: c.month, m: Number(c.m), weight: Number(c.weight), contribution: Number(c.contribution) }),
-      ),
+      eComponents,
       months: sixMonths,
+      initial: initialSummary(initialByMonth, eComponents),
       roundingPending: rule.params.monthlyRounding === 'pending',
       roundingNote: rule.params.monthlyRounding === 'pending' ? RULE_GAPS.R01 : null,
     }
@@ -541,6 +548,7 @@ export class ScoringService {
           rank: i + 1,
           userId: r.userId,
           displayName: r.displayName,
+          avatarAssetId: r.avatarAssetId,
           membership: r.membership,
           e: r.eDisplay,
           isMe: r.userId === viewerUserId,
@@ -550,13 +558,19 @@ export class ScoringService {
     if (kind === 'disclosure' && refId) {
       const d = await this.db.disclosure.findUnique({ where: { id: refId }, include: { rows: { orderBy: { rank: 'asc' } } } })
       if (!d) throw new ScoringError('公示不存在', 'NOT_FOUND')
+      // 公示行是发布时快照，头像按成员当前资料补上
+      const profiles = await this.db.userProfile.findMany({
+        where: { userId: { in: d.rows.map((r) => r.userId) } },
+        select: { userId: true, avatarAssetId: true, visibility: true },
+      })
+      const avatarOf = new Map(profiles.map((p) => [p.userId, visibleAvatar(p)]))
       return {
         kind,
         monthKey: d.monthKey,
         startsAt: d.startsAt?.toISOString() ?? null,
         endsAt: d.endsAt?.toISOString() ?? null,
         ruleVersionId: d.ruleVersionId,
-        rows: d.rows.map((r) => ({ rank: r.rank, userId: r.userId, displayName: r.displayName, studentNo: r.studentNo, membership: r.membership, currentE: Number(r.currentE).toFixed(1), monthAdded: Number(r.monthAdded).toFixed(1), isMe: r.userId === viewerUserId })),
+        rows: d.rows.map((r) => ({ rank: r.rank, userId: r.userId, displayName: r.displayName, avatarAssetId: avatarOf.get(r.userId) ?? null, studentNo: r.studentNo, membership: r.membership, currentE: Number(r.currentE).toFixed(1), monthAdded: Number(r.monthAdded).toFixed(1), isMe: r.userId === viewerUserId })),
       }
     }
     throw new ScoringError('缺少榜单引用', 'REF_MISSING')

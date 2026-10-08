@@ -17,6 +17,7 @@ import {
   MemberPanels,
   MEMBER_DEFAULT_SECTION,
   MEMBER_SECTION_KEYS,
+  prefetchPanels,
 } from '@/workspaces/lazy-panels';
 import { resolveSection, SectionRouter } from '@/workspaces/shared/SectionRouter';
 import { PlatformBindingGate } from '@/components/club/PlatformBindingGate';
@@ -96,6 +97,13 @@ export function MemberWorkspace({ user: providedUser, manageAccess }: MemberWork
       { replace: true },
     );
   }, [searchParams, setSearchParams]);
+
+  // 登录后在空闲时预取其余面板代码，切换导航不再等下载
+  const authenticated = session.principal?.authenticated === true;
+  useEffect(() => {
+    if (!authenticated) return;
+    return prefetchPanels('member', MEMBER_SECTION_KEYS);
+  }, [authenticated]);
 
   const handleNavigate = useCallback(
     (sectionKey: string) => {

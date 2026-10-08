@@ -7,6 +7,7 @@ import type { Response } from 'express'
 import { z } from 'zod'
 import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentUser, CurrentActor, ok } from '../../common/guards.js'
 import { TeamService, TeamError } from './team.service.js'
+import { TeamAdminService } from './team-admin.service.js'
 import type { SessionActor } from '../auth/session.service.js'
 
 /** 成员端 · 组队广场 */
@@ -121,5 +122,85 @@ export class TeamAdminController {
     res.setHeader('Content-Type', material.mimeType ?? 'application/octet-stream')
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(material.fileName)}`)
     return new StreamableFile(createReadStream(filePath))
+  }
+}
+
+/** 管理端 · 组队管理页（/admin?section=teams） */
+@Controller('/api/v1/admin/teams')
+@UseGuards(SessionGuard, PermissionsGuard, ActionGuard)
+export class TeamManageController {
+  constructor(private readonly teams: TeamAdminService) {}
+
+  @Get()
+  @RequireAction('competitions.manage')
+  async list(@Query('q') q?: string, @Query('status') status?: string, @Query('cursor') cursor?: string) {
+    return ok(await this.teams.list({ q, status, cursor }))
+  }
+
+  @Get(':id')
+  @RequireAction('competitions.manage')
+  async detail(@Param('id', ParseUUIDPipe) id: string) {
+    return ok(await this.teams.detail(id))
+  }
+
+  @Post()
+  @RequireAction('competitions.manage')
+  async create(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
+    const parsed = z.object({
+      name: z.string().trim().min(2, '队名至少 2 个字').max(80),
+      teamSize: z.number().int().min(1).max(10),
+      captainUserId: z.string().uuid(),
+      memberUserIds: z.array(z.string().uuid()).max(10).optional(),
+    }).safeParse(body)
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.teams.create(actor, parsed.data))
+  }
+
+  @Post(':id')
+  @RequireAction('competitions.manage')
+  async update(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({
+      name: z.string().trim().min(2, '队名至少 2 个字').max(80).optional(),
+      teamSize: z.number().int().min(1).max(10).optional(),
+      status: z.enum(['forming', 'locked']).optional(),
+    }).safeParse(body)
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.teams.update(actor, id, parsed.data))
+  }
+
+  @Post(':id/members')
+  @RequireAction('competitions.manage')
+  async addMember(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ userId: z.string().uuid() }).safeParse(body)
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.teams.addMember(actor, id, parsed.data.userId))
+  }
+
+  @Post(':id/members/:userId/remove')
+  @RequireAction('competitions.manage')
+  async removeMember(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Param('userId', ParseUUIDPipe) userId: string) {
+    return ok(await this.teams.removeMember(actor, id, userId))
+  }
+
+  @Post(':id/captain')
+  @RequireAction('competitions.manage')
+  async setCaptain(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ userId: z.string().uuid() }).safeParse(body)
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.teams.setCaptain(actor, id, parsed.data.userId))
+  }
+
+  @Post(':id/disband')
+  @RequireAction('competitions.manage')
+  async disband(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ reason: z.string().trim().max(200).optional() }).safeParse(body ?? {})
+    if (!parsed.success) throw new TeamError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.teams.disband(actor, id, parsed.data.reason || undefined))
+  }
+
+  @Post(':id/invites/:inviteId/cancel')
+  @RequireAction('competitions.manage')
+  async cancelInvite(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Param('inviteId', ParseUUIDPipe) inviteId: string) {
+    return ok(await this.teams.cancelInvite(actor, id, inviteId))
   }
 }

@@ -5,7 +5,7 @@ import { AuthService } from '../../modules/auth/auth.service.js'
 import { SessionService } from '../../modules/auth/session.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { MembersService } from '../../modules/members/members.service.js'
-import { sha256Hex } from '../../common/utils.js'
+import { monthKey, sha256Hex } from '../../common/utils.js'
 import { makeActor } from './helpers.js'
 import type { Request, Response } from 'express'
 
@@ -322,6 +322,21 @@ describe('邀请注册事务', () => {
     // 默认 m = max(有名次行数, 最大名次)；仅一人 → 30
     const solo = await members.importMembers(actor, [{ studentNo: '202605105', realName: '独苗', admissionRank: 1 }])
     expect(solo).toMatchObject({ admissionTotal: 1, results: [{ initialPoints: '30.00' }] })
+  })
+
+  it('成员概览：入社基础分照常计入 E，但从当月积分里拆出来单独显示', async () => {
+    const month = monthKey(new Date())
+    const imported = await members.importMembers(makeActor(), [{ studentNo: '202605120', realName: '基础分展示', admissionRank: 1 }], { admissionTotal: 1, admissionMonth: month })
+    const user = await db.user.findUniqueOrThrow({ where: { studentNo: '202605120' } })
+    expect(imported.initialCount).toBe(1)
+    await db.pointsLedgerEntry.create({
+      data: { id: crypto.randomUUID(), userId: user.id, sourceKey: `test:activity:${user.id}`, category: 'activity', amount: '2', scoreMonth: month, recordedAt: new Date(), status: 'approved' },
+    })
+    const dashboard = await members.memberDashboard(user.id)
+    expect(dashboard.score.currentMonthM).toBe(2)
+    expect(dashboard.score.initial).toEqual({ amount: 30, month, weight: 1, contribution: 30 })
+    expect(dashboard.score.components.find((c) => c.month === month)).toMatchObject({ m: 32, initial: 30 })
+    expect(Number(dashboard.score.e)).toBe(32)
   })
 
   it('Excel 预导入学生首次 CAS 登录（login 入口）按学号自动绑定，无需邀请', async () => {

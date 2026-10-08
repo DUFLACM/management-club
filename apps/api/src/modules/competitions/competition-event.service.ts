@@ -274,7 +274,7 @@ export class CompetitionEventService {
     return this.db.competitionShortlistRow.findMany({
       where: { eventId },
       orderBy: { position: 'asc' },
-      include: { user: { select: { verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } } } },
+      include: { user: { select: { verifiedRealName: true, studentNo: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } },
     })
   }
 
@@ -403,7 +403,7 @@ export class CompetitionEventService {
     return this.db.competitionRegistration.findMany({
       where: { eventId },
       orderBy: { registeredAt: 'asc' },
-      include: { materials: true, user: { select: { verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } } } },
+      include: { materials: true, user: { select: { verifiedRealName: true, studentNo: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } },
     })
   }
 
@@ -418,7 +418,7 @@ export class CompetitionEventService {
           include: {
             members: {
               where: { status: 'active' },
-              include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } } } },
+              include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } },
             },
           },
         },

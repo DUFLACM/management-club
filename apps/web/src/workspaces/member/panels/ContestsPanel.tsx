@@ -23,7 +23,7 @@ import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { LoadMoreButton } from '@/lib/hooks';
-import { formatDateTime, platformAccountBadge, platformLabel, memberName } from '@/lib/format';
+import { formatDateTime, platformAccountBadge, platformLabel, memberName, memberAvatarId } from '@/lib/format';
 import {
   competitionsApi,
   contestTierLabel,
@@ -59,6 +59,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { MemberAvatar } from '@/components/club/MemberAvatar';
 
 interface PlatformAccountDto {
   id: string;
@@ -1474,7 +1475,8 @@ function TeamCard({
 
         <ul className="flex flex-wrap gap-x-4 gap-y-1">
           {team.members.map((member) => (
-            <li key={member.id} className="text-xs text-muted-foreground">
+            <li key={member.id} className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <MemberAvatar assetId={memberAvatarId(member.user)} name={memberName(member.user, '队员')} size="xs" />
               {memberName(member.user, '队员')}
               {member.role === 'captain' && <span className="ml-1 text-primary">队长</span>}
             </li>
@@ -1586,7 +1588,8 @@ function InvitePicker({
               key={candidate.userId}
               className="flex items-center justify-between gap-2 py-1.5 text-xs"
             >
-              <span className="min-w-0 truncate text-foreground">
+              <span className="flex min-w-0 items-center gap-2 truncate text-foreground">
+                <MemberAvatar assetId={candidate.avatarAssetId} name={candidate.displayName} size="xs" />
                 {candidate.displayName}
                 <span className="ml-2 font-mono text-muted-foreground">
                   {candidate.studentNoMasked}

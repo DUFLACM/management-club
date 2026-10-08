@@ -17,6 +17,8 @@ export interface CsrfSession {
   studentNo: string | null;
   staffNo: string | null;
   roles: string[];
+  /** 学生是否已绑定牛客（登录绑定门用）；非学生或旧版接口为 null */
+  nowcoderBound: boolean | null;
 }
 
 export interface CsrfPayload {
@@ -29,6 +31,7 @@ export interface CsrfPayload {
   studentNo?: string | null;
   staffNo?: string | null;
   roles?: string[];
+  nowcoderBound?: boolean | null;
 }
 
 /**
@@ -48,6 +51,7 @@ export function normalizeCsrfSession(data: CsrfPayload | null | undefined): Csrf
     studentNo: data?.studentNo ?? null,
     staffNo: data?.staffNo ?? null,
     roles: data?.roles ?? [],
+    nowcoderBound: typeof data?.nowcoderBound === 'boolean' ? data.nowcoderBound : null,
   };
 }
 

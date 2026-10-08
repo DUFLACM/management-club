@@ -7,14 +7,14 @@
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { CalendarRangeIcon, LoaderCircleIcon, SearchIcon, Trash2Icon, UploadIcon } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import type * as XlsxModule from 'xlsx';
 
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { useDebouncedValue, LoadMoreButton } from '@/lib/hooks';
-import { currentMonthKey, formatDateTime, membershipBadgeClass, membershipLabel } from '@/lib/format';
+import { currentMonthKey, formatDateTime, membershipBadgeClass, membershipLabel, memberAvatarId } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { PrincipalGate } from '@/components/club/QueryBoundary';
 import { EmptyState } from '@/components/club/EmptyState';
@@ -38,10 +38,12 @@ import {
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Textarea } from '@/components/ui/textarea';
+import { MemberAvatar } from '@/components/club/MemberAvatar';
 
 interface MemberRowDto {
   id: string;
   displayName: string;
+  avatarAssetId?: string | null;
   studentNo: string;
   grade: number | null;
   membership: string;
@@ -56,7 +58,7 @@ interface MemberDetailDto {
   verifiedRealName: string;
   grade: number | null;
   accountStatus: string;
-  profile: { displayName: string | null; bio: string | null; visibility: string } | null;
+  profile: { displayName: string | null; bio: string | null; visibility: string; avatarAssetId?: string | null } | null;
   membershipTerms: Array<{
     id: string;
     membershipStatus: string;
@@ -359,7 +361,12 @@ function MembersBody({ principalId }: { principalId: string }) {
                         />
                       </TableCell>
                       <TableCell className="tabular-nums">{member.studentNo}</TableCell>
-                      <TableCell className="font-medium">{member.displayName}</TableCell>
+                      <TableCell className="font-medium">
+                        <span className="flex items-center gap-2">
+                          <MemberAvatar assetId={member.avatarAssetId} name={member.displayName} size="xs" />
+                          {member.displayName}
+                        </span>
+                      </TableCell>
                       <TableCell className="text-muted-foreground tabular-nums">
                         {member.grade ?? '—'}
                       </TableCell>
@@ -385,10 +392,11 @@ function MembersBody({ principalId }: { principalId: string }) {
                 <li key={member.id} className="flex items-start gap-3 px-4 py-3">
                   <Checkbox
                     aria-label={`选择 ${member.displayName}`}
-                    className="mt-1"
+                    className="mt-2.5"
                     checked={selected.has(member.id)}
                     onCheckedChange={() => toggleSelected(member.id)}
                   />
+                  <MemberAvatar assetId={member.avatarAssetId} name={member.displayName} size="md" />
                   <button
                     type="button"
                     onClick={() => setDetailId(member.id)}
@@ -572,7 +580,20 @@ function MemberDetail({
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
-      title={query.data ? `${query.data.verifiedRealName}（${query.data.studentNo}）` : '成员详情'}
+      title={
+        query.data ? (
+          <span className="flex items-center gap-3">
+            <MemberAvatar
+              assetId={memberAvatarId(query.data)}
+              name={query.data.profile?.displayName || query.data.verifiedRealName}
+              size="md"
+            />
+            {query.data.verifiedRealName}（{query.data.studentNo}）
+          </span>
+        ) : (
+          '成员详情'
+        )
+      }
       description={query.data?.profile?.displayName ?? undefined}
     >
       {query.isPending ? (
@@ -1080,7 +1101,7 @@ interface ImportMemberRow {
 }
 
 /** 解析 Excel 工作表第一个 sheet：表头按常见中英文别名归一化，数据行号从 2 起算（跳过表头） */
-function parseMemberSheet(workbook: XLSX.WorkBook): ImportMemberRow[] {
+function parseMemberSheet(XLSX: typeof XlsxModule, workbook: XlsxModule.WorkBook): ImportMemberRow[] {
   const firstSheetName = workbook.SheetNames[0];
   const sheet = firstSheetName ? workbook.Sheets[firstSheetName] : undefined;
   if (!sheet) return [];
@@ -1234,10 +1255,12 @@ function ImportMembersDialog({
                   setFileName(file.name);
                   setParseError(null);
                   const reader = new FileReader();
-                  reader.onload = () => {
+                  reader.onload = async () => {
                     try {
+                      // xlsx 体积大，选了文件才按需加载
+                      const XLSX = await import('xlsx');
                       const workbook = XLSX.read(reader.result, { type: 'array' });
-                      const parsed = parseMemberSheet(workbook);
+                      const parsed = parseMemberSheet(XLSX, workbook);
                       if (parsed.length === 0) setParseError('未解析出任何数据行，请检查表头是否包含「学号」「姓名」列。');
                       setRows(parsed);
                     } catch {

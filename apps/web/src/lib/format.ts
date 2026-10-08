@@ -371,3 +371,12 @@ export function formatMemberName(displayName: string | null | undefined, realNam
   if (display && real && display !== real) return `${display}（${real}）`;
   return display || real;
 }
+
+/** 列表里可展示的头像：主页设为「仅自己」时不显示（服务端头像接口同样拒绝读取） */
+export function memberAvatarId(
+  user: { profile?: { avatarAssetId?: string | null; visibility?: string | null } | null } | null | undefined,
+): string | null {
+  const profile = user?.profile;
+  if (!profile || profile.visibility === 'self_only') return null;
+  return profile.avatarAssetId ?? null;
+}

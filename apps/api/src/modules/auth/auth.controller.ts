@@ -26,6 +26,10 @@ export class AuthController {
     const actor = await this.sessions.resolveActor(req)
     if (actor) {
       const token = await this.sessions.issueSessionCsrf(req, res)
+      // 登录绑定门用：随会话一起返回是否已绑定牛客，前端不必再串行请求一次平台账号列表
+      const nowcoderBound = actor.userId
+        ? (await this.db.platformAccount.count({ where: { userId: actor.userId, platform: 'nowcoder', status: { not: 'revoked' } } })) > 0
+        : null
       return ok({
         token,
         authenticated: true,
@@ -36,6 +40,7 @@ export class AuthController {
         studentNo: actor.studentNo,
         staffNo: actor.staffNo,
         campusId: actor.campusId,
+        nowcoderBound,
       })
     }
     const { token } = await this.sessions.issueAnonymousCsrf(req, res)

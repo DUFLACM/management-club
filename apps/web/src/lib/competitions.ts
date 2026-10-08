@@ -196,7 +196,7 @@ export interface TeamMemberDto {
     id: string;
     verifiedRealName: string;
     studentNo: string;
-    profile: { displayName: string | null } | null;
+    profile: { displayName: string | null; avatarAssetId?: string | null; visibility?: string } | null;
   };
 }
 
@@ -253,7 +253,7 @@ export interface AdminShortlistRowDto {
   user: {
     verifiedRealName: string;
     studentNo: string;
-    profile: { displayName: string | null } | null;
+    profile: { displayName: string | null; avatarAssetId?: string | null; visibility?: string } | null;
   };
 }
 
@@ -270,7 +270,7 @@ export interface AdminRegistrationDto {
   user: {
     verifiedRealName: string;
     studentNo: string;
-    profile: { displayName: string | null } | null;
+    profile: { displayName: string | null; avatarAssetId?: string | null; visibility?: string } | null;
   };
 }
 
@@ -298,7 +298,7 @@ export interface AdminTeamEntryDto {
         id: string;
         verifiedRealName: string;
         studentNo: string;
-        profile: { displayName: string | null } | null;
+        profile: { displayName: string | null; avatarAssetId?: string | null; visibility?: string } | null;
       };
     }>;
   };
@@ -341,6 +341,7 @@ export interface EligibleEventDto {
 export interface InvitableMemberDto {
   userId: string;
   displayName: string;
+  avatarAssetId?: string | null;
   studentNoMasked: string;
 }
 

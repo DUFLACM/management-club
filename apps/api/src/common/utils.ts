@@ -96,3 +96,9 @@ export function memberName(user: { verifiedRealName: string | null; profile?: { 
   if (display && real && display !== real) return `${display}（${real}）`
   return display ?? real ?? ''
 }
+
+/** 列表里可展示的头像：主页设为「仅自己」的成员不暴露头像（与头像读取接口的可见性口径一致） */
+export function visibleAvatar(profile: { avatarAssetId: string | null; visibility: string } | null | undefined): string | null {
+  if (!profile || profile.visibility === 'self_only') return null
+  return profile.avatarAssetId
+}

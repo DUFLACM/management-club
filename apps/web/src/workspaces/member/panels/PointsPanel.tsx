@@ -43,9 +43,19 @@ import { ResponsiveDetail } from '@/components/club/ResponsiveDetail';
 interface PointsOverviewDto {
   e: string;
   eComponents: Array<{ month: string; m: number; weight: number; contribution: number }>;
-  months: Array<{ month: string; raw: number; m: number | null }>;
+  /** raw 为当月积分（不含入社基础分），initial 为该月计入的入社基础分 */
+  months: Array<{ month: string; raw: number; initial?: number; m: number | null }>;
+  /** 入社基础分（第八条）：单独展示，按计入月份的权重计入 E */
+  initial?: InitialPointsDto | null;
   roundingPending: boolean;
   roundingNote: string | null;
+}
+
+interface InitialPointsDto {
+  amount: number;
+  month: string;
+  weight: number;
+  contribution: number;
 }
 
 interface LedgerEntryDto {
@@ -70,7 +80,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   contribution: '贡献',
   service: '服务',
   award: '奖项',
-  initial: '初始',
+  initial: '入社基础分',
   penalty: '扣分',
   reversal: '冲正',
 };
@@ -144,17 +154,20 @@ function PointsBody({ principalId }: { principalId: string }) {
               </Alert>
             )}
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-              <Card className="lg:col-span-4">
-                <CardContent className="flex flex-col gap-2 p-5">
-                  <p className="text-sm text-muted-foreground">有效积分 E</p>
-                  <p className="text-[40px] leading-[48px] font-semibold tracking-tight text-foreground tabular-nums">
-                    {overview.e}
-                  </p>
-                  <p className="text-xs leading-5 text-muted-foreground">
-                    近六个月 M 按当月 ×1、往前 ×0.85 / ×0.7 / ×0.55 / ×0.4 / ×0.25 加权求和。
-                  </p>
-                </CardContent>
-              </Card>
+              <div className="flex flex-col gap-4 lg:col-span-4">
+                <Card>
+                  <CardContent className="flex flex-col gap-2 p-5">
+                    <p className="text-sm text-muted-foreground">有效积分 E</p>
+                    <p className="text-[40px] leading-[48px] font-semibold tracking-tight text-foreground tabular-nums">
+                      {overview.e}
+                    </p>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      近六个月 M 按当月 ×1、往前 ×0.85 / ×0.7 / ×0.55 / ×0.4 / ×0.25 加权求和{overview.initial ? '（含入社基础分）' : ''}。
+                    </p>
+                  </CardContent>
+                </Card>
+                {overview.initial && <InitialPointsCard initial={overview.initial} />}
+              </div>
               <CompositionCard overview={overview} className="lg:col-span-8" />
             </div>
           </>
@@ -222,6 +235,23 @@ function PointsBody({ principalId }: { principalId: string }) {
   );
 }
 
+/** 入社基础分卡：不并入「当月积分」，单独显示分值、计入月份与当前计入 E 的部分 */
+function InitialPointsCard({ initial }: { initial: InitialPointsDto }) {
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-1.5 p-5">
+        <p className="text-sm text-muted-foreground">入社基础分</p>
+        <p className="text-[28px] leading-9 font-semibold text-foreground tabular-nums">{initial.amount.toFixed(2)}</p>
+        <p className="text-xs leading-5 text-muted-foreground">
+          {initial.weight > 0
+            ? `${monthLabel(initial.month)}入社时一次性获得，按该月权重 ×${initial.weight} 计入 E：${initial.contribution.toFixed(2)}，之后逐月衰减。`
+            : `${monthLabel(initial.month)}入社时一次性获得，已超出近六个月，不再计入 E。`}
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
 function CompositionCard({
   overview,
   className,
@@ -230,6 +260,7 @@ function CompositionCard({
   className?: string;
 }) {
   const [showTable, setShowTable] = useState(false);
+  const hasInitial = overview.months.some((row) => row.initial);
   return (
     <Card className={className}>
       <CardContent className="flex h-full flex-col gap-3 p-5">
@@ -253,7 +284,8 @@ function CompositionCard({
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
                 <th scope="col" className="py-2 font-medium">月份</th>
-                <th scope="col" className="py-2 text-right font-medium">原始积分</th>
+                <th scope="col" className="py-2 text-right font-medium">当月积分</th>
+                {hasInitial && <th scope="col" className="py-2 text-right font-medium">入社基础分</th>}
                 <th scope="col" className="py-2 text-right font-medium">系数</th>
                 <th scope="col" className="py-2 text-right font-medium">计入 E</th>
               </tr>
@@ -265,6 +297,7 @@ function CompositionCard({
                   <tr key={row.month}>
                     <td className="py-2">{monthLabel(row.month)}</td>
                     <td className="py-2 text-right tabular-nums">{row.raw}</td>
+                    {hasInitial && <td className="py-2 text-right tabular-nums text-muted-foreground">{row.initial ? row.initial : '—'}</td>}
                     <td className="py-2 text-right text-muted-foreground tabular-nums">
                       {component ? `×${component.weight}` : '—'}
                     </td>
@@ -287,7 +320,7 @@ function CompositionCard({
               ariaLabel="六个月积分构成柱状图"
             />
             <p className="text-xs leading-5 text-muted-foreground">
-              正式月度 M 待 R01 取整口径确认；柱图为各月原始积分，月下系数为有效权重。
+              正式月度 M 待 R01 取整口径确认；柱图为各月积分（不含入社基础分），月下系数为有效权重。
             </p>
           </>
         )}

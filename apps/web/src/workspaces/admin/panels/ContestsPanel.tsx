@@ -21,7 +21,7 @@ import {
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrincipal } from '@/lib/session';
-import { formatDateTime, memberName } from '@/lib/format';
+import { formatDateTime, memberName, memberAvatarId } from '@/lib/format';
 import {
   competitionsAdminApi,
   contestTierLabel,
@@ -62,6 +62,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { MemberAvatar } from '@/components/club/MemberAvatar';
 
 const STATUS_FILTERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'all', label: '全部状态' },
@@ -838,7 +839,10 @@ function RegistrationsSection({
                 {rows.map((row) => (
                   <TableRow key={row.id}>
                     <TableCell>
-                      <span className="block text-sm text-foreground">{memberName(row.user)}</span>
+                      <span className="flex items-center gap-2 text-sm text-foreground">
+                        <MemberAvatar assetId={memberAvatarId(row.user)} name={memberName(row.user)} size="xs" />
+                        {memberName(row.user)}
+                      </span>
                       <span className="block font-mono text-xs text-muted-foreground">
                         {row.user.studentNo}
                       </span>
@@ -1297,7 +1301,8 @@ function TeamEntriesSection({
                 </div>
                 <ul className="flex flex-wrap gap-x-4 gap-y-1">
                   {entry.team.members.map((member) => (
-                    <li key={member.id} className="text-xs text-muted-foreground">
+                    <li key={member.id} className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <MemberAvatar assetId={memberAvatarId(member.user)} name={memberName(member.user)} size="xs" />
                       {memberName(member.user)}
                       <span className="ml-1 font-mono">{member.user.studentNo}</span>
                       {member.role === 'captain' && (
@@ -1425,7 +1430,10 @@ function ShortlistSection({
                   <TableRow key={row.id} className={row.shortlisted ? undefined : 'opacity-60'}>
                     <TableCell className="tabular-nums">{row.position}</TableCell>
                     <TableCell>
-                      <span className="block text-sm text-foreground">{memberName(row.user)}</span>
+                      <span className="flex items-center gap-2 text-sm text-foreground">
+                        <MemberAvatar assetId={memberAvatarId(row.user)} name={memberName(row.user)} size="xs" />
+                        {memberName(row.user)}
+                      </span>
                       <span className="block font-mono text-xs text-muted-foreground">
                         {row.user.studentNo}
                       </span>

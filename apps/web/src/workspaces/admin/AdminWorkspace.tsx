@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect } from 'react';
 import { Navigate, useSearchParams } from 'react-router';
 import { hasAnyAction } from '@/lib/session';
 import { useWorkspaceSession } from '@/lib/workspace-session';
@@ -14,12 +14,14 @@ import {
   TicketIcon,
   TrophyIcon,
   UsersIcon,
+  UsersRoundIcon,
   LoaderCircleIcon,
 } from 'lucide-react';
 
 import {
   AdminPanels,
   ADMIN_DEFAULT_SECTION,
+  prefetchPanels,
 } from '@/workspaces/lazy-panels';
 import { resolveSection, SectionRouter } from '@/workspaces/shared/SectionRouter';
 import { PlatformBindingGate } from '@/components/club/PlatformBindingGate';
@@ -42,6 +44,7 @@ export const ADMIN_SECTIONS: readonly WorkspaceSection[] = [
   { key: 'members', title: '成员', icon: UsersIcon },
   { key: 'activities', title: '活动', icon: CalendarDaysIcon },
   { key: 'contests', title: '赛事', icon: TrophyIcon },
+  { key: 'teams', title: '组队', icon: UsersRoundIcon },
   { key: 'points', title: '积分审核', icon: CoinsIcon },
   { key: 'evaluation', title: '综评导出', icon: GraduationCapIcon },
   { key: 'invites', title: '邀请码', icon: TicketIcon },
@@ -54,6 +57,7 @@ const SECTION_ACTIONS: Record<string, string[]> = {
   members: ['members.read', 'members.review'],
   activities: ['activity.manage', 'venue.manage'],
   contests: ['competitions.manage'],
+  teams: ['competitions.manage'],
   points: ['points.review'],
   evaluation: ['evaluation.manage'],
   invites: ['invitations.manage'],
@@ -82,6 +86,13 @@ export function AdminWorkspace({ user: providedUser }: AdminWorkspaceProps) {
     sections.map((section) => section.key),
     ADMIN_DEFAULT_SECTION,
   );
+
+  // 只预取有权限看到的面板代码
+  const sectionKeys = sections.map((section) => section.key).join(',');
+  useEffect(() => {
+    if (!sectionKeys) return;
+    return prefetchPanels('admin', sectionKeys.split(','));
+  }, [sectionKeys]);
 
   const handleNavigate = useCallback(
     (sectionKey: string) => {

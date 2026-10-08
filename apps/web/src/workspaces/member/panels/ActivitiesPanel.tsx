@@ -58,6 +58,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { MemberAvatar } from '@/components/club/MemberAvatar';
 
 interface ActivityCardDto {
   id: string;
@@ -137,7 +138,7 @@ interface ActivityDetailDto {
   activityPoints: {
     mine: Array<{ amount: number; category: string; scoreMonth: string; note: string | null; recordedAt: string }>;
     myTotal: number;
-    board: Array<{ rank: number; userId: string; name: string; total: number; count: number }>;
+    board: Array<{ rank: number; userId: string; name: string; avatarAssetId?: string | null; total: number; count: number }>;
     totalAwarded: number;
   } | null;
 }
@@ -1826,9 +1827,10 @@ function ActivityPointsCard({ detail }: { detail: ActivityDetailDto }) {
                       key={row.userId}
                       className={`flex items-center gap-3 px-3 py-2.5 text-sm ${row.userId === principal?.userId ? 'bg-info-subtle' : ''}`}
                     >
-                      <span className="w-8 shrink-0 text-center font-semibold text-foreground tabular-nums">
+                      <span className="w-6 shrink-0 text-center font-semibold text-foreground tabular-nums">
                         {row.rank}
                       </span>
+                      <MemberAvatar assetId={row.avatarAssetId} name={row.name} size="sm" />
                       <span className="min-w-0 flex-1 truncate text-foreground">
                         {row.name}
                         {row.userId === principal?.userId && (

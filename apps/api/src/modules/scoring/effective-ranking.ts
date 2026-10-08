@@ -1,7 +1,7 @@
 import { computeEffectiveScore, defaultRuleParams } from '@acm/scoring-core'
 import { mergeRuleParams } from './rule-params.js'
 import type { PrismaService } from '../../infrastructure/database/database.module.js'
-import { memberName } from '../../common/utils.js'
+import { memberName, visibleAvatar } from '../../common/utils.js'
 
 /**
  * 当前有效榜的唯一口径（首页「当前有效榜排名」与榜单页「当前有效榜」共用，保证两处名次一致）。
@@ -17,6 +17,8 @@ export const RANKED_MEMBERSHIPS: readonly string[] = ['formal', 'provisional', '
 export interface RankedMember {
   userId: string
   displayName: string
+  /** 可展示的头像（主页仅自己可见时为 null） */
+  avatarAssetId: string | null
   membership: string
   /** 排序用数值 E */
   e: number
@@ -41,7 +43,7 @@ export async function rankEligibleMembers(
     select: {
       id: true,
       verifiedRealName: true,
-      profile: { select: { displayName: true } },
+      profile: { select: { displayName: true, avatarAssetId: true, visibility: true } },
       membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1, select: { membershipStatus: true } },
     },
   })
@@ -49,6 +51,7 @@ export async function rankEligibleMembers(
     .map((u) => ({
       id: u.id,
       displayName: memberName(u),
+      avatarAssetId: visibleAvatar(u.profile),
       membership: u.membershipTerms[0]?.membershipStatus ?? 'applicant',
     }))
     .filter((u) => RANKED_MEMBERSHIPS.includes(u.membership))
@@ -70,7 +73,7 @@ export async function rankEligibleMembers(
   return eligible
     .map((u) => {
       const eff = computeEffectiveScore({ monthlyScores: byUser.get(u.id) ?? {}, currentMonth }, { effectiveWeights })
-      return { userId: u.id, displayName: u.displayName, membership: u.membership, e: Number(eff.e), eDisplay: eff.eDisplay }
+      return { userId: u.id, displayName: u.displayName, avatarAssetId: u.avatarAssetId, membership: u.membership, e: Number(eff.e), eDisplay: eff.eDisplay }
     })
     // 同分按 userId 升序：同一时刻首页与榜单页给出相同名次
     .sort((a, b) => b.e - a.e || a.userId.localeCompare(b.userId))
@@ -87,4 +90,19 @@ const EXCLUSION_REASONS: Record<string, string> = {
 
 export function rankExclusionReason(membership: string): string {
   return EXCLUSION_REASONS[membership] ?? `当前成员状态（${membership}）不参与当前有效榜`
+}
+
+/**
+ * 入社基础分摘要（成员端单独展示）：分值、计入月份，以及当前按该月权重计入 E 的部分（出了六个月窗口为 0）。
+ * 每人只有一次入社基础分；万一多月都有（冲正后重记等），取最近一个月。
+ */
+export function initialSummary(
+  initialByMonth: Map<string, number>,
+  components: Array<{ month: string; weight: number }>,
+): { amount: number; month: string; weight: number; contribution: number } | null {
+  const months = [...initialByMonth.entries()].filter(([, amount]) => amount !== 0).sort(([a], [b]) => b.localeCompare(a))
+  if (months.length === 0) return null
+  const [month, amount] = months[0]
+  const weight = components.find((c) => c.month === month)?.weight ?? 0
+  return { amount, month, weight, contribution: Math.round(amount * weight * 1e4) / 1e4 }
 }

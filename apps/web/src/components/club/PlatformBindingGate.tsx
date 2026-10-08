@@ -13,17 +13,22 @@ import { performLogout } from '@/workspaces/shared/WorkspaceShell';
  * （默认展开教程），只能提交绑定或退出登录。Codeforces / AtCoder 不强制，可在「竞赛」页自愿绑定。
  * 提交后状态为待核验即可放行——历史成绩导入与平台赛计分都按绑定账号自动匹配。
  * 教职工与本地管理员没有平台账号，不拦截。
+ * 是否已绑定优先取会话（GET /auth/csrf 的 nowcoderBound），不再额外串行请求；旧版接口没有该字段时才查平台账号列表。
  */
 export function PlatformBindingGate({ principal, children }: { principal: CsrfSession; children: ReactNode }) {
   const isStudent = principal.principalKind === 'student' && principal.userId != null;
+  const knownBound = principal.nowcoderBound;
   const accountsQuery = usePrivateQuery<Array<{ id: string; platform: string }>, ApiError>(
     principal.principalId,
     ['me', 'platform-accounts'],
     async () => (await api.get<Array<{ id: string; platform: string }>>('/me/platform-accounts')).data,
-    { enabled: isStudent },
+    { enabled: isStudent && knownBound == null },
   );
 
-  if (!isStudent) return <>{children}</>;
+  if (!isStudent || knownBound === true) return <>{children}</>;
+  if (knownBound === false) {
+    return <BindingRequired principalId={principal.principalId!} principalKind={principal.principalKind} />;
+  }
 
   if (accountsQuery.isPending) {
     return (

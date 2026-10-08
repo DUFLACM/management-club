@@ -22,6 +22,7 @@ describe('CSRF session identity normalization', () => {
       studentNo: null,
       staffNo: 'T00123',
       roles: ['advisor'],
+      nowcoderBound: null,
     });
   });
 

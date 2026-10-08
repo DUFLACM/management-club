@@ -25,11 +25,13 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { MemberAvatar } from '@/components/club/MemberAvatar';
 
 interface CurrentRow {
   rank: number;
   userId: string;
   displayName: string;
+  avatarAssetId?: string | null;
   membership: string;
   e: string;
   isMe: boolean;
@@ -38,6 +40,7 @@ interface DisclosureRow {
   rank: number;
   userId: string;
   displayName: string;
+  avatarAssetId?: string | null;
   studentNo: string;
   membership: string;
   currentE: string;
@@ -194,6 +197,7 @@ function CurrentBoard({ principalId }: { principalId: string }) {
                           </TableCell>
                           <TableCell>
                             <span className="flex items-center gap-2">
+                              <MemberAvatar assetId={row.avatarAssetId} name={row.displayName} size="xs" />
                               {row.displayName}
                               {row.isMe && (
                                 <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] leading-3 font-semibold text-primary-foreground">
@@ -224,9 +228,10 @@ function CurrentBoard({ principalId }: { principalId: string }) {
                       ref={row.isMe ? itemRef : undefined}
                       className={`flex items-center gap-3 rounded-xl border border-border p-3 ${row.isMe ? 'bg-info-subtle' : 'bg-card'}`}
                     >
-                      <span className="w-8 shrink-0 text-center text-sm font-semibold text-foreground tabular-nums">
+                      <span className="w-6 shrink-0 text-center text-sm font-semibold text-foreground tabular-nums">
                         {row.rank}
                       </span>
+                      <MemberAvatar assetId={row.avatarAssetId} name={row.displayName} size="md" />
                       <span className="min-w-0 flex-1">
                         <span className="flex items-center gap-2">
                           <span className="truncate text-sm font-medium text-foreground">{row.displayName}</span>
@@ -275,10 +280,19 @@ function PodiumCard({ row }: { row: CurrentRow }) {
   return (
     <Card className={`${medal.card} ${champion ? 'sm:-mt-2' : ''}`}>
       <CardContent className="flex items-center gap-3 p-4 sm:flex-col sm:items-center sm:gap-2 sm:p-5">
-        <span
-          className={`flex size-10 shrink-0 items-center justify-center rounded-full font-bold tabular-nums sm:size-12 sm:text-xl ${medal.circle}`}
-        >
-          {row.rank}
+        {/* 头像 + 右下角金/银/铜名次徽章 */}
+        <span className="relative shrink-0">
+          <MemberAvatar
+            assetId={row.avatarAssetId}
+            name={row.displayName}
+            size="lg"
+            className={champion ? 'sm:size-[72px] sm:text-2xl' : 'sm:size-16'}
+          />
+          <span
+            className={`absolute -right-1 -bottom-1 flex size-6 items-center justify-center rounded-full text-xs font-bold tabular-nums ring-2 ring-background sm:size-7 sm:text-sm ${medal.circle}`}
+          >
+            {row.rank}
+          </span>
         </span>
         <div className="min-w-0 flex-1 sm:flex-none sm:text-center">
           <p className="flex items-center gap-1.5 sm:justify-center">
@@ -450,6 +464,7 @@ function DisclosureBoard({ principalId }: { principalId: string }) {
                         </TableCell>
                         <TableCell>
                           <span className="flex items-center gap-2">
+                            <MemberAvatar assetId={row.avatarAssetId} name={row.displayName} size="xs" />
                             {row.displayName}
                             {row.isMe && (
                               <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] leading-3 font-semibold text-primary-foreground">

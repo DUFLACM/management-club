@@ -47,6 +47,8 @@ export function useBindPlatformAccount(principalId: string, onSuccess?: () => vo
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'platform-accounts'] }),
         queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'dashboard'] }),
+        // 会话里带的「是否已绑定牛客」随之刷新，登录绑定门立即放行
+        queryClient.invalidateQueries({ queryKey: ['session', 'csrf'] }),
       ]);
     },
   });

@@ -7,7 +7,7 @@
  */
 import { useState, type ReactNode } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import * as XLSX from 'xlsx';
+// xlsx 体积大（gzip 约 140 KB），只在下载模板 / 读取文件时按需加载
 import { CheckCircle2Icon, DownloadIcon, ExternalLinkIcon, LoaderCircleIcon, RefreshCwIcon, TriangleAlertIcon } from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
@@ -87,7 +87,8 @@ interface ImportResult {
   rows: Array<{ row: number; studentNo: string; status: 'posted' | 'duplicate' | 'failed'; error?: string }>;
 }
 
-function downloadTemplate() {
+async function downloadTemplate() {
+  const XLSX = await import('xlsx');
   const workbook = XLSX.utils.book_new();
   const sheet = XLSX.utils.aoa_to_sheet([[...HISTORY_TEMPLATE_HEADERS], ...HISTORY_TEMPLATE_EXAMPLES]);
   sheet['!cols'] = [12, 8, 22, 12, 12, 8, 12, 8, 10, 12, 16, 14, 10, 30].map((wch) => ({ wch }));
@@ -224,8 +225,9 @@ export function HistoryImportDialog({
                     reset();
                     setFileName(file.name);
                     const reader = new FileReader();
-                    reader.onload = () => {
+                    reader.onload = async () => {
                       try {
+                        const XLSX = await import('xlsx');
                         const workbook = XLSX.read(reader.result, { type: 'array', cellDates: true });
                         const sheetName = workbook.SheetNames[0];
                         const sheet = sheetName ? workbook.Sheets[sheetName] : undefined;
@@ -268,7 +270,7 @@ export function HistoryImportDialog({
                   </SelectContent>
                 </Select>
               </div>
-              <Button variant="outline" onClick={downloadTemplate}>
+              <Button variant="outline" onClick={() => void downloadTemplate()}>
                 <DownloadIcon aria-hidden="true" />
                 下载模板
               </Button>

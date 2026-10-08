@@ -4,7 +4,7 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { VenueService } from '../venues/venue.service.js'
-import { newId, memberName } from '../../common/utils.js'
+import { newId, memberName, visibleAvatar } from '../../common/utils.js'
 import { actorCan } from '../../common/guards.js'
 import { ContestStandingsService, contestExternalUrl, type StandingsSnapshot } from './contest-standings.service.js'
 import type { SessionActor } from '../auth/session.service.js'
@@ -710,12 +710,12 @@ export class ActivityService {
     const points = await this.db.pointsLedgerEntry.findMany({
       where: { status: 'approved', detail: { path: ['activityId'], equals: activityId } },
       orderBy: [{ recordedAt: 'desc' }, { id: 'desc' }],
-      include: { user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true } } } } },
+      include: { user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } },
     })
-    const byUser = new Map<string, { userId: string; name: string; total: number; count: number }>()
+    const byUser = new Map<string, { userId: string; name: string; avatarAssetId: string | null; total: number; count: number }>()
     for (const entry of points) {
       const name = memberName(entry.user)
-      const current = byUser.get(entry.userId) ?? { userId: entry.userId, name, total: 0, count: 0 }
+      const current = byUser.get(entry.userId) ?? { userId: entry.userId, name, avatarAssetId: visibleAvatar(entry.user.profile), total: 0, count: 0 }
       current.total += Number(entry.amount)
       current.count += 1
       byUser.set(entry.userId, current)

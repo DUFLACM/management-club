@@ -24,7 +24,7 @@ import {
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrincipal } from '@/lib/session';
-import { activityTypeLabel, formatDateTime, formatMonthDay, formatWeekday, membershipLabel, monthLabel, platformAccountBadge, platformLabel, relativeDeadline, formatMemberName } from '@/lib/format';
+import { activityTypeLabel, formatDateTime, formatMonthDay, formatWeekday, membershipLabel, monthLabel, platformAccountBadge, platformLabel, relativeDeadline } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { BindPlatformAccountDialog } from '@/components/club/BindPlatformAccountDialog';
 import { MemberGate, QueryBoundary } from '@/components/club/QueryBoundary';
@@ -44,8 +44,11 @@ interface DashboardData {
   };
   score: {
     e: string;
-    components: Array<{ month: string; m: number; weight: number; contribution: number }>;
+    /** m 为该月计入 E 的原始分（含入社基础分），initial 为其中的入社基础分 */
+    components: Array<{ month: string; m: number; initial?: number; weight: number; contribution: number }>;
+    /** 本月积分（不含入社基础分） */
     currentMonthM: number;
+    initial?: { amount: number; month: string; weight: number; contribution: number } | null;
   };
   rank: { position: number | null; total: number; qualified: boolean; reason?: string | null };
   attendance: { done: number; total: number; note: string | null };
@@ -247,7 +250,7 @@ function OverviewBody({ principalId }: { principalId: string }) {
                           {membershipLabel(data.user.membership)}
                         </p>
                         <h2 className="mt-1 text-lg font-semibold text-foreground">
-                          下午好，{formatMemberName(data.user.displayName, data.user.realName)}
+                          下午好，{data.user.displayName}
                         </h2>
                       </div>
                       <div className="flex flex-wrap items-end gap-x-8 gap-y-3">
@@ -269,6 +272,16 @@ function OverviewBody({ principalId }: { principalId: string }) {
                             {data.score.currentMonthM}
                           </p>
                         </div>
+                        {data.score.initial && (
+                          <div>
+                            <p className="text-xs leading-5 text-muted-foreground">
+                              入社基础分（{monthLabel(data.score.initial.month)}，单独计）
+                            </p>
+                            <p className="text-[28px] leading-9 font-semibold text-foreground tabular-nums">
+                              {data.score.initial.amount.toFixed(2)}
+                            </p>
+                          </div>
+                        )}
                       </div>
                       {data.platformSync.length > 0 && (
                         <ul className="flex flex-wrap gap-2" aria-label="平台同步状态">
@@ -507,6 +520,11 @@ function UpcomingCard({
   );
 }
 
+/** 当月积分 = 该月原始分扣掉入社基础分（入社基础分单独显示） */
+function monthPoints(row: { m: number; initial?: number }): number {
+  return Math.round((row.m - (row.initial ?? 0)) * 1e4) / 1e4;
+}
+
 function CompositionCard({
   components,
   className,
@@ -515,6 +533,7 @@ function CompositionCard({
   className?: string;
 }) {
   const [showTable, setShowTable] = useState(false);
+  const hasInitial = components.some((row) => row.initial);
   return (
     <section aria-label="近六个月积分构成" className={className}>
       <Card className="h-full">
@@ -544,7 +563,8 @@ function CompositionCard({
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
                   <th scope="col" className="py-2 font-medium">月份</th>
-                  <th scope="col" className="py-2 text-right font-medium">当月 M</th>
+                  <th scope="col" className="py-2 text-right font-medium">当月积分</th>
+                  {hasInitial && <th scope="col" className="py-2 text-right font-medium">入社基础分</th>}
                   <th scope="col" className="py-2 text-right font-medium">系数</th>
                   <th scope="col" className="py-2 text-right font-medium">贡献</th>
                 </tr>
@@ -553,7 +573,8 @@ function CompositionCard({
                 {components.map((row) => (
                   <tr key={row.month}>
                     <td className="py-2">{monthLabel(row.month)}</td>
-                    <td className="py-2 text-right tabular-nums">{row.m}</td>
+                    <td className="py-2 text-right tabular-nums">{monthPoints(row)}</td>
+                    {hasInitial && <td className="py-2 text-right tabular-nums text-muted-foreground">{row.initial ? row.initial : '—'}</td>}
                     <td className="py-2 text-right text-muted-foreground tabular-nums">
                       ×{row.weight}
                     </td>
@@ -567,10 +588,10 @@ function CompositionCard({
           ) : (
             <>
               <MonthBars
-                data={components.map((c) => ({ month: c.month, raw: c.m, weight: c.weight }))}
+                data={components.map((c) => ({ month: c.month, raw: monthPoints(c), weight: c.weight }))}
               />
               <p className="text-xs leading-5 text-muted-foreground">
-                柱高为当月原始积分 M，柱下系数为该月的有效权重（当月 ×1，往前依次
+                柱高为当月积分（入社基础分单独显示，不计入柱高），柱下系数为该月的有效权重（当月 ×1，往前依次
                 ×0.85 / ×0.7 / ×0.55 / ×0.4 / ×0.25）。
               </p>
             </>

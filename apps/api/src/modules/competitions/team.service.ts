@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common'
 import { matrixTeamAssignment } from '@acm/scoring-core'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
-import { newId, memberName } from '../../common/utils.js'
+import { newId, memberName, visibleAvatar } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 
 /**
@@ -41,7 +41,7 @@ export class TeamService {
       include: {
         team: {
           include: {
-            members: { where: { status: 'active' }, include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } } } } },
+            members: { where: { status: 'active' }, include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } } } } },
             entries: { include: { event: { select: { id: true, title: true, status: true } } } },
           },
         },
@@ -65,12 +65,13 @@ export class TeamService {
           { profile: { displayName: { contains: q } } },
         ],
       },
-      select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } },
+      select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true, avatarAssetId: true, visibility: true } } },
       take: 20,
     })
     return users.map((u) => ({
       userId: u.id,
       displayName: memberName(u),
+      avatarAssetId: visibleAvatar(u.profile),
       studentNoMasked: u.studentNo.length > 4 ? `***${u.studentNo.slice(-4)}` : u.studentNo,
     }))
   }

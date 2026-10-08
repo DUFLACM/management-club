@@ -14,7 +14,7 @@ import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { LoadMoreButton } from '@/lib/hooks';
-import { attendanceResultBadge, formatDateTime, formatStartEnd, membershipLabel, platformAccountBadge, platformLabel, memberName, formatMemberName } from '@/lib/format';
+import { attendanceResultBadge, formatDateTime, formatStartEnd, membershipLabel, platformAccountBadge, platformLabel, memberName, formatMemberName, memberAvatarId } from '@/lib/format';
 import {
   competitionsApi,
   entryStatusLabel,
@@ -44,6 +44,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { MemberAvatar } from '@/components/club/MemberAvatar';
 
 const RatingChart = lazy(() => import('@/components/club/RatingChart'));
 
@@ -1092,12 +1093,21 @@ function CompetitionsSection({ principalId }: { principalId: string }) {
                     </Badge>
                     {team.captainUserId === principalId && <Badge variant="info">队长</Badge>}
                   </span>
-                  <span className="text-xs text-muted-foreground">
-                    {team.members
-                      .map(
-                        (member) => memberName(member.user, '队员'),
-                      )
-                      .join(' · ')}
+                  <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                    {/* 队员头像叠放 */}
+                    <span className="flex -space-x-2">
+                      {team.members.map((member) => (
+                        <MemberAvatar
+                          key={member.id}
+                          assetId={memberAvatarId(member.user)}
+                          name={memberName(member.user, '队员')}
+                          size="xs"
+                        />
+                      ))}
+                    </span>
+                    <span className="min-w-0">
+                      {team.members.map((member) => memberName(member.user, '队员')).join(' · ')}
+                    </span>
                   </span>
                   {team.entries.length > 0 && (
                     <ul className="flex flex-wrap gap-x-3 gap-y-1">

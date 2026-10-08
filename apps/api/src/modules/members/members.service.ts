@@ -3,13 +3,14 @@ import { Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newInvitationSecret } from '../auth/auth.service.js'
-import { newId, sha256Hex, monthKey, memberName } from '../../common/utils.js'
+import { newId, sha256Hex, monthKey, memberName, visibleAvatar } from '../../common/utils.js'
 import { computeEffectiveScore, formalQuota, graceMonths, initialPoints } from '@acm/scoring-core'
 import {
   RANKED_MEMBERSHIPS,
   rankEligibleMembers,
   rankExclusionReason,
   resolveEffectiveWeights,
+  initialSummary,
 } from '../scoring/effective-ranking.js'
 import type { Prisma } from '@acm/db'
 import type { SessionActor } from '../auth/session.service.js'
@@ -58,68 +59,77 @@ export class MembersService {
 
   /** /api/v1/me/dashboard：轻量首屏聚合（不加载流水/附件/榜单/第三方） */
   async memberDashboard(userId: string) {
-    const user = await this.db.user.findUnique({
-      where: { id: userId },
-      include: {
-        profile: true,
-        membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 },
-      },
-    })
-    if (!user) throw new MembersError('用户不存在', 'NOT_FOUND')
     const now = new Date()
     const currentMonth = monthKey(now)
+    // 各块数据互不依赖，并发查询（原先逐个 await 串行）
+    const [user, effectiveWeights] = await Promise.all([
+      this.db.user.findUnique({
+        where: { id: userId },
+        include: {
+          profile: true,
+          membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 },
+        },
+      }),
+      resolveEffectiveWeights(this.db),
+    ])
+    if (!user) throw new MembersError('用户不存在', 'NOT_FOUND')
 
-    // E（当前规则版本）
-    const effectiveWeights = await resolveEffectiveWeights(this.db)
-    const entries = await this.db.pointsLedgerEntry.findMany({ where: { userId, status: 'approved' }, select: { amount: true, scoreMonth: true } })
+    const [entries, ranked, attendanceResults, openActivities, openDisclosures, pendingClaims, upcoming] = await Promise.all([
+      // E（当前规则版本）
+      this.db.pointsLedgerEntry.findMany({ where: { userId, status: 'approved' }, select: { amount: true, scoreMonth: true, category: true } }),
+      // 排名（正式/预备/考察参与当前有效榜；E=0 的成员同样在榜，口径与榜单页同源）
+      rankEligibleMembers(this.db, currentMonth, effectiveWeights),
+      // 出勤摘要：本人必须参加且已结算的活动的出勤结果（一次查出，不逐场查询）
+      this.db.attendanceAttendanceResult.findMany({
+        where: { userId, activity: { endAt: { lt: now }, participants: { some: { userId, required: true } } } },
+        select: { status: true },
+      }),
+      // 当前可签到活动
+      this.db.activity.findMany({
+        where: { status: 'published', startAt: { lte: new Date(now.getTime() + 2 * 3600_000) }, endAt: { gte: now } },
+        orderBy: { startAt: 'asc' },
+        take: 3,
+        include: {
+          policy: true,
+          registrations: { where: { userId } },
+          participants: { where: { userId } },
+          checkpoints: { where: { userId } },
+          venueVersion: { include: { venue: true } },
+          venueBindings: { take: 1, include: { venueVersion: { include: { venue: true } } } },
+        },
+      }),
+      // 待办（公示 + 待补材料）
+      this.db.disclosure.findMany({ where: { status: 'published', endsAt: { gt: now } }, take: 3 }),
+      this.db.pointsClaim.count({ where: { userId, status: 'more_info' } }),
+      // 近期安排
+      this.db.activity.findMany({
+        where: { status: 'published', startAt: { gt: now }, endAt: { lt: new Date(now.getTime() + 14 * 24 * 3600_000) } },
+        orderBy: { startAt: 'asc' },
+        take: 5,
+        include: { registrations: { where: { userId } }, venueVersion: { include: { venue: true } } },
+      }),
+    ])
+
     const monthly: Record<string, number> = {}
-    for (const e of entries) monthly[e.scoreMonth] = (monthly[e.scoreMonth] ?? 0) + Number(e.amount)
-    const eff = computeEffectiveScore({ monthlyScores: monthly, currentMonth }, { effectiveWeights })
-
-    // 排名（正式/预备/考察参与当前有效榜；E=0 的成员同样在榜，口径与榜单页同源）
-    const ranked = await rankEligibleMembers(this.db, currentMonth, effectiveWeights)
-    const myRank = ranked.findIndex((r) => r.userId === userId)
-
-    // 出勤摘要：本人必须参加且已结算的活动
-    const requiredParticipations = await this.db.activityParticipant.findMany({
-      where: { userId, required: true, activity: { endAt: { lt: now } } },
-      include: { activity: true },
-    })
-    let attendanceDone = 0
-    let attendanceTotal = 0
-    for (const p of requiredParticipations) {
-      const result = await this.db.attendanceAttendanceResult.findUnique({ where: { activityId_userId: { activityId: p.activityId, userId } } })
-      if (!result) continue
-      attendanceTotal++
-      if (['ontime', 'late', 'early_leave', 'late_and_early', 'remote_approved'].includes(result.status)) attendanceDone++
+    // 入社基础分照常计入 E，但展示时从当月积分里拆出来单独显示
+    const initialByMonth = new Map<string, number>()
+    for (const e of entries) {
+      monthly[e.scoreMonth] = (monthly[e.scoreMonth] ?? 0) + Number(e.amount)
+      if (e.category === 'initial') initialByMonth.set(e.scoreMonth, (initialByMonth.get(e.scoreMonth) ?? 0) + Number(e.amount))
     }
-
-    // 当前可签到活动
-    const openActivities = await this.db.activity.findMany({
-      where: { status: 'published', startAt: { lte: new Date(now.getTime() + 2 * 3600_000) }, endAt: { gte: now } },
-      orderBy: { startAt: 'asc' },
-      take: 3,
-      include: {
-        policy: true,
-        registrations: { where: { userId } },
-        participants: { where: { userId } },
-        checkpoints: { where: { userId } },
-        venueVersion: { include: { venue: true } },
-        venueBindings: { take: 1, include: { venueVersion: { include: { venue: true } } } },
-      },
-    })
-
-    // 待办（公示 + 待补材料）
-    const openDisclosures = await this.db.disclosure.findMany({ where: { status: 'published', endsAt: { gt: now } }, take: 3 })
-    const pendingClaims = await this.db.pointsClaim.count({ where: { userId, status: 'more_info' } })
-
-    // 近期安排
-    const upcoming = await this.db.activity.findMany({
-      where: { status: 'published', startAt: { gt: now }, endAt: { lt: new Date(now.getTime() + 14 * 24 * 3600_000) } },
-      orderBy: { startAt: 'asc' },
-      take: 5,
-      include: { registrations: { where: { userId } }, venueVersion: { include: { venue: true } } },
-    })
+    const eff = computeEffectiveScore({ monthlyScores: monthly, currentMonth }, { effectiveWeights })
+    const components = eff.components.map((c) => ({
+      month: c.month,
+      m: Number(c.m),
+      initial: initialByMonth.get(c.month) ?? 0,
+      weight: Number(c.weight),
+      contribution: Number(c.contribution),
+    }))
+    const myRank = ranked.findIndex((r) => r.userId === userId)
+    const attendanceTotal = attendanceResults.length
+    const attendanceDone = attendanceResults.filter((result) =>
+      ['ontime', 'late', 'early_leave', 'late_and_early', 'remote_approved'].includes(result.status),
+    ).length
 
     const membership = user.membershipTerms[0]?.membershipStatus ?? 'applicant'
     return {
@@ -131,8 +141,11 @@ export class MembersService {
       },
       score: {
         e: eff.eDisplay,
-        components: eff.components.map((c) => ({ month: c.month, m: Number(c.m), weight: Number(c.weight), contribution: Number(c.contribution) })),
-        currentMonthM: monthly[currentMonth] ?? 0,
+        /** m 为该月计入 E 的原始分（含入社基础分），initial 为其中的入社基础分 */
+        components,
+        /** 本月积分（不含入社基础分） */
+        currentMonthM: Math.round(((monthly[currentMonth] ?? 0) - (initialByMonth.get(currentMonth) ?? 0)) * 1e6) / 1e6,
+        initial: initialSummary(initialByMonth, components),
       },
       rank:
         myRank >= 0
@@ -218,7 +231,7 @@ export class MembersService {
       take: 21,
       ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
       include: {
-        profile: { select: { displayName: true } },
+        profile: { select: { displayName: true, avatarAssetId: true, visibility: true } },
         membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1 },
         restrictions: { where: { revokedAt: null, OR: [{ endsAt: null }, { endsAt: { gt: new Date() } }] } },
       },
@@ -238,6 +251,7 @@ export class MembersService {
         return {
           id: u.id,
           displayName: memberName(u),
+          avatarAssetId: visibleAvatar(u.profile),
           studentNo: u.studentNo,
           grade: u.grade,
           membership: u.membershipTerms[0]?.membershipStatus ?? 'applicant',
