@@ -91,7 +91,7 @@ export class MembersAdminController {
     return ok({ decided: true })
   }
 
-  /** 直接调整身份（presidium）：记录流转与审计，不能操作本人 */
+  /** 直接调整身份（presidium）：记录流转与审计 */
   @Post('members/:id/membership')
   @RequireAction('members.manage')
   async setMembership(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {

@@ -72,7 +72,8 @@ export const ROLE_ACTIONS: Record<string, string[]> = {
 }
 
 export function actorCan(actor: SessionActor, action: string): boolean {
-  if (actor.roles.includes('system_admin') && ROLE_ACTIONS.system_admin.includes(action)) return true
+  // 系统管理员拥有全部业务与技术权限
+  if (actor.roles.includes('system_admin')) return true
   return actor.roles.some((role) => ROLE_ACTIONS[role]?.includes(action))
 }
 

@@ -15,8 +15,9 @@ describe('运行服务与角色授权', () => {
     expect(actorCan({ roles: [role] } as SessionActor, 'members.read')).toBe(true)
   })
 
-  it('成员无管理读取权，系统管理员读取权不附带业务审批权', () => {
+  it('成员无管理读取权，系统管理员拥有全部业务权限', () => {
     expect(actorCan({ roles: ['member'] } as SessionActor, 'members.read')).toBe(false)
-    expect(actorCan({ roles: ['system_admin'] } as SessionActor, 'members.review')).toBe(false)
+    expect(actorCan({ roles: ['system_admin'] } as SessionActor, 'members.review')).toBe(true)
+    expect(actorCan({ roles: ['system_admin'] } as SessionActor, 'venue.verify')).toBe(true)
   })
 })

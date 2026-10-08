@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { LoaderCircleIcon } from 'lucide-react';
+import { BookOpenIcon, ChevronDownIcon, LoaderCircleIcon } from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -23,12 +23,17 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
+import { MarkdownView } from '@/components/club/MarkdownView';
+import { cn } from '@/lib/utils';
+import bindingGuide from '@/content/platform-binding-guide.md?raw';
 
 interface BindPlatformAccountDialogProps {
   principalId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSuccess?: () => void;
+  /** 预选平台（如从平台赛报名入口打开） */
+  defaultPlatform?: string;
 }
 
 export function BindPlatformAccountDialog({
@@ -36,6 +41,7 @@ export function BindPlatformAccountDialog({
   open,
   onOpenChange,
   onSuccess,
+  defaultPlatform,
 }: BindPlatformAccountDialogProps) {
   const queryClient = useQueryClient();
   const mutation = useMutation({
@@ -61,12 +67,15 @@ export function BindPlatformAccountDialog({
         onOpenChange(nextOpen);
       }}
     >
-      <DialogContent className="gap-5 p-5 sm:max-w-md sm:p-6">
+      <DialogContent className="max-h-[90dvh] gap-5 overflow-y-auto p-5 sm:max-w-lg sm:p-6">
         <DialogHeader>
           <DialogTitle>绑定平台账号</DialogTitle>
           <DialogDescription>管理员核验后，比赛成绩会自动同步。</DialogDescription>
         </DialogHeader>
+        <BindingGuide />
         <BindForm
+          key={defaultPlatform ?? 'any'}
+          defaultPlatform={defaultPlatform}
           submitting={mutation.isPending}
           onSubmit={(input) => mutation.mutate(input)}
           onCancel={() => {
@@ -81,17 +90,19 @@ export function BindPlatformAccountDialog({
 }
 
 function BindForm({
+  defaultPlatform,
   submitting,
   onSubmit,
   onCancel,
   error,
 }: {
+  defaultPlatform?: string;
   submitting: boolean;
   onSubmit: (input: { platform: string; externalId: string; proofNote: string }) => void;
   onCancel: () => void;
   error: string | null;
 }) {
-  const [platform, setPlatform] = useState('nowcoder');
+  const [platform, setPlatform] = useState(defaultPlatform ?? 'nowcoder');
   const [externalId, setExternalId] = useState('');
   const [proofNote, setProofNote] = useState('');
 
@@ -159,5 +170,25 @@ function BindForm({
         </Button>
       </DialogFooter>
     </form>
+  );
+}
+
+/** 绑定教程（src/content/platform-binding-guide.md，Markdown 渲染）：默认收起，首次绑定可展开对照 */
+function BindingGuide() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="rounded-xl border border-border bg-muted/30">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-sm font-medium text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <BookOpenIcon className="size-4 text-primary" aria-hidden="true" />
+        不知道填什么？查看绑定教程
+        <ChevronDownIcon className={cn('ml-auto size-4 text-muted-foreground transition-transform', open && 'rotate-180')} aria-hidden="true" />
+      </button>
+      {open && <MarkdownView source={bindingGuide} className="border-t border-border px-4 pt-2 pb-3" />}
+    </div>
   );
 }

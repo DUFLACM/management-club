@@ -335,7 +335,7 @@ function GroupEditor({ principalId, group }: { principalId: string; group: strin
     onSuccess: (result) => {
       setNotice(
         result.valid
-          ? { tone: 'info', text: '校验通过（validated），可交另一负责人审批。' }
+          ? { tone: 'info', text: '校验通过（validated），可直接审批。' }
           : { tone: 'error', text: `校验未通过：${result.issues.join('；')}` },
       );
       invalidate();
@@ -538,11 +538,11 @@ function GroupEditor({ principalId, group }: { principalId: string; group: strin
                     disabled={approveMutation.isPending}
                     onClick={() => approveMutation.mutate(draft.id)}
                   >
-                    审批（需另一负责人）
+                    审批
                   </Button>
                 )}
                 <span className="ml-auto text-xs text-muted-foreground">
-                  草稿创建人不能审批自己的草稿（SAME_PRINCIPAL 拒绝）。
+                  校验通过后可直接审批并发布。
                 </span>
               </div>
             </CardContent>

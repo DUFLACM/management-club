@@ -42,6 +42,8 @@ export interface StandingsSnapshot {
   entries: StandingsEntry[]
   fetchedAt: string
   note: string | null
+  /** 榜单接口附带的比赛元数据（仅部分平台提供，供历史导入预填名称与时间） */
+  contest?: { name: string | null; startAt: string | null; endAt: string | null }
 }
 
 export interface StandingsFailure {
@@ -153,7 +155,10 @@ export class ContestStandingsService {
     const result = (body.result ?? {}) as Json
     const problemRows = asArray(result.problems)
     const rankRows = asArray(result.rows)
-    const contestPhase = str((result.contest as Json | undefined)?.phase)
+    const contestInfo = (result.contest ?? {}) as Json
+    const contestPhase = str(contestInfo.phase)
+    const startSeconds = num(contestInfo.startTimeSeconds)
+    const durationSeconds = num(contestInfo.durationSeconds)
     const problems: StandingsProblem[] = problemRows.map((p) => ({
       index: str(p.index) ?? '?',
       name: str(p.name),
@@ -179,6 +184,11 @@ export class ContestStandingsService {
     }).filter((e) => e.handle !== '')
     return {
       platform: 'codeforces', contestId, available: true, problems, entries, fetchedAt: new Date().toISOString(),
+      contest: {
+        name: str(contestInfo.name),
+        startAt: startSeconds != null ? new Date(startSeconds * 1000).toISOString() : null,
+        endAt: startSeconds != null && durationSeconds != null ? new Date((startSeconds + durationSeconds) * 1000).toISOString() : null,
+      },
       note: contestPhase === 'FINISHED' ? '数据来自 Codeforces 官方 API，为最终榜单。' : '比赛仍在进行/待复核，榜单为当前实时快照（每分钟自动刷新）。',
     }
   }

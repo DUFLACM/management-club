@@ -4,7 +4,7 @@
  *   详情（公告设置/报名候补/现场出勤/参与核验/归档）+ 发布 + 必到名单 + 结算候选 + 现场码大屏。
  * - tab=venues：GET /admin/venues（认证状态 + 运行状态双徽标）；新增地点（venueDraftSchema）、
  *   版本详情（贡献者/样本/审核事件/绑定活动）、现场采样（点击定位）、提交认证、审核
- *   （创建/编辑者提交返回 400 RECUSED 显示回避提示）、停用/恢复/归档（停用前 impact 预览）。
+ *   （有地点审核权限即可审核，含创建者本人）、停用/恢复/归档（停用前 impact 预览）。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
@@ -2113,7 +2113,7 @@ function VenueDetailSheet({
                               `/admin/venues/${venueId}/versions/${version.id}/submit`,
                               { expectedRevision: version.revision },
                             ),
-                          '已提交认证（创建/编辑者需回避审核）。',
+                          '已提交认证，可直接审核。',
                         )
                       }
                     >
@@ -2203,7 +2203,7 @@ function VenueDetailSheet({
               </section>
 
               <section className="flex flex-col gap-2">
-                <h3 className="text-sm font-semibold text-foreground">贡献者（回避集合）</h3>
+                <h3 className="text-sm font-semibold text-foreground">贡献者</h3>
                 <ul className="flex flex-wrap gap-2 text-xs">
                   {version.contributors.map((contributor) => (
                     <li
@@ -2403,7 +2403,7 @@ function CreateVenueDialog({
         <DialogHeader>
           <DialogTitle>新增地点（创建草稿 v1）</DialogTitle>
           <DialogDescription>
-            创建后为草稿版本；采集样本、提交认证、另一负责人审核通过后才能用于发布活动。
+            创建后为草稿版本；采集样本、提交认证并审核通过后即可用于发布活动（可自行审核）。
             声明 GEO 能力必须提供真实坐标/半径/精度，不得虚构。
           </DialogDescription>
         </DialogHeader>

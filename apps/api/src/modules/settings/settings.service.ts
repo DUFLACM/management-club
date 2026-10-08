@@ -11,7 +11,7 @@ import type { SessionActor } from '../auth/session.service.js'
  * - 类型化 schema 校验；draft → validated → pending_approval → approved → published。
  * - 发布在事务内更新有效指针 + 审计 + outbox；恢复 = 以旧值建立新版本。
  * - 秘密只写（PUT /admin/secrets/:key），GET 只返回 configured/轮换状态。
- * - system_admin 维护基础设施；业务裁决（规则/审核/隐私）不因技术权限绕过审批。
+ * - system_admin 拥有全部权限；业务分组审批单人即可（创建人可自行审批）。
  */
 
 export const SETTING_GROUPS = [
@@ -44,7 +44,7 @@ const GROUP_SCHEMAS: Record<SettingGroup, z.ZodTypeAny> = {
   backups: z.object({ note: z.string().max(300).optional() }),
 }
 
-/** 需要业务审批的分组（system_admin 不能直接发布） */
+/** 需要业务审批的分组（业务角色或 system_admin 审批） */
 const BUSINESS_GROUPS = new Set<SettingGroup>(['term', 'rule_defaults', 'review_rules', 'privacy_disclosures'])
 
 @Injectable()
@@ -88,16 +88,14 @@ export class SettingsService {
     return { versionId: id }
   }
 
-  /** 审批（业务组需要非 system_admin 业务权限；发布人与审批人分离） */
+  /** 审批（业务组需要业务角色或 system_admin；创建人可自行审批） */
   async approve(actor: SessionActor, versionId: string): Promise<void> {
     const version = await this.db.siteSettingVersion.findUnique({ where: { id: versionId } })
     if (!version) throw new SettingsError('版本不存在', 'NOT_FOUND')
     if (version.status !== 'validated' && version.status !== 'pending_approval') throw new SettingsError('先校验再审批', 'STATE_INVALID')
-    if (BUSINESS_GROUPS.has(version.group as SettingGroup) && !actor.roles.some((r) => ['presidium', 'advisor', 'points_reviewer'].includes(r))) {
-      throw new SettingsError('该分组属业务裁决，需要业务审批权限（system_admin 技术权限不能替代）', 'BUSINESS_APPROVAL_REQUIRED')
-    }
-    if (version.createdBy === actor.principalId) {
-      throw new SettingsError('审批人与草稿创建人不能为同一主体', 'SAME_PRINCIPAL')
+    // 单人审批即可（创建人可自行审批）；业务分组需业务角色或系统管理员
+    if (BUSINESS_GROUPS.has(version.group as SettingGroup) && !actor.roles.some((r) => ['presidium', 'advisor', 'points_reviewer', 'system_admin'].includes(r))) {
+      throw new SettingsError('该分组属业务裁决，需要业务审批权限', 'BUSINESS_APPROVAL_REQUIRED')
     }
     await this.db.siteSettingVersion.update({ where: { id: versionId }, data: { status: 'approved', approvedBy: actor.principalId } })
     await this.db.settingEvent.create({ data: { id: newId(), versionId, principalId: actor.principalId, action: 'approve' } })

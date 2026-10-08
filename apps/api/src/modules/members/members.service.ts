@@ -243,7 +243,6 @@ export class MembersService {
 
   /** 入社审批（applicant → observing；记录 transition；不自动正式） */
   async reviewMembership(actor: SessionActor, userId: string, decision: 'admit' | 'reject', reason: string): Promise<void> {
-    if (actor.userId === userId) throw new MembersError('不能审批本人入社', 'RECUSED')
     const term = await this.db.membershipTerm.findFirst({ where: { userId }, orderBy: { createdAt: 'desc' } })
     if (!term || term.membershipStatus !== 'applicant') throw new MembersError('当前不是申请中状态', 'STATE_INVALID')
     const nextStatus = decision === 'admit' ? 'observing' : 'rejected_input'
@@ -268,7 +267,6 @@ export class MembersService {
 
   /** 直接调整身份（members.manage）：记录 transition 与审计；无 term 时按当前学期补建 */
   async setMembership(actor: SessionActor, userId: string, status: MembershipStatus, reason: string): Promise<void> {
-    if (actor.userId === userId) throw new MembersError('不能调整本人身份', 'RECUSED')
     const term = await this.db.membershipTerm.findFirst({ where: { userId }, orderBy: { createdAt: 'desc' } })
     if (term?.membershipStatus === status) throw new MembersError('当前已是该身份，无需调整', 'STATE_INVALID')
     const now = new Date()
@@ -654,9 +652,6 @@ export class MembersService {
   async decideRoomBooking(actor: SessionActor, bookingId: string, decision: 'approve' | 'reject', reason?: string): Promise<void> {
     const booking = await this.db.roomBooking.findUnique({ where: { id: bookingId } })
     if (!booking || booking.status !== 'pending') throw new MembersError('预约不存在或已处理', 'STATE_INVALID')
-    if (booking.applicantUserId === actor.userId || booking.coApplicantUserIds.includes(actor.userId ?? '')) {
-      throw new MembersError('不能审批本人参与的预约', 'RECUSED')
-    }
     await this.db.roomBooking.update({
       where: { id: bookingId },
       data: decision === 'approve'

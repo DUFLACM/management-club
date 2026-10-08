@@ -51,30 +51,21 @@ const baseDraft = {
   coordinateSource: 'manual_verified' as const,
 }
 
-describe('回避与状态机', () => {
-  it('创建者不能审核自己提交的版本；独立 verifier 可批准', async () => {
+describe('审核与状态机', () => {
+  it('创建者可以直接审核自己提交的版本', async () => {
     const { venueId, versionId } = await venueService.createVenue(creator, baseDraft)
     await venueService.submitForReview(creator, venueId, versionId, 1)
-    await expect(venueService.decide(creator, venueId, versionId, 'approve', '自审')).rejects.toMatchObject({ code: 'RECUSED' })
-    await venueService.decide(verifier, venueId, versionId, 'approve', '独立核验通过')
+    await venueService.decide(creator, venueId, versionId, 'approve', '自审通过')
     const version = await db.venueVersion.findUnique({ where: { id: versionId } })
     expect(version!.status).toBe('approved')
   })
 
-  it('换人提交不能绕过：编辑者/提交者均在回避集合', async () => {
+  it('编辑者 / 提交者同样可审核（贡献者仅留痕）', async () => {
     const { venueId, versionId } = await venueService.createVenue(creator, { ...baseDraft, name: '换人提交测试' })
-    // editor 编辑草稿（登记 contributor）
     await venueService.updateDraft(editor, venueId, versionId, 1, { ...baseDraft, name: '换人提交测试-改' })
-    // submitter（未参与编辑）提交
     await venueService.submitForReview(submitter, venueId, versionId, 2)
-    // creator（创建者）审核 → 拒绝
-    await expect(venueService.decide(creator, venueId, versionId, 'approve', '创建者')).rejects.toMatchObject({ code: 'RECUSED' })
-    // editor（编辑者）审核 → 拒绝
-    await expect(venueService.decide(editor, venueId, versionId, 'approve', '编辑者')).rejects.toMatchObject({ code: 'RECUSED' })
-    // submitter（提交者）审核 → 拒绝
-    await expect(venueService.decide(submitter, venueId, versionId, 'approve', '提交者')).rejects.toMatchObject({ code: 'RECUSED' })
-    // 完全无关的 verifier → 通过
-    await venueService.decide(verifier, venueId, versionId, 'approve', '无关主体审核')
+    await venueService.decide(editor, venueId, versionId, 'approve', '编辑者审核')
+    expect((await db.venueVersion.findUnique({ where: { id: versionId } }))!.status).toBe('approved')
   })
 
   it('样本仅 draft 可追加；提交后冻结', async () => {

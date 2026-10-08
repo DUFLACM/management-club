@@ -68,10 +68,15 @@ it.each(['system', 'staff'])('有活动管理权限的 %s 主体无需学生账�
   })
 })
 
-it.each([['member'], ['system_admin']])('没有活动管理权限的 %j 被拒绝', async (...roles) => {
-  actor!.roles = roles
+it('没有活动管理权限的成员被拒绝', async () => {
+  actor!.roles = ['member']
   await request(app.getHttpServer()).get(`/api/v1/admin/activities/${activityId}`).expect(403)
   expect(findUnique).not.toHaveBeenCalled()
+})
+
+it('系统管理员拥有全部权限，可读取活动详情', async () => {
+  actor!.roles = ['system_admin']
+  await request(app.getHttpServer()).get(`/api/v1/admin/activities/${activityId}`).expect(200)
 })
 
 it('未登录仍返回 401，活动不存在返回 404', async () => {

@@ -6,6 +6,7 @@ import { loadEnv } from '../../config/env.js'
 import { newId, randomToken, sha256Hex } from '../../common/utils.js'
 import { SessionService, type SessionActor } from './session.service.js'
 import {
+  ADMIN_PASSWORD_MAX_LENGTH,
   ADMIN_PASSWORD_MIN_LENGTH,
   ADMIN_SECRET_MIN_LENGTH,
   generateCaptcha,
@@ -175,6 +176,49 @@ export class AdminAuthService {
       summary: '本地管理员登录成功',
     })
     return { principalId: principal.id, roles }
+  }
+
+  /**
+   * 本地管理员修改自己的登录密码：校验当前密码 → 写新哈希 → 吊销本主体其它会话（当前会话保留）。
+   */
+  async changeOwnPassword(actor: SessionActor, currentPassword: string, newPassword: string): Promise<{ changed: true }> {
+    if (newPassword.length < ADMIN_PASSWORD_MIN_LENGTH || newPassword.length > ADMIN_PASSWORD_MAX_LENGTH) {
+      throw new AdminAuthError(`新密码长度须为 ${ADMIN_PASSWORD_MIN_LENGTH}–${ADMIN_PASSWORD_MAX_LENGTH} 位`, 'ADMIN_PASSWORD_FORMAT')
+    }
+    const credential = await this.db.adminCredential.findUnique({ where: { principalId: actor.principalId } })
+    if (!credential) throw new AdminAuthError('当前账号不是本地管理员账号，没有可修改的管理员密码', 'ADMIN_CREDENTIAL_MISSING', 404)
+    if (!(await verifyAdminSecret(currentPassword, credential.passwordHash))) {
+      await this.audit.log({
+        actorPrincipalId: actor.principalId,
+        action: 'admin_auth.password_change_failed',
+        resourceType: 'admin_credential',
+        resourceId: credential.id,
+        reason: 'CURRENT_PASSWORD_INVALID',
+      })
+      throw new AdminAuthError('当前密码错误', 'ADMIN_CURRENT_PASSWORD_INVALID', 403)
+    }
+    if (await verifyAdminSecret(newPassword, credential.passwordHash)) {
+      throw new AdminAuthError('新密码不能与当前密码相同', 'ADMIN_PASSWORD_UNCHANGED')
+    }
+    const passwordHash = await hashAdminSecret(newPassword)
+    const now = new Date()
+    await this.db.$transaction(async (tx) => {
+      await tx.adminCredential.update({
+        where: { id: credential.id },
+        data: { passwordHash, passwordChangedAt: now, failedAttempts: 0, lockedUntil: null },
+      })
+      await tx.session.updateMany({
+        where: { principalId: actor.principalId, revokedAt: null, id: { not: actor.sessionId } },
+        data: { revokedAt: now, revokeReason: 'admin_password_changed' },
+      })
+      await tx.auditLog.create({
+        data: {
+          id: newId(), actorPrincipalId: actor.principalId, action: 'admin_auth.password_changed',
+          resourceType: 'admin_credential', resourceId: credential.id, summary: '本地管理员修改登录密码（其它会话已下线）',
+        },
+      })
+    })
+    return { changed: true }
   }
 
   async rotateAccessSecret(actor: SessionActor, currentPassword: string, newSecret: string): Promise<{ version: number }> {

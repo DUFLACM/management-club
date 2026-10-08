@@ -9,7 +9,7 @@ import { z } from 'zod'
 /**
  * 地点管理与认证（09 方案）：
  * - venues（稳定地点 + active/suspended/archived）与 venue_versions（draft/pending_review/approved/rejected）分离。
- * - 创建/编辑/提交者按 principal 完整回避（venue_version_contributors）；换人提交不能绕过。
+ * - 创建/编辑/提交者记录在 venue_version_contributors（仅留痕，不限制本人审核）。
  * - 样本仅 draft 可追加；提交冻结证据清单与内容 hash。
  * - approved 版本不可变；修改建新版本；撤销/有效期独立字段。
  * - 新草稿不移动已发布活动围栏。
@@ -253,7 +253,7 @@ export class VenueService {
   }
 
   /**
-   * 独立审核：创建/编辑/提交者全部回避（principal_id 比对，换人提交不能绕过）。
+   * 审核：有 venue.verify 权限即可审核（创建/提交者本人也可审核）。
    * approve/reject 并发只有一个有效结论；重复通过返回原结果。
    */
   async decide(actor: SessionActor, venueId: string, versionId: string, decision: 'approve' | 'reject', reason: string, expectedContentHash?: string): Promise<void> {
@@ -270,10 +270,6 @@ export class VenueService {
       }
       if (expectedContentHash && version.contentHash !== expectedContentHash) {
         throw new VenueError('内容已变化，请刷新后审核', 'CONTENT_CHANGED')
-      }
-      // 完整回避：创建者/编辑者/提交者均不得审核
-      if (version.contributors.some((c) => c.principalId === actor.principalId)) {
-        throw new VenueError('你是本版本的创建/编辑/提交者，必须回避审核', 'RECUSED')
       }
       const now = new Date()
       if (decision === 'approve') {

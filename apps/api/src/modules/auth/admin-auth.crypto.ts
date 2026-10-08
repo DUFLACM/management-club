@@ -6,11 +6,13 @@ const SCRYPT_P = 1
 const SCRYPT_KEY_LENGTH = 32
 const SCRYPT_MAX_MEMORY = 64 * 1024 * 1024
 
-export const ADMIN_PASSWORD_MIN_LENGTH = 16
+/** 管理员自行设置的新密码长度区间（已有的更长初始密码照常可登录） */
+export const ADMIN_PASSWORD_MIN_LENGTH = 6
+export const ADMIN_PASSWORD_MAX_LENGTH = 18
 /**
  * 入口密语是管理端登录的第一道门，不是第二个密码：真正的身份校验在用户名+密码+一次性验证码。
  * 短密语的暴力破解风险由 IP/账号维度限流兜底（15 分钟窗口内 5 次失败即封禁 15 分钟），
- * 因此下限取便于口头转交的 5 位；管理员密码的 16 位下限不受此影响。
+ * 因此下限取便于口头转交的 5 位；管理员密码另有 6–18 位规则。
  */
 export const ADMIN_SECRET_MIN_LENGTH = 5
 

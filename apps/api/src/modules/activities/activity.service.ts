@@ -6,7 +6,7 @@ import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { VenueService } from '../venues/venue.service.js'
 import { newId } from '../../common/utils.js'
 import { actorCan } from '../../common/guards.js'
-import { ContestStandingsService, contestExternalUrl } from './contest-standings.service.js'
+import { ContestStandingsService, contestExternalUrl, type StandingsSnapshot } from './contest-standings.service.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { z } from 'zod'
 import { Prisma, attendanceDeadline } from '@acm/db'
@@ -80,6 +80,10 @@ export const activityUpdateSchema = activityInputSchema
 export type ActivityUpdate = z.infer<typeof activityUpdateSchema>
 
 const CONTEST_TYPES = new Set(['weekly_contest', 'monthly_contest', 'custom_contest'])
+
+/** 需要成员先绑定平台账号才能报名的平台（榜单按绑定账号计分） */
+const BINDABLE_PLATFORMS = new Set(['nowcoder', 'codeforces', 'atcoder'])
+const PLATFORM_NAMES: Record<string, string> = { nowcoder: '牛客', codeforces: 'Codeforces', atcoder: 'AtCoder' }
 
 export const lectureRatingSchema = z.object({
   score: z.number().int().min(1).max(5),
@@ -453,6 +457,11 @@ export class ActivityService {
       const now = new Date()
       if (activity.registerStartAt && activity.registerStartAt > now) throw new ActivityError('报名尚未开始', 'REG_NOT_OPEN')
       if (activity.registerDeadline && activity.registerDeadline < now) throw new ActivityError('报名已截止', 'REG_CLOSED')
+      // 平台赛靠绑定账号匹配榜单计分：没绑定就无法计成绩，报名前必须先绑定
+      if (activity.platform && BINDABLE_PLATFORMS.has(activity.platform)) {
+        const bound = await tx.platformAccount.findFirst({ where: { userId, platform: activity.platform, status: { not: 'revoked' } }, select: { id: true } })
+        if (!bound) throw new ActivityError(`本场是${PLATFORM_NAMES[activity.platform]}比赛，请先在「我的 → 平台账号」绑定${PLATFORM_NAMES[activity.platform]}账号后再报名`, 'NEEDS_PLATFORM_BIND')
+      }
 
       const existing = await tx.activityRegistration.findUnique({
         where: { activityId_userId: { activityId, userId } },
@@ -621,7 +630,8 @@ export class ActivityService {
   /** 活动目录（用户）：标签 + 筛选 + 分页；卡片含本人状态 */
   async listForUser(userId: string | null, filters: { tab?: string; type?: string; q?: string; cursor?: string }) {
     const now = new Date()
-    const where: Record<string, unknown> = { status: 'published' }
+    // 归档活动（含历史积分导入存档）留在「全部 / 已结束」里，成员可回看积分来源
+    const where: Record<string, unknown> = { status: { in: ['published', 'archived'] } }
     if (filters.type) where.type = filters.type
     if (filters.q) where.title = { contains: filters.q, mode: 'insensitive' }
     if (filters.tab === 'open') where.registerDeadline = { gte: now }
@@ -691,6 +701,12 @@ export class ActivityService {
     const activity = await this.withContestMeta(await this.loadDetail(userId, activityId))
     if (!userId) return activity
     const lectureRatings = await this.lectureRatings(userId, activityId, actor)
+    const platformBinding = activity.platform && BINDABLE_PLATFORMS.has(activity.platform)
+      ? {
+        platform: activity.platform,
+        bound: (await this.db.platformAccount.count({ where: { userId, platform: activity.platform, status: { not: 'revoked' } } })) > 0,
+      }
+      : null
     const points = await this.db.pointsLedgerEntry.findMany({
       where: { status: 'approved', detail: { path: ['activityId'], equals: activityId } },
       orderBy: [{ recordedAt: 'desc' }, { id: 'desc' }],
@@ -708,6 +724,7 @@ export class ActivityService {
     const mine = points.filter((entry) => entry.userId === userId)
     return Object.assign(activity, {
       lectureRatings,
+      platformBinding,
       activityPoints: {
         mine: mine.map((entry) => ({
           amount: Number(entry.amount),
@@ -1078,11 +1095,17 @@ export class ActivityService {
     const ended = activity.endAt.getTime() <= Date.now()
     const result = await standings.fetch(activity.platform, activity.platformContestId)
     if (!result.available) return { activity, contestUrl, ended, result, clubRows: [], clubRanking: [], problems: [], totalEntries: 0 }
+    const { clubRows, clubRanking, problems, totalEntries } = await this.matchClubRows(activity.platform, result)
+    return { activity, contestUrl, ended, result, clubRows, clubRanking, problems, totalEntries }
+  }
+
+  /** 平台榜单 → 社团成员行：按平台账号绑定（externalId / displayHandle）映射，按对题数、得分排序 */
+  async matchClubRows(platform: string, result: StandingsSnapshot) {
     const accounts = await this.db.platformAccount.findMany({
-      where: { platform: activity.platform, status: { not: 'revoked' } },
+      where: { platform, status: { not: 'revoked' } },
       select: {
         externalId: true, displayHandle: true, userId: true,
-        user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
+        user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
       },
     })
     const entryByHandle = new Map(result.entries.map((entry) => [entry.handle, entry]))
@@ -1092,6 +1115,7 @@ export class ActivityService {
         if (!entry) return null
         return {
           userId: account.userId,
+          studentNo: account.user.studentNo,
           name: account.user.profile?.displayName ?? account.user.verifiedRealName,
           handle: entry.handle,
           displayName: entry.displayName,
@@ -1104,12 +1128,13 @@ export class ActivityService {
       .filter((row): row is NonNullable<typeof row> => row !== null)
       .sort((a, b) => b.solvedCount - a.solvedCount || b.score - a.score || a.name.localeCompare(b.name))
     let clubRank = 0
-    const clubRanking = clubRows.map((row) => ({ ...row, cells: undefined, clubRank: (clubRank += 1) }))
+    // 社团排名会下发给成员端：不带学号
+    const clubRanking = clubRows.map((row) => ({ ...row, cells: undefined, studentNo: undefined, clubRank: (clubRank += 1) }))
     const problems = result.problems.map((problem) => ({
       ...problem,
       clubSolved: clubRows.filter((row) => row.cells.some((cell) => cell.index === problem.index && cell.solved)).length,
     }))
-    return { activity, contestUrl, ended, result, clubRows, clubRanking, problems, totalEntries: result.entries.length }
+    return { clubRows, clubRanking, problems, totalEntries: result.entries.length }
   }
 
   /**

@@ -5,6 +5,7 @@ import {
   ChevronsLeftIcon,
   ChevronsRightIcon,
   ChevronsUpDownIcon,
+  KeyRoundIcon,
   LogOutIcon,
   MenuIcon,
   ShieldCheckIcon,
@@ -34,6 +35,7 @@ import {
 } from '@/components/ui/sheet';
 import { ThemeToggle } from '@/workspaces/shared/ThemeToggle';
 import { MobileNavigation } from '@/workspaces/shared/MobileNavigation';
+import { ChangePasswordDialog } from '@/workspaces/shared/ChangePasswordDialog';
 
 /**
  * 统一工作台外框。
@@ -210,17 +212,105 @@ async function performLogout(principalKind: string | null): Promise<void> {
   window.location.assign(casLogoutUrl ?? '/login');
 }
 
+/** 账户菜单内容：侧栏底部与手机顶栏共用，保证手机端同样能退出登录。 */
+function AccountMenuContent({
+  variant,
+  user,
+  manageAccess,
+  onNavigate,
+  onChangePassword,
+  align,
+  side,
+}: {
+  variant: 'member' | 'admin';
+  user: WorkspaceUser;
+  manageAccess?: boolean;
+  onNavigate: (key: string) => void;
+  onChangePassword: () => void;
+  align: 'start' | 'end';
+  side: 'top' | 'bottom';
+}) {
+  return (
+    <DropdownMenuContent align={align} side={side} className="w-56">
+      <DropdownMenuLabel>
+        <span className="block truncate text-sm font-medium text-foreground">
+          {user.displayName}
+        </span>
+        <span className="block truncate font-normal">
+          {user.membershipLabel}
+          {user.roles.length > 0 ? ` · ${roleLabels(user.roles)}` : ''}
+        </span>
+      </DropdownMenuLabel>
+      <DropdownMenuSeparator />
+      {variant === 'member' && (
+        <DropdownMenuItem onSelect={() => onNavigate('profile')}>
+          <UserRoundIcon aria-hidden="true" />
+          我的资料
+        </DropdownMenuItem>
+      )}
+      {/* 管理入口：仅当前账号有权限时出现（API 仍独立鉴权） */}
+      {variant === 'member' && manageAccess && (
+        <DropdownMenuItem asChild>
+          <a href="/admin?section=overview">
+            <ShieldCheckIcon aria-hidden="true" />
+            管理工作台
+          </a>
+        </DropdownMenuItem>
+      )}
+      {variant === 'admin' && (
+        <DropdownMenuItem asChild>
+          <a href="/app?section=overview">
+            <UserRoundIcon aria-hidden="true" />
+            返回成员工作台
+          </a>
+        </DropdownMenuItem>
+      )}
+      {/* 本地管理员账号（principalKind=system）才有可修改的管理员密码 */}
+      {user.principalKind === 'system' && (
+        <DropdownMenuItem onSelect={onChangePassword}>
+          <KeyRoundIcon aria-hidden="true" />
+          修改密码
+        </DropdownMenuItem>
+      )}
+      <DropdownMenuSeparator />
+      <DropdownMenuItem
+        variant="destructive"
+        onSelect={() => void performLogout(user.principalKind)}
+      >
+        <LogOutIcon aria-hidden="true" />
+        退出登录
+      </DropdownMenuItem>
+    </DropdownMenuContent>
+  );
+}
+
+function UserAvatar({ user }: { user: WorkspaceUser }) {
+  return (
+    <Avatar className="size-8 shrink-0 ring-1 ring-sidebar-border">
+      {user.avatarAssetId && (
+        <AvatarImage
+          src={`/api/v1/me/avatar/${user.avatarAssetId}?size=64`}
+          alt={`${user.displayName} 的头像`}
+        />
+      )}
+      <AvatarFallback>{user.avatarText}</AvatarFallback>
+    </Avatar>
+  );
+}
+
 function SidebarFooter({
   variant,
   user,
   manageAccess,
   onNavigate,
+  onChangePassword,
   expanded,
 }: {
   variant: 'member' | 'admin';
   user: WorkspaceUser;
   manageAccess?: boolean;
   onNavigate: (key: string) => void;
+  onChangePassword: () => void;
   expanded: boolean;
 }) {
   return (
@@ -253,15 +343,7 @@ function SidebarFooter({
               'hover:bg-sidebar-accent/60 focus-visible:ring-2 focus-visible:ring-sidebar-ring focus-visible:ring-offset-2 focus-visible:ring-offset-sidebar',
             )}
           >
-            <Avatar className="size-8 shrink-0 ring-1 ring-sidebar-border">
-              {user.avatarAssetId && (
-                <AvatarImage
-                  src={`/api/v1/me/avatar/${user.avatarAssetId}?size=64`}
-                  alt={`${user.displayName} 的头像`}
-                />
-              )}
-              <AvatarFallback>{user.avatarText}</AvatarFallback>
-            </Avatar>
+            <UserAvatar user={user} />
             <span className={cn('hidden min-w-0 flex-1 flex-col', expanded ? 'md:flex' : 'md:hidden', 'lg:flex')}>
               <span className="truncate text-sm leading-5 font-medium text-sidebar-foreground">
                 {user.displayName}
@@ -273,49 +355,15 @@ function SidebarFooter({
             <ChevronsUpDownIcon className={cn('hidden size-3.5 shrink-0 text-muted-foreground', expanded ? 'md:block' : 'md:hidden', 'lg:block')} aria-hidden="true" />
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="start" side="top" className="w-56">
-          <DropdownMenuLabel>
-            <span className="block truncate text-sm font-medium text-foreground">
-              {user.displayName}
-            </span>
-            <span className="block truncate font-normal">
-              {user.membershipLabel}
-              {user.roles.length > 0 ? ` · ${roleLabels(user.roles)}` : ''}
-            </span>
-          </DropdownMenuLabel>
-          <DropdownMenuSeparator />
-          {variant === 'member' && (
-            <DropdownMenuItem onSelect={() => onNavigate('profile')}>
-              <UserRoundIcon aria-hidden="true" />
-              我的资料
-            </DropdownMenuItem>
-          )}
-          {/* 管理入口：仅当前账号有权限时出现（API 仍独立鉴权） */}
-          {variant === 'member' && manageAccess && (
-            <DropdownMenuItem asChild>
-              <a href="/admin?section=overview">
-                <ShieldCheckIcon aria-hidden="true" />
-                管理工作台
-              </a>
-            </DropdownMenuItem>
-          )}
-          {variant === 'admin' && (
-            <DropdownMenuItem asChild>
-              <a href="/app?section=overview">
-                <UserRoundIcon aria-hidden="true" />
-                返回成员工作台
-              </a>
-            </DropdownMenuItem>
-          )}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            variant="destructive"
-            onSelect={() => void performLogout(user.principalKind)}
-          >
-            <LogOutIcon aria-hidden="true" />
-            退出登录
-          </DropdownMenuItem>
-        </DropdownMenuContent>
+        <AccountMenuContent
+          variant={variant}
+          user={user}
+          manageAccess={manageAccess}
+          onNavigate={onNavigate}
+          onChangePassword={onChangePassword}
+          align="start"
+          side="top"
+        />
       </DropdownMenu>
     </div>
   );
@@ -333,6 +381,7 @@ export function WorkspaceShell({
 }: WorkspaceShellProps) {
   const [railExpanded, setRailExpanded] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
 
   useEffect(() => {
     if (!railExpanded) return;
@@ -436,6 +485,7 @@ export function WorkspaceShell({
           user={user}
           manageAccess={manageAccess}
           onNavigate={onNavigate}
+          onChangePassword={() => setPasswordOpen(true)}
           expanded={railExpanded}
         />
       </aside>
@@ -487,6 +537,27 @@ export function WorkspaceShell({
 
           <div className="ml-auto flex shrink-0 items-center gap-1">
             {headerRight ?? <ThemeToggle />}
+            {/* 手机端侧栏隐藏，账户菜单（含退出登录）放到顶栏 */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`${user.displayName}，账户菜单`}
+                  className="flex size-11 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring md:hidden"
+                >
+                  <UserAvatar user={user} />
+                </button>
+              </DropdownMenuTrigger>
+              <AccountMenuContent
+                variant={variant}
+                user={user}
+                manageAccess={manageAccess}
+                onNavigate={onNavigate}
+                onChangePassword={() => setPasswordOpen(true)}
+                align="end"
+                side="bottom"
+              />
+            </DropdownMenu>
           </div>
         </header>
 
@@ -509,6 +580,8 @@ export function WorkspaceShell({
           <MobileNavigation currentSection={currentSection} onNavigate={onNavigate} />
         )}
       </div>
+
+      <ChangePasswordDialog open={passwordOpen} onOpenChange={setPasswordOpen} />
 
       {/* 管理端手机导航 Sheet */}
       {variant === 'admin' && (

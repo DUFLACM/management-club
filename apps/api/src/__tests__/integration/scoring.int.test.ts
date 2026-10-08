@@ -74,14 +74,15 @@ describe('账本幂等与冲正', () => {
     expect(net).toBe(8) // 10 - 10 + 8
   })
 
-  it('冲正本人积分被回避拒绝', async () => {
+  it('可冲正本人积分（不再要求回避）', async () => {
     const u = await createTestUser(db, { studentNo: '202604003' })
     const input = ledgerEntrySchema.parse({
       userId: u.userId, sourceKey: 'activity:act1:participation', category: 'activity',
       amount: '2', scoreMonth: '2026-09',
     })
     const { entryId } = await scoring.postLedgerEntry(makeActor(), input)
-    await expect(scoring.reverseEntry(u.actor, entryId, '本人尝试', null)).rejects.toMatchObject({ code: 'RECUSED' })
+    const result = await scoring.reverseEntry(u.actor, entryId, '本人更正', null)
+    expect(result.reversalId).toBeTruthy()
   })
 
   it('月度批次：R01 未决时 blocked，不产出正式 M', async () => {
@@ -107,27 +108,24 @@ describe('公示', () => {
   })
 })
 
-describe('双人复核', () => {
-  it('同一主体不能投两票；涉及本人回避；两名不同主体通过', async () => {
+describe('复核案件', () => {
+  it('单人裁决即结案（含涉及本人），more_info 不结案', async () => {
     const target = await createTestUser(db, { studentNo: '202604020' })
     const caseRow = await db.reviewCase.create({
       data: { id: crypto.randomUUID(), type: 'points', subjectType: 'ledger', subjectId: crypto.randomUUID(), targetUserId: target.userId, createdBy: crypto.randomUUID() },
     })
-    const reviewer1 = makeActor()
-    const reviewer2 = makeActor()
-    // 本人回避
-    await expect(scoring.voteOnCase(target.actor, caseRow.id, 'approve', '本人投票')).rejects.toMatchObject({ code: 'RECUSED' })
-    // 第一票
-    const v1 = await scoring.voteOnCase(reviewer1, caseRow.id, 'approve', '第一票')
-    expect(v1.resolved).toBe(false)
-    // 同人第二票拒绝
-    await expect(scoring.voteOnCase(reviewer1, caseRow.id, 'approve', '重复投票')).rejects.toMatchObject({ code: 'DOUBLE_VOTE' })
-    // 第二名不同主体
-    const v2 = await scoring.voteOnCase(reviewer2, caseRow.id, 'approve', '第二票')
-    expect(v2.resolved).toBe(true)
-    expect(v2.approvals).toBe(2)
+    const info = await scoring.voteOnCase(makeActor(), caseRow.id, 'more_info', '请补充材料')
+    expect(info.resolved).toBe(false)
+    const decided = await scoring.voteOnCase(target.actor, caseRow.id, 'approve', '本人直接裁决')
+    expect(decided).toEqual({ resolved: true, approvals: 1 })
     const updated = await db.reviewCase.findUnique({ where: { id: caseRow.id } })
     expect(updated!.status).toBe('resolved')
+
+    const rejectCase = await db.reviewCase.create({
+      data: { id: crypto.randomUUID(), type: 'points', subjectType: 'ledger', subjectId: crypto.randomUUID(), targetUserId: target.userId, createdBy: crypto.randomUUID() },
+    })
+    await scoring.voteOnCase(makeActor(), rejectCase.id, 'reject', '证据不足')
+    expect((await db.reviewCase.findUnique({ where: { id: rejectCase.id } }))!.status).toBe('rejected')
   })
 })
 

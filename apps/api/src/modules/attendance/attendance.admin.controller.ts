@@ -99,7 +99,7 @@ export class AttendanceAdminController {
 
   /**
    * 人工复核/补签（无既有结果行也可操作）：到场类状态补建 MANUAL 签到检查点，
-   * 必到成员自动补报名；结果 upsert 为 corrected 并追加更正记录；利益关联回避。
+   * 必到成员自动补报名；结果 upsert 为 corrected 并追加更正记录。
    */
   @Post('activities/:id/attendance/manual')
   @RequireAction('attendance.review')
@@ -120,7 +120,6 @@ export class AttendanceAdminController {
     const input = parsed.data
     const user = await this.db.user.findUnique({ where: { id: input.userId }, select: { principalId: true } })
     if (!user) throw new AttendanceError('成员不存在', 'NOT_FOUND')
-    if (user.principalId === actor.principalId) throw new AttendanceError('不能复核本人出勤（利益回避）', 'RECUSED')
     const activity = await this.db.activity.findUnique({ where: { id }, select: { id: true } })
     if (!activity) throw new AttendanceError('活动不存在', 'NOT_FOUND')
 
@@ -178,7 +177,7 @@ export class AttendanceAdminController {
     return ok({ resultId, corrected: true })
   }
 
-  /** 人工补签/更正：原值+认定值+原因+证据，追加式；利益关联回避 */
+  /** 人工补签/更正：原值+认定值+原因+证据，追加式 */
   @Post('attendance/:resultId/corrections')
   @RequireAction('attendance.review')
   async correction(
@@ -195,9 +194,6 @@ export class AttendanceAdminController {
     }).parse(body)
     const result = await this.db.attendanceAttendanceResult.findUnique({ where: { id: resultId }, include: { user: true } })
     if (!result) throw new AttendanceError('出勤记录不存在', 'NOT_FOUND')
-    if (result.user && result.user.principalId === actor.principalId) {
-      throw new AttendanceError('不能为本人补签/更正（利益回避）', 'RECUSED')
-    }
     await this.db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT id FROM activities WHERE id = ${result.activityId}::uuid FOR UPDATE`
       if (['ontime', 'late', 'early_leave', 'late_and_early'].includes(parsed.newStatus)) {
@@ -251,7 +247,6 @@ export class AttendanceAdminController {
     const parsed = z.object({ decision: z.enum(['approve', 'reject']), note: z.string().max(500).optional() }).parse(body)
     const leave = await this.db.leaveRequest.findUnique({ where: { id }, include: { user: true } })
     if (!leave) throw new AttendanceError('请假申请不存在', 'NOT_FOUND')
-    if (leave.user.principalId === actor.principalId) throw new AttendanceError('不能审批本人请假（利益回避）', 'RECUSED')
     await this.db.leaveRequest.update({
       where: { id },
       data: { status: parsed.decision === 'approve' ? 'approved' : 'rejected', reviewedBy: actor.principalId, reviewedAt: new Date(), reviewNote: parsed.note },
@@ -277,7 +272,6 @@ export class AttendanceAdminController {
     const parsed = z.object({ decision: z.enum(['approve', 'reject']), note: z.string().max(500).optional() }).parse(body)
     const perm = await this.db.remotePermission.findUnique({ where: { id }, include: { user: true } })
     if (!perm) throw new AttendanceError('远程申请不存在', 'NOT_FOUND')
-    if (perm.user.principalId === actor.principalId) throw new AttendanceError('利益回避', 'RECUSED')
     await this.db.remotePermission.update({
       where: { id },
       data: { status: parsed.decision === 'approve' ? 'approved' : 'rejected', approvedBy: actor.principalId, approvedAt: new Date() },

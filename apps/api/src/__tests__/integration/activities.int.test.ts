@@ -161,6 +161,17 @@ async function createPublishedActivity(opts: { capacity: number; waitlist?: numb
 }
 
 describe('报名并发与候补', () => {
+  it('平台赛报名前必须绑定对应平台账号（待审核绑定即可）', async () => {
+    const activityId = await createPublishedActivity({ capacity: 5 })
+    await db.activity.update({ where: { id: activityId }, data: { platform: 'codeforces', platformContestId: '2043' } })
+    const u = await createTestUser(db, { studentNo: '202602090' })
+    await expect(activities.register(u.userId, activityId)).rejects.toMatchObject({ code: 'NEEDS_PLATFORM_BIND' })
+    await db.platformAccount.create({ data: { id: crypto.randomUUID(), platform: 'atcoder', externalId: 'someone', userId: u.userId, status: 'verified' } })
+    await expect(activities.register(u.userId, activityId)).rejects.toMatchObject({ code: 'NEEDS_PLATFORM_BIND' })
+    await db.platformAccount.create({ data: { id: crypto.randomUUID(), platform: 'codeforces', externalId: 'tourist-club', userId: u.userId, status: 'pending_review' } })
+    expect((await activities.register(u.userId, activityId)).status).toBe('enrolled')
+  })
+
   it('容量 1 并发两请求：一人 enrolled，一人 waitlisted（不超发）', async () => {
     const activityId = await createPublishedActivity({ capacity: 1, waitlist: 2 })
     const u1 = await createTestUser(db, { studentNo: '202602001' })

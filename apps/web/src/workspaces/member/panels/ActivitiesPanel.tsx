@@ -35,6 +35,7 @@ import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
+import { BindPlatformAccountDialog } from '@/components/club/BindPlatformAccountDialog';
 import { useDebouncedValue, LoadMoreButton } from '@/lib/hooks';
 import {
   ACTIVITY_TYPE_LABELS,
@@ -142,6 +143,8 @@ interface ActivityDetailDto {
   }>;
   /** 本活动获批讲题人的满意度评价（无讲题时为空数组） */
   lectureRatings?: LectureRatingDto[];
+  /** 平台赛（牛客 / CF / AtCoder）报名前须绑定对应平台账号 */
+  platformBinding?: { platform: string; bound: boolean } | null;
   activityPoints: {
     mine: Array<{ amount: number; category: string; scoreMonth: string; note: string | null; recordedAt: string }>;
     myTotal: number;
@@ -881,6 +884,8 @@ function RegistrationSection({
   const [showLeaveForm, setShowLeaveForm] = useState(false);
   const [showRemoteForm, setShowRemoteForm] = useState(false);
   const [lectureTopic, setLectureTopic] = useState('');
+  const [bindOpen, setBindOpen] = useState(false);
+  const needsBinding = detail.platformBinding != null && !detail.platformBinding.bound;
 
   const invalidate = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'activities'] });
@@ -1025,11 +1030,34 @@ function RegistrationSection({
           )}
         </div>
 
+        {needsBinding && !activityEnded && (
+          <Alert>
+            <AlertTitle>报名前需绑定{platformLabel(detail.platformBinding!.platform)}账号</AlertTitle>
+            <AlertDescription className="flex flex-wrap items-center gap-2">
+              <span>本场成绩按绑定账号从平台榜单自动计分，未绑定无法报名参赛。</span>
+              <Button size="sm" variant="outline" onClick={() => setBindOpen(true)}>
+                去绑定
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+        <BindPlatformAccountDialog
+          principalId={principalId}
+          open={bindOpen}
+          onOpenChange={setBindOpen}
+          defaultPlatform={detail.platformBinding?.platform}
+          onSuccess={() => {
+            setActionError(null);
+            setActionNotice('平台账号已提交绑定，现在可以报名了。');
+            invalidate();
+          }}
+        />
+
         <div className="flex flex-wrap gap-2">
           {!required && (!registration ||
             !['enrolled', 'waitlisted', 'pending_approval'].includes(registration.status)) && (
             <Button
-              onClick={() => registerMutation.mutate()}
+              onClick={() => (needsBinding ? setBindOpen(true) : registerMutation.mutate())}
               disabled={registerMutation.isPending}
             >
               {registerMutation.isPending && (

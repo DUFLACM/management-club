@@ -176,3 +176,35 @@ describe('独立管理员认证', () => {
     ).resolves.toBeTruthy()
   })
 })
+
+describe('管理员修改自己的密码', () => {
+  it('校验当前密码与 6–18 位长度；成功后其它会话下线、当前会话保留', async () => {
+    const selfPrincipal = crypto.randomUUID()
+    await db.principal.create({ data: { id: selfPrincipal, kind: 'system' } })
+    await db.adminCredential.create({
+      data: { id: crypto.randomUUID(), principalId: selfPrincipal, username: 'pwd.changer', displayName: '改密测试', passwordHash: await hashAdminSecret('old-password-long-enough') },
+    })
+    await sessions.createSession(selfPrincipal, 'current-device')
+    await sessions.createSession(selfPrincipal, 'other-device')
+    const [current, other] = await db.session.findMany({ where: { principalId: selfPrincipal }, orderBy: { createdAt: 'asc' } })
+    const actor = { principalId: selfPrincipal, sessionId: current.id, principalKind: 'system', authzVersion: 1, roles: ['system_admin'] }
+
+    await expect(adminAuth.changeOwnPassword(actor, 'wrong-password', 'abc123')).rejects.toMatchObject({ code: 'ADMIN_CURRENT_PASSWORD_INVALID' })
+    await expect(adminAuth.changeOwnPassword(actor, 'old-password-long-enough', '12345')).rejects.toMatchObject({ code: 'ADMIN_PASSWORD_FORMAT' })
+    await expect(adminAuth.changeOwnPassword(actor, 'old-password-long-enough', '1234567890123456789')).rejects.toMatchObject({ code: 'ADMIN_PASSWORD_FORMAT' })
+
+    await expect(adminAuth.changeOwnPassword(actor, 'old-password-long-enough', 'abc123')).resolves.toEqual({ changed: true })
+    const credential = await db.adminCredential.findUniqueOrThrow({ where: { principalId: selfPrincipal } })
+    const { verifyAdminSecret } = await import('../../modules/auth/admin-auth.crypto.js')
+    expect(await verifyAdminSecret('abc123', credential.passwordHash)).toBe(true)
+    expect((await db.session.findUniqueOrThrow({ where: { id: current.id } })).revokedAt).toBeNull()
+    expect((await db.session.findUniqueOrThrow({ where: { id: other.id } })).revokeReason).toBe('admin_password_changed')
+  })
+
+  it('非本地管理员账号没有可修改的密码', async () => {
+    await expect(adminAuth.changeOwnPassword(
+      { principalId: crypto.randomUUID(), sessionId: crypto.randomUUID(), principalKind: 'student', authzVersion: 1, roles: [] },
+      'whatever', 'abc123',
+    )).rejects.toMatchObject({ code: 'ADMIN_CREDENTIAL_MISSING' })
+  })
+})

@@ -203,7 +203,6 @@ export class ProfilesService {
   async grantBadge(actor: SessionActor, input: { definitionKey: string; userId: string; reason: string; evidenceRef?: string; expiresAt?: string }) {
     const def = await this.db.badgeDefinition.findUnique({ where: { key: input.definitionKey } })
     if (!def) throw new ProfileError('徽标定义不存在', 'NOT_FOUND')
-    if (input.userId === actor.userId) throw new ProfileError('不能授予本人徽标（回避）', 'RECUSED')
     const sourceKey = `badge:${def.key}:${input.userId}:${input.evidenceRef ?? 'manual'}`
     const id = newId()
     try {
@@ -227,7 +226,6 @@ export class ProfilesService {
   async revokeBadge(actor: SessionActor, awardId: string, reason: string) {
     const award = await this.db.badgeAward.findUnique({ where: { id: awardId } })
     if (!award) throw new ProfileError('授予不存在', 'NOT_FOUND')
-    if (award.userId === actor.userId) throw new ProfileError('回避', 'RECUSED')
     await this.db.badgeAward.update({ where: { id: awardId }, data: { status: 'revoked', revokedReason: reason } })
     await this.db.profileFeaturedBadge.deleteMany({ where: { awardId } })
     return { revoked: true }

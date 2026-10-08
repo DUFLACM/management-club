@@ -193,7 +193,6 @@ export class ScoringAdminController {
     const parsed = z.object({ decision: z.enum(['approve', 'reject', 'more_info']), note: z.string().max(500).optional(), amount: z.string().regex(/^-?\d+(\.\d+)?$/).optional() }).parse(body)
     const claim = await this.db.pointsClaim.findUnique({ where: { id } })
     if (!claim) return ok({ decided: false })
-    if (claim.userId === actor.userId) return ok({ decided: false, reason: '涉及本人需回避' })
     await this.db.pointsClaim.update({
       where: { id },
       data: { status: parsed.decision === 'approve' ? 'approved' : parsed.decision === 'reject' ? 'rejected' : 'more_info', reviewNote: parsed.note, reviewedBy: actor.principalId, reviewedAt: new Date() },

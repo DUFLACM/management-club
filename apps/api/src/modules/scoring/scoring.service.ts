@@ -16,6 +16,7 @@ import { ActivityService } from '../activities/activity.service.js'
 import { ContestStandingsService } from '../activities/contest-standings.service.js'
 import { rankEligibleMembers } from './effective-ranking.js'
 import { mergeRuleParams } from './rule-params.js'
+import { computeContestW, hasValidSubmission, type LambdaKey } from './contest-formula.js'
 import { newId, monthKey, monthKeyPlus } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { z } from 'zod'
@@ -25,7 +26,7 @@ import { z } from 'zod'
  * - source_key 稳定逻辑键（不含活动/地点/rule_version）；部分唯一索引保证同一来源只有一条 approved。
  * - 纠错：冲正 + 替代，不改总分、不删历史。
  * - 月度 rollup 使用 scoring-core；R01 未决时不发布正式 M。
- * - 公示 ≥48h；双人复核（不同 principal）；冻结后回填不改变名单。
+ * - 公示 ≥48h；复核单人裁决即结案；冻结后回填不改变名单。
  */
 
 export class ScoringError extends DomainError {
@@ -63,6 +64,26 @@ export class ScoringService {
     return { id: 'default', params: defaultRuleParams() }
   }
 
+  /** λ 档来源：公告指定 → 指定比赛目录按标题匹配 → 默认乙类 */
+  async resolveLambda(platform: string, title: string, announced?: string | null): Promise<{ lambdaKey: LambdaKey; lambdaSource: string }> {
+    if (announced === 'A' || announced === 'B' || announced === 'C') return { lambdaKey: announced, lambdaSource: '活动公告' }
+    const catalog = await this.db.designatedContest.findMany({
+      where: { status: 'active', platform, lambdaKey: { not: null } },
+    })
+    const lowered = title.toLowerCase()
+    const matched = catalog.find((entry) =>
+      entry.name
+        .split(/[/（）()、,，]+/)
+        .map((token) => token.trim().toLowerCase())
+        .filter((token) => token.length >= 3)
+        .some((token) => lowered.includes(token)),
+    )
+    if (matched?.lambdaKey === 'A' || matched?.lambdaKey === 'B' || matched?.lambdaKey === 'C') {
+      return { lambdaKey: matched.lambdaKey, lambdaSource: `指定目录（${matched.name}）` }
+    }
+    return { lambdaKey: 'B', lambdaSource: '默认乙类（未匹配公告与目录，可复核后重跑）' }
+  }
+
   /**
    * 平台赛积分结算引擎：活动结束 5 分钟后触发（管理端按钮或调度器）。
    * - λ 来源：活动公告 scoringConfig.lambdaKey → 指定目录匹配（附录一系数）→ 默认乙类；
@@ -97,39 +118,13 @@ export class ScoringService {
 
     // λ：公告 → 指定目录 → 默认乙类
     const config = (activity.scoringConfig ?? {}) as { lambdaKey?: string; specialCap?: number }
-    let lambdaKey = ['A', 'B', 'C'].includes(config.lambdaKey ?? '') ? config.lambdaKey! : null
-    let lambdaSource = lambdaKey ? '活动公告' : null
-    if (!lambdaKey) {
-      const catalog = await this.db.designatedContest.findMany({
-        where: { status: 'active', platform: activity.platform, lambdaKey: { not: null } },
-      })
-      const title = activity.title.toLowerCase()
-      const matched = catalog.find((entry) =>
-        entry.name
-          .split(/[/（）()、,，]+/)
-          .map((token) => token.trim().toLowerCase())
-          .filter((token) => token.length >= 3)
-          .some((token) => title.includes(token)),
-      )
-      if (matched?.lambdaKey) {
-        lambdaKey = matched.lambdaKey
-        lambdaSource = `指定目录（${matched.name}）`
-      }
-    }
-    if (!lambdaKey) {
-      lambdaKey = 'B'
-      lambdaSource = '默认乙类（未匹配公告与目录，可复核后重跑）'
-    }
-    if (!lambdaSource) lambdaSource = '活动公告'
-    const lambdaValue = lambdaKey === 'A' ? 1.2 : lambdaKey === 'C' ? 0.8 : 1.0
+    const { lambdaKey, lambdaSource } = await this.resolveLambda(activity.platform, activity.title, config.lambdaKey)
     const cap = Math.min(config.specialCap ?? 20, 25)
 
     // 有效提交（R04 引擎自动判定）与社团内排名
-    const valid = clubRows.filter(
-      (row) => row.solvedCount > 0 || row.score > 0 || row.cells.some((cell) => cell.solved || (cell.failedCount ?? 0) > 0),
-    )
+    const valid = clubRows.filter(hasValidSubmission)
     const rankOf = new Map(valid.map((row, index) => [row.userId, index + 1]))
-    const totalProblems = problems.length || 1
+    const totalProblems = problems.length
     const fullTotal = problems.reduce((sum, problem) => sum + (problem.fullScore ?? 0), 0)
 
     // 到场 / 远程事实
@@ -153,38 +148,29 @@ export class ScoringService {
         skipped.push({ name: row.name, reason: '榜上有提交但无到场记录（未扫码且未人工复核），转人工窗口' })
         continue
       }
-      // S：优先过题比例；分数制用得分/满分合计
-      const s = row.solvedCount > 0
-        ? Math.min(1, row.solvedCount / totalProblems)
-        : fullTotal > 0
-          ? Math.min(1, row.score / fullTotal)
-          : 0
-      // R：社内名次分（有效参赛 < 3 人减半）
-      const rank = rankOf.get(row.userId)!
-      const n = valid.length
-      const r = n <= 1 ? 0.5 : (1 - (rank - 1) / (n - 1)) * (n < 3 ? 0.5 : 1)
-      // X：外部总排名百分位
-      let x = 0
-      if (row.platformRank != null && totalEntries > 0) {
-        const pct = row.platformRank / totalEntries
-        x = pct <= 0.05 ? 3 : pct <= 0.10 ? 2 : pct <= 0.30 ? 1 : 0
-      }
-      const base = isRemote ? 0 : 2
-      const raw = isRemote
-        ? 0.5 * (lambdaValue * (4 * s + 6 * r) + x)
-        : base + lambdaValue * (4 * s + 6 * r) + x
-      const effectiveCap = isRemote ? cap * 0.5 : cap
-      const w = Math.min(raw, effectiveCap)
+      const formula = computeContestW({
+        solvedCount: row.solvedCount,
+        score: row.score,
+        platformRank: row.platformRank,
+        clubRank: rankOf.get(row.userId)!,
+        validCount: valid.length,
+        totalProblems,
+        fullTotal,
+        totalEntries,
+        lambdaKey,
+        remote: isRemote,
+        cap,
+      })
       const outcome = await this.postLedgerEntry(actor, {
         userId: row.userId,
         sourceKey: `contest:${activity.platform}:${activity.platformContestId}:W:${row.userId}`,
         category: isRemote ? 'remote_contest' : 'contest',
-        amount: w.toFixed(2),
+        amount: formula.W.toFixed(2),
         scoreMonth: monthKey(activity.endAt),
         detail: {
           activityId,
           activityTitle: activity.title,
-          formula: { B: base, lambda: lambdaValue, lambdaKey, S: Number(s.toFixed(4)), R: Number(r.toFixed(4)), X: x, W: Number(w.toFixed(2)) },
+          formula: { B: formula.B, lambda: formula.lambda, lambdaKey, S: formula.S, R: formula.R, X: formula.X, W: formula.W },
           lambdaSource,
           note: '平台赛结算引擎自动入账（有效提交由榜单自动核验）',
         },
@@ -300,9 +286,6 @@ export class ScoringService {
       const original = await tx.pointsLedgerEntry.findUnique({ where: { id: entryId } })
       if (!original) throw new ScoringError('原始记录不存在', 'NOT_FOUND')
       if (original.status !== 'approved') throw new ScoringError('仅生效记录可冲正', 'STATE_INVALID')
-      if (original.userId && actor.userId === original.userId) {
-        throw new ScoringError('不能审核/冲正本人积分（利益回避）', 'RECUSED')
-      }
       const reversalId = newId()
       await tx.pointsLedgerEntry.create({
         data: {
@@ -634,32 +617,19 @@ export class ScoringService {
     return { claimId: id }
   }
 
-  /** 审核复核案件：至少两名不同且无利益冲突负责人；涉本人拒绝 */
+  /** 审核复核案件：单人裁决即结案（通过 / 驳回），more_info 只记录意见不结案 */
   async voteOnCase(actor: SessionActor, caseId: string, verdict: 'approve' | 'reject' | 'more_info', reason: string): Promise<{ resolved: boolean; approvals: number }> {
-    const reviewCase = await this.db.reviewCase.findUnique({ where: { id: caseId }, include: { votes: true } })
+    const reviewCase = await this.db.reviewCase.findUnique({ where: { id: caseId } })
     if (!reviewCase) throw new ScoringError('案件不存在', 'NOT_FOUND')
-    if (reviewCase.targetUserId && reviewCase.targetUserId === actor.userId) {
-      throw new ScoringError('该案件涉及本人，必须回避', 'RECUSED')
-    }
-    if (reviewCase.votes.some((v) => v.reviewerId === actor.principalId && !v.recused)) {
-      throw new ScoringError('同一主体不能投两票（不能以两个角色重复）', 'DOUBLE_VOTE')
-    }
     await this.db.reviewVote.create({
       data: { id: newId(), caseId, reviewerId: actor.principalId, verdict, reason },
     })
-    const votes = await this.db.reviewVote.findMany({ where: { caseId } })
-    const approvals = votes.filter((v) => v.verdict === 'approve').length
-    const distinctApprovers = new Set(votes.filter((v) => v.verdict === 'approve').map((v) => v.reviewerId)).size
-    const rejects = votes.filter((v) => v.verdict === 'reject').length
-    let resolved = false
-    if (distinctApprovers >= 2) {
-      resolved = true
-      await this.db.reviewCase.update({ where: { id: caseId }, data: { status: reviewCase.teacherRequired ? 'pending_teacher' : 'resolved', closedAt: reviewCase.teacherRequired ? null : new Date() } })
-    } else if (rejects >= 2) {
-      resolved = true
-      await this.db.reviewCase.update({ where: { id: caseId }, data: { status: 'rejected', closedAt: new Date() } })
-    }
-    return { resolved, approvals: distinctApprovers }
+    if (verdict === 'more_info') return { resolved: false, approvals: 0 }
+    await this.db.reviewCase.update({
+      where: { id: caseId },
+      data: { status: verdict === 'approve' ? 'resolved' : 'rejected', closedAt: new Date() },
+    })
+    return { resolved: true, approvals: verdict === 'approve' ? 1 : 0 }
   }
 
   /** sourceKey 组装便捷方法（供 worker/审核使用） */

@@ -1,7 +1,7 @@
 /**
  * 管理端 · 积分审核（points.review / points.propose / claims.review）。
  * - 审核队列 GET /admin/reviews（cases / claims / appeals 三 Tab，宽屏左右分栏队列+详情）；
- * - claims 决定 POST /admin/claims/:id/decision（涉及本人返回 reason 显示回避）；
+ * - claims 决定 POST /admin/claims/:id/decision；
  * - 复核投票 POST /admin/reviews/:id/votes；
  * - 入账 POST /admin/ledger-entries（sourceKey 幂等）；冲正 POST /admin/ledger-entries/:id/reverse；
  * - 月度批次 POST /admin/scoring-batches（blocked=R01 提示）；
@@ -9,7 +9,7 @@
  */
 import { useCallback, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { BookOpenIcon, ClipboardListIcon, CoinsIcon, LoaderCircleIcon, RotateCcwIcon } from 'lucide-react';
+import { BookOpenIcon, ClipboardListIcon, CoinsIcon, HistoryIcon, LoaderCircleIcon, RotateCcwIcon } from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
@@ -35,6 +35,7 @@ import {
 } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { HistoryImportDialog } from './HistoryImportDialog';
 
 interface ReviewCaseDto {
   id: string;
@@ -107,6 +108,7 @@ function PointsBody({ principalId }: { principalId: string }) {
   const [entryOpen, setEntryOpen] = useState(false);
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchImportOpen, setBatchImportOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [disclosureOpen, setDisclosureOpen] = useState(false);
   const queryClient = useQueryClient();
   const [queueNotice, setQueueNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
@@ -175,6 +177,10 @@ function PointsBody({ principalId }: { principalId: string }) {
             <Button variant="outline" onClick={() => setBatchImportOpen(true)}>
               <ClipboardListIcon aria-hidden="true" />
               批量加分
+            </Button>
+            <Button variant="outline" onClick={() => setHistoryOpen(true)}>
+              <HistoryIcon aria-hidden="true" />
+              历史积分导入
             </Button>
             <Button variant="outline" onClick={() => setBatchOpen(true)}>
               <BookOpenIcon aria-hidden="true" />
@@ -277,6 +283,7 @@ function PointsBody({ principalId }: { principalId: string }) {
 
       <LedgerEntryDialog open={entryOpen} onOpenChange={setEntryOpen} />
       <BatchLedgerDialog open={batchImportOpen} onOpenChange={setBatchImportOpen} />
+      <HistoryImportDialog open={historyOpen} onOpenChange={setHistoryOpen} />
       <MonthlyBatchDialog open={batchOpen} onOpenChange={setBatchOpen} />
       <DisclosureDialog open={disclosureOpen} onOpenChange={setDisclosureOpen} />
     </div>
@@ -442,7 +449,7 @@ function ClaimsQueue({
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              涉及本人的申报接口会返回回避提示；通过并填分值时以
+              通过并填分值时以
               contribution:&lt;userId&gt;:&lt;claimId&gt; 作为 sourceKey 幂等入账。
             </p>
           </CardContent>
@@ -501,7 +508,7 @@ function AppealsQueue({ appeals }: { appeals: AppealDto[] }) {
             </p>
             <p className="text-xs leading-5 text-muted-foreground">
               申诉处理流程：核对流水与出勤记录 → 需要更正时通过「入账 / 冲正」落账（保留审计
-              痕迹）→ 结论在公示期结束前告知申诉人。涉及本人积分时必须回避。
+              痕迹）→ 结论在公示期结束前告知申诉人。
             </p>
           </CardContent>
         </Card>
@@ -533,8 +540,8 @@ function CasesQueue({
       onNotice({
         tone: 'info',
         text: result.resolved
-          ? '投票完成；案件已按双人复核规则结案。'
-          : `投票已记录（当前不同通过人 ${result.approvals}/2）。`,
+          ? '已裁决，案件结案。'
+          : '意见已记录，案件保持待处理。',
       });
       onHandled();
     },
@@ -632,7 +639,7 @@ function CasesQueue({
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              两名不同负责人同意即结案；涉及本人或重复投票会被拒绝（RECUSED / DOUBLE_VOTE）。
+              单人裁决即结案：「通过」或「驳回」直接结案，「需补充信息」只记录意见。
             </p>
           </CardContent>
         </Card>
@@ -1187,7 +1194,7 @@ function MonthlyBatchDialog({
             </div>
           </form>
           <p className="mt-2 text-xs text-muted-foreground">
-            冲正不改历史：保留原记录并生成负值条目；不能冲正本人积分（利益回避）。
+            冲正不改历史：保留原记录并生成负值条目。
           </p>
         </div>
       </DialogContent>

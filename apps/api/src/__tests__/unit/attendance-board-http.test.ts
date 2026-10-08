@@ -107,7 +107,7 @@ it('后续刷新返回新签到人数与最新成员，无记录时返回零人�
   expect(updated.body.data).toMatchObject({ checkedIn: 1, checkedOut: 0, recentCheckins: [{ userId: 'new-member', name: '成员' }] })
 })
 
-it.each([['member'], ['points_reviewer'], ['system_admin']])('无现场码权限的 %j 无法读取大屏名单', async (...roles) => {
+it.each([['member'], ['points_reviewer']])('无现场码权限的 %j 无法读取大屏名单', async (...roles) => {
   actor!.roles = roles
   await request(app.getHttpServer()).get(`/api/v1/admin/activities/${activityId}/attendance/board`).expect(403)
   expect(count).not.toHaveBeenCalled()
