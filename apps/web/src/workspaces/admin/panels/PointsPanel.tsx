@@ -303,9 +303,9 @@ function ClaimsQueue({
   const [note, setNote] = useState('');
   const [amount, setAmount] = useState('');
   const mutation = useMutation({
-    mutationFn: async (decision: 'approve' | 'reject' | 'more_info') => {
+    mutationFn: async ({ claimId, decision }: { claimId: string; decision: 'approve' | 'reject' | 'more_info' }) => {
       const { data } = await api.post<{ decided: boolean; reason?: string }>(
-        `/admin/claims/${selectedId}/decision`,
+        `/admin/claims/${claimId}/decision`,
         {
           decision,
           note: note.trim() || undefined,
@@ -434,17 +434,17 @@ function ClaimsQueue({
               <Button
                 size="sm"
                 disabled={mutation.isPending || (Boolean(amount) && !/^-?\d+(\.\d+)?$/.test(amount))}
-                onClick={() => mutation.mutate('approve')}
+                onClick={() => mutation.mutate({ claimId: selected.id, decision: 'approve' })}
               >
-                {mutation.isPending && mutation.variables === 'approve' && (
+                {mutation.isPending && mutation.variables?.decision === 'approve' && (
                   <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
                 )}
                 通过{amount ? '并入账' : ''}
               </Button>
-              <Button size="sm" variant="outline" disabled={mutation.isPending} onClick={() => mutation.mutate('reject')}>
+              <Button size="sm" variant="outline" disabled={mutation.isPending} onClick={() => mutation.mutate({ claimId: selected.id, decision: 'reject' })}>
                 驳回
               </Button>
-              <Button size="sm" variant="ghost" disabled={mutation.isPending} onClick={() => mutation.mutate('more_info')}>
+              <Button size="sm" variant="ghost" disabled={mutation.isPending} onClick={() => mutation.mutate({ claimId: selected.id, decision: 'more_info' })}>
                 要求补充材料
               </Button>
             </div>
@@ -529,9 +529,9 @@ function CasesQueue({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [reason, setReason] = useState('');
   const mutation = useMutation({
-    mutationFn: async (verdict: 'approve' | 'reject' | 'more_info') => {
+    mutationFn: async ({ caseId, verdict }: { caseId: string; verdict: 'approve' | 'reject' | 'more_info' }) => {
       const { data } = await api.post<{ resolved: boolean; approvals: number }>(
-        `/admin/reviews/${selectedId ?? cases[0]?.id}/votes`,
+        `/admin/reviews/${caseId}/votes`,
         { verdict, reason: reason.trim() },
       );
       return data;
@@ -617,7 +617,7 @@ function CasesQueue({
               <Button
                 size="sm"
                 disabled={mutation.isPending || reason.trim().length < 3}
-                onClick={() => mutation.mutate('approve')}
+                onClick={() => mutation.mutate({ caseId: selected.id, verdict: 'approve' })}
               >
                 同意
               </Button>
@@ -625,7 +625,7 @@ function CasesQueue({
                 size="sm"
                 variant="outline"
                 disabled={mutation.isPending || reason.trim().length < 3}
-                onClick={() => mutation.mutate('reject')}
+                onClick={() => mutation.mutate({ caseId: selected.id, verdict: 'reject' })}
               >
                 不同意
               </Button>
@@ -633,7 +633,7 @@ function CasesQueue({
                 size="sm"
                 variant="ghost"
                 disabled={mutation.isPending || reason.trim().length < 3}
-                onClick={() => mutation.mutate('more_info')}
+                onClick={() => mutation.mutate({ caseId: selected.id, verdict: 'more_info' })}
               >
                 需补充信息
               </Button>

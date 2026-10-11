@@ -38,7 +38,22 @@ interface JobDto {
   runAfter: string;
   lastError: string | null;
   createdAt: string;
+  /** 账号同步任务的目标账号（payload.accountId）；全量刷新等任务为 null */
+  accountId: string | null;
+  account: {
+    id: string;
+    platform: string;
+    externalId: string;
+    displayHandle: string | null;
+    status: string;
+    user: { id: string; verifiedRealName: string | null; studentNo: string | null } | null;
+  } | null;
 }
+
+const JOB_TYPE_LABELS: Record<string, string> = {
+  'platform.sync_account': '账号同步',
+  'platform.refresh_all': '每日全量刷新',
+};
 
 interface AccountDto {
   id: string;
@@ -57,6 +72,13 @@ const JOB_STATUS_LABELS: Record<string, string> = {
   done: '成功',
   dead: '失败',
 };
+
+function jobAccountLabel(job: JobDto): string | null {
+  if (!job.account) return null;
+  const handle = job.account.displayHandle ?? job.account.externalId;
+  const owner = job.account.user?.verifiedRealName ?? job.account.user?.studentNo;
+  return `${platformLabel(job.account.platform)} · ${handle}${owner ? ` · ${owner}` : ''}`;
+}
 
 export default function SyncPanel() {
   const principal = usePrincipal();
@@ -111,15 +133,18 @@ function SyncBody({ principalId }: { principalId: string }) {
   });
 
   const retryMutation = useMutation({
-    mutationFn: async (jobId: string) => {
+    mutationFn: async (job: JobDto) => {
       const { data } = await api.post<{ retried: boolean; reason?: string }>(
-        `/admin/platform/jobs/${jobId}/retry`,
+        `/admin/platform/jobs/${job.id}/retry`,
       );
-      return data;
+      return { ...data, label: jobAccountLabel(job) };
     },
     onSuccess: (result) => {
       setActionError(null);
-      setActionNotice(result.retried ? '任务已重新排队。' : (result.reason ?? '未能重试该任务。'));
+      const subject = result.label ? `（${result.label}）` : '';
+      setActionNotice(
+        result.retried ? `任务已重新排队${subject}。` : `${result.reason ?? '未能重试该任务'}${subject}。`,
+      );
       void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'platform', 'jobs'] });
     },
     onError: (error: ApiError) => {
@@ -299,6 +324,7 @@ function SyncBody({ principalId }: { principalId: string }) {
                 <TableHeader>
                   <TableRow className="h-10">
                     <TableHead className="pl-5">任务</TableHead>
+                    <TableHead>账号</TableHead>
                     <TableHead>状态</TableHead>
                     <TableHead className="text-right">尝试</TableHead>
                     <TableHead>计划执行</TableHead>
@@ -309,7 +335,27 @@ function SyncBody({ principalId }: { principalId: string }) {
                 <TableBody>
                   {(jobsQuery.data ?? []).map((job) => (
                     <TableRow key={job.id} className="h-14">
-                      <TableCell className="pl-5 font-mono text-xs">{job.type}</TableCell>
+                      <TableCell className="pl-5 text-xs">
+                        <span className="text-foreground">{JOB_TYPE_LABELS[job.type] ?? job.type}</span>
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        {job.account ? (
+                          <span className="flex flex-col gap-0.5">
+                            <span className="font-medium text-foreground">
+                              {platformLabel(job.account.platform)} ·{' '}
+                              {job.account.displayHandle ?? job.account.externalId}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {job.account.user?.verifiedRealName ?? '—'} ·{' '}
+                              <span className="tabular-nums">{job.account.user?.studentNo ?? '—'}</span>
+                            </span>
+                          </span>
+                        ) : job.accountId ? (
+                          <span className="text-muted-foreground">账号已删除</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
                       <TableCell>
                         <StatusBadge
                           kind="sync"
@@ -320,7 +366,10 @@ function SyncBody({ principalId }: { principalId: string }) {
                       <TableCell className="text-muted-foreground tabular-nums">
                         {formatDateTime(job.runAfter)}
                       </TableCell>
-                      <TableCell className="max-w-64 truncate text-xs text-destructive">
+                      <TableCell
+                        className="max-w-64 truncate text-xs text-destructive"
+                        title={job.lastError ?? undefined}
+                      >
                         {job.lastError ?? '—'}
                       </TableCell>
                       <TableCell className="pr-5">
@@ -329,7 +378,7 @@ function SyncBody({ principalId }: { principalId: string }) {
                             size="sm"
                             variant="outline"
                             disabled={retryMutation.isPending}
-                            onClick={() => retryMutation.mutate(job.id)}
+                            onClick={() => retryMutation.mutate(job)}
                           >
                             重试
                           </Button>

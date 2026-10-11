@@ -221,14 +221,18 @@ function PlatformRecords({ principalId }: { principalId: string }) {
   });
 
   const syncMutation = useMutation({
-    mutationFn: async (accountId: string) => {
-      await api.post('/me/platform-syncs', { accountId });
+    mutationFn: async (account: PlatformAccountDto) => {
+      await api.post('/me/platform-syncs', { accountId: account.id });
       return true;
     },
-    onSuccess: () => {
-      setNotice({ tone: 'info', text: '同步任务已排队（202），稍后回来刷新查看结果。' });
+    onSuccess: (_, account) => {
+      setNotice({
+        tone: 'info',
+        text: `${platformLabel(account.platform)} · ${account.displayHandle}：同步任务已排队（202），稍后回来刷新查看结果。`,
+      });
     },
-    onError: (error: ApiError) => setNotice({ tone: 'error', text: error.message }),
+    onError: (error: ApiError, account) =>
+      setNotice({ tone: 'error', text: `${platformLabel(account.platform)} · ${account.displayHandle}：${error.message}` }),
   });
 
   const results = resultsQuery.data?.pages.flatMap((page) => page.items) ?? [];
@@ -285,9 +289,9 @@ function PlatformRecords({ principalId }: { principalId: string }) {
                           size="sm"
                           variant="ghost"
                           disabled={syncMutation.isPending}
-                          onClick={() => syncMutation.mutate(account.id)}
+                          onClick={() => syncMutation.mutate(account)}
                         >
-                          {syncMutation.isPending && syncMutation.variables === account.id ? (
+                          {syncMutation.isPending && syncMutation.variables?.id === account.id ? (
                             <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
                           ) : (
                             <RefreshCwIcon aria-hidden="true" />

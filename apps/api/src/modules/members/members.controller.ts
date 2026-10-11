@@ -145,13 +145,11 @@ export class MembersAdminController {
       grade: z.number().int().optional(),
       phone: z.string().max(32).optional(),
       membershipStatus: z.enum(MEMBERSHIP_STATUSES).optional(),
-      /** 本批次录取名次 r：填了即自动记入社基础分 */
-      admissionRank: z.number().int().min(1).optional(),
+      /** 手动填写的初始积分：填了（> 0）即记一条 initial 流水 */
+      initialPoints: z.number().min(0, '初始积分不能为负').max(1000, '初始积分不能超过 1000').optional(),
     })
     const parsed = z.object({
       rows: z.array(rowSchema).min(1).max(500),
-      /** 本批次录取总人数 m（默认 max(有名次的行数, 最大名次)） */
-      admissionTotal: z.number().int().min(1).max(1000).optional(),
       /** 入社月份 YYYY-MM（默认导入当月） */
       admissionMonth: z.string().regex(/^\d{4}-\d{2}$/, '入社月份格式为 YYYY-MM').optional(),
     }).safeParse(body)

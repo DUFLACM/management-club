@@ -1,0 +1,168 @@
+import { Inject, Injectable } from '@nestjs/common'
+import { z } from 'zod'
+import type { Prisma } from '@acm/db'
+import { PrismaService } from '../../infrastructure/database/database.module.js'
+import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import type { SessionActor } from '../auth/session.service.js'
+import { newId } from '../../common/utils.js'
+import { DomainError } from '../../common/domain-error.js'
+
+export class AnnouncementsError extends DomainError {
+  constructor(message: string, readonly code: 'NOT_FOUND' | 'INVALID_STATE' | 'INVALID_INPUT') {
+    super(message, code)
+  }
+}
+
+export const announcementInputSchema = z.object({
+  title: z.string().trim().min(1, '标题不能为空').max(100, '标题不超过 100 字'),
+  content: z.string().trim().min(1, '正文不能为空').max(20000, '正文不超过 20000 字'),
+  popup: z.boolean().default(false),
+  pinned: z.boolean().default(false),
+  expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
+})
+export type AnnouncementInput = z.infer<typeof announcementInputSchema>
+
+const ADMIN_SELECT = {
+  id: true, title: true, content: true, popup: true, pinned: true, status: true,
+  publishedAt: true, expiresAt: true, createdAt: true, updatedAt: true,
+  _count: { select: { reads: true } },
+} satisfies Prisma.AnnouncementSelect
+
+/**
+ * 公告：管理端撰写草稿 → 发布（可撤回、可删除）；成员端只看已发布且未过期的。
+ * popup=true 的公告在成员进入工作台时弹窗，点「我知道了」写入 AnnouncementRead，之后不再弹。
+ * 置顶的排在前面，其余按发布时间倒序。
+ */
+@Injectable()
+export class AnnouncementsService {
+  constructor(
+    @Inject(PrismaService) private readonly db: PrismaService,
+    @Inject(AuditService) private readonly audit: AuditService,
+  ) {}
+
+  async adminList() {
+    const rows = await this.db.announcement.findMany({
+      orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
+      take: 200,
+      select: ADMIN_SELECT,
+    })
+    return rows.map(({ _count, ...row }) => ({ ...row, readCount: _count.reads }))
+  }
+
+  async create(actor: SessionActor, input: AnnouncementInput, publish: boolean) {
+    const now = new Date()
+    const row = await this.db.announcement.create({
+      data: {
+        id: newId(),
+        title: input.title,
+        content: input.content,
+        popup: input.popup,
+        pinned: input.pinned,
+        expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+        status: publish ? 'published' : 'draft',
+        publishedAt: publish ? now : null,
+        createdBy: actor.principalId,
+      },
+      select: { id: true },
+    })
+    // 发布者本人不必再被自己的公告弹窗
+    if (publish) await this.markRead(actor.principalId, row.id)
+    await this.audit.log({
+      actorPrincipalId: actor.principalId, action: publish ? 'announcements.publish' : 'announcements.create',
+      resourceType: 'announcement', resourceId: row.id, summary: `${publish ? '发布' : '新建'}公告「${input.title}」`,
+    })
+    return row
+  }
+
+  async update(actor: SessionActor, id: string, input: AnnouncementInput) {
+    await this.require(id)
+    await this.db.announcement.update({
+      where: { id },
+      data: {
+        title: input.title,
+        content: input.content,
+        popup: input.popup,
+        pinned: input.pinned,
+        expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+      },
+    })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId, action: 'announcements.update', resourceType: 'announcement', resourceId: id,
+      summary: `编辑公告「${input.title}」`,
+    })
+    return { id }
+  }
+
+  async publish(actor: SessionActor, id: string) {
+    const row = await this.require(id)
+    if (row.status === 'published') throw new AnnouncementsError('公告已发布', 'INVALID_STATE')
+    await this.db.announcement.update({ where: { id }, data: { status: 'published', publishedAt: new Date() } })
+    await this.markRead(actor.principalId, id)
+    await this.audit.log({
+      actorPrincipalId: actor.principalId, action: 'announcements.publish', resourceType: 'announcement', resourceId: id,
+      summary: `发布公告「${row.title}」`,
+    })
+    return { id }
+  }
+
+  async withdraw(actor: SessionActor, id: string) {
+    const row = await this.require(id)
+    if (row.status !== 'published') throw new AnnouncementsError('只有已发布的公告可以撤回', 'INVALID_STATE')
+    await this.db.announcement.update({ where: { id }, data: { status: 'withdrawn' } })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId, action: 'announcements.withdraw', resourceType: 'announcement', resourceId: id,
+      summary: `撤回公告「${row.title}」`,
+    })
+    return { id }
+  }
+
+  async remove(actor: SessionActor, id: string) {
+    const row = await this.require(id)
+    await this.db.announcement.delete({ where: { id } })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId, action: 'announcements.delete', resourceType: 'announcement', resourceId: id,
+      summary: `删除公告「${row.title}」`,
+    })
+    return { id }
+  }
+
+  /** 成员端：已发布且未过期的公告，带本人已读标记 */
+  async visible(principalId: string) {
+    const now = new Date()
+    const rows = await this.db.announcement.findMany({
+      where: { status: 'published', OR: [{ expiresAt: null }, { expiresAt: { gt: now } }] },
+      orderBy: [{ pinned: 'desc' }, { publishedAt: 'desc' }],
+      take: 50,
+      select: {
+        id: true, title: true, content: true, popup: true, pinned: true, publishedAt: true, expiresAt: true,
+        reads: { where: { principalId }, select: { readAt: true } },
+      },
+    })
+    return rows.map(({ reads, ...row }) => ({ ...row, read: reads.length > 0 }))
+  }
+
+  async markRead(principalId: string, announcementId: string) {
+    await this.db.announcementRead.upsert({
+      where: { announcementId_principalId: { announcementId, principalId } },
+      create: { announcementId, principalId },
+      update: {},
+    })
+  }
+
+  /** 成员端标记已读：只允许对当前可见的公告 */
+  async markVisibleRead(principalId: string, id: string) {
+    const row = await this.db.announcement.findFirst({
+      where: { id, status: 'published', OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }] },
+      select: { id: true },
+    })
+    if (!row) throw new AnnouncementsError('公告不存在或已下线', 'NOT_FOUND')
+    await this.markRead(principalId, id)
+    return { id, read: true }
+  }
+
+  private async require(id: string) {
+    const row = await this.db.announcement.findUnique({ where: { id }, select: { id: true, title: true, status: true } })
+    if (!row) throw new AnnouncementsError('公告不存在', 'NOT_FOUND')
+    return row
+  }
+}

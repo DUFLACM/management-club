@@ -3,6 +3,8 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { randomUUID } from 'node:crypto'
+import { PlatformAdminController } from '../../modules/platforms/platform.controller.js'
+import { createTestUser } from './helpers.js'
 
 /**
  * PostgreSQL 任务队列（真实数据库）：
@@ -81,5 +83,28 @@ describe('任务队列', () => {
     expect(reclaimed).toBeGreaterThanOrEqual(1)
     const job = await db.job.findUnique({ where: { id } })
     expect(job!.status).toBe('queued')
+  })
+
+  it('管理端同步任务列表：失败的账号同步任务附带对应平台账号与成员', async () => {
+    const owner = await createTestUser(db, { studentNo: '20269901', name: '同步失败者' })
+    const accountId = randomUUID()
+    await db.platformAccount.create({ data: { id: accountId, platform: 'nowcoder', externalId: '785693755', displayHandle: 'nc-owner', userId: owner.userId, status: 'verified' } })
+    const failed = await jobs.enqueue({ type: 'platform.sync_account', payload: { accountId } })
+    await db.job.update({ where: { id: failed.id }, data: { status: 'dead', lastError: 'nowcoder 403' } })
+    const orphan = await jobs.enqueue({ type: 'platform.sync_account', payload: { accountId: randomUUID() } })
+    const refreshAll = await db.job.create({ data: { id: randomUUID(), type: 'platform.refresh_all', payload: {} } })
+
+    const { data } = await new PlatformAdminController(null as never, db).jobs('100')
+    const byId = new Map(data.map((row) => [row.id, row]))
+    expect(byId.get(failed.id)).toMatchObject({
+      status: 'dead', lastError: 'nowcoder 403', accountId,
+      account: { platform: 'nowcoder', externalId: '785693755', displayHandle: 'nc-owner', user: { verifiedRealName: '同步失败者', studentNo: '20269901' } },
+    })
+    // 账号已删除：保留 accountId 供定位，account 为 null
+    expect(byId.get(orphan.id)).toMatchObject({ account: null })
+    expect(byId.get(orphan.id)?.accountId).toBeTruthy()
+    // 全量刷新任务没有目标账号
+    expect(byId.get(refreshAll.id)).toMatchObject({ accountId: null, account: null })
+    expect(byId.get(failed.id)).not.toHaveProperty('payload')
   })
 })

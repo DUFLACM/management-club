@@ -1904,3 +1904,36 @@ model EvaluationRow {
   @@index([batchId, rankNo])
   @@map("evaluation_rows")
 }
+
+/// 公告：管理端撰写并发布；popup=true 的公告在成员进入工作台时弹窗，每人确认一次（见 AnnouncementRead）
+model Announcement {
+  id          String    @id @db.Uuid
+  title       String
+  content     String    @db.Text // Markdown
+  popup       Boolean   @default(false)
+  pinned      Boolean   @default(false)
+  status      String    @default("draft") // draft | published | withdrawn
+  publishedAt DateTime? @db.Timestamptz(3) @map("published_at")
+  expiresAt   DateTime? @db.Timestamptz(3) @map("expires_at") // 过期后不再展示与弹窗
+  createdBy   String    @map("created_by") @db.Uuid
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+  updatedAt   DateTime  @default(now()) @updatedAt @db.Timestamptz(3) @map("updated_at")
+
+  reads AnnouncementRead[]
+
+  @@index([status, publishedAt])
+  @@map("announcements")
+}
+
+/// 公告已读：按主体记录，弹窗点「我知道了」或在列表里打开即写入
+model AnnouncementRead {
+  announcementId String   @map("announcement_id") @db.Uuid
+  principalId    String   @map("principal_id") @db.Uuid
+  readAt         DateTime @default(now()) @db.Timestamptz(3) @map("read_at")
+
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+
+  @@id([announcementId, principalId])
+  @@index([principalId])
+  @@map("announcement_reads")
+}

@@ -4,7 +4,7 @@ import { lazy, type LazyExoticComponent, type ComponentType } from 'react';
  * 面板懒加载注册表（模块顶层声明 React.lazy，配合 SectionRouter 的
  * Suspense + 错误边界；切换 section 时仅挂载当前面板）。
  *
- * 成员端 7 个与管理端 11 个业务面板按需加载；首屏渲染后由 prefetchPanels 在浏览器空闲时
+ * 成员端 7 个与管理端 12 个业务面板按需加载；首屏渲染后由 prefetchPanels 在浏览器空闲时
  * 预取其余面板代码，切换导航时不再等待下载（同一个 import() 只会请求一次）。
  */
 
@@ -31,6 +31,7 @@ const ADMIN_LOADERS: Readonly<Record<string, PanelLoader>> = {
   evaluation: () => import('@/workspaces/admin/panels/EvaluationPanel'),
   invites: () => import('@/workspaces/admin/panels/InvitesPanel'),
   sync: () => import('@/workspaces/admin/panels/SyncPanel'),
+  announcements: () => import('@/workspaces/admin/panels/AnnouncementsPanel'),
   audit: () => import('@/workspaces/admin/panels/AuditPanel'),
   settings: () => import('@/workspaces/admin/panels/SettingsPanel'),
 };
@@ -42,7 +43,7 @@ function toLazy(loaders: Readonly<Record<string, PanelLoader>>): Readonly<Record
 /** 成员端 7 个面板（/app?section=…；签到/签出已并入活动详情页） */
 export const MemberPanels = toLazy(MEMBER_LOADERS);
 
-/** 管理端 11 个面板（/admin?section=…） */
+/** 管理端 12 个面板（/admin?section=…） */
 export const AdminPanels = toLazy(ADMIN_LOADERS);
 
 /**

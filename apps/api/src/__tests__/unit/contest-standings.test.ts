@@ -54,6 +54,52 @@ describe('牛客实时榜单适配', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it('按 basicInfo.pageCount 翻完全部页：拼接全榜、ranking=0 记无名次、跨页重复 uid 去重', async () => {
+    const problemData = [{ name: 'A', score: 100, problemId: 1 }]
+    const row = (uid: number, ranking: number, accepted: boolean, failedCount = 0) => ({
+      uid, ranking, userName: `u${uid}`, totalScore: accepted ? 100 : 0,
+      scoreList: [{ problemId: 1, score: accepted ? 100 : 0, accepted, failedCount }],
+    })
+    const pages: Record<string, unknown[]> = {
+      1: Array.from({ length: 50 }, (_, i) => row(1000 + i, i + 1, true)),
+      2: [row(1049, 50, true), ...Array.from({ length: 49 }, (_, i) => row(2000 + i, 51 + i, true))],
+      3: [row(3000, 0, false, 2), row(3001, 0, false)],
+    }
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      const page = new URL(url).searchParams.get('page') ?? '1'
+      return jsonResponse({
+        code: 0, msg: 'OK',
+        data: { problemData, rankData: pages[page] ?? [], basicInfo: { pageCount: 3, pageSize: 50, pageCurrent: Number(page), rankCount: 101 } },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await new ContestStandingsService().fetch('nowcoder', '140235')
+    if (!result.available) throw new Error('应当可用')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.map(([url]) => new URL(url as string).searchParams.get('page')).sort()).toEqual(['1', '2', '3'])
+    // 50 + 49（u1049 在第 2 页重复，去重）+ 2
+    expect(result.entries).toHaveLength(101)
+    expect(result.entries.filter((e: { handle: string }) => e.handle === '1049')).toHaveLength(1)
+    // 原第 50 名之后的成员也能匹配到（此前只抓第 1 页会丢失）
+    expect(result.entries.find((e: { handle: string }) => e.handle === '2048')).toMatchObject({ rank: 99, solvedCount: 1 })
+    // 榜尾未过题行：ranking=0 → rank null，不能被当作第 1 名参与 X 百分位
+    expect(result.entries.find((e: { handle: string }) => e.handle === '3000')).toMatchObject({ rank: null, solvedCount: 0 })
+    expect(result.note).toContain('共 3 页')
+  })
+
+  it('任一页抓取失败（重试后仍失败）整体返回不可用，不输出残缺榜单', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      const page = new URL(url).searchParams.get('page')
+      if (page === '2') return jsonResponse({}, 503)
+      return jsonResponse({ code: 0, data: { problemData: [{ name: 'A', problemId: 1 }], rankData: [{ uid: 1, ranking: 1, scoreList: [] }], basicInfo: { pageCount: 2 } } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await new ContestStandingsService().fetch('nowcoder', '140235')
+    expect(result.available).toBe(false)
+    // 第 1 页 + 第 2 页两次尝试
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
   it('空榜单（比赛 ID 无效）返回不可用而非报错', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ code: 0, data: { problemData: [], rankData: [] } })))
     const result = await new ContestStandingsService().fetch('nowcoder', '0')

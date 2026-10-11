@@ -12,6 +12,7 @@ import { MembersModule } from './modules/members/members.module.js'
 import { FilesModule } from './modules/files/files.module.js'
 import { CompetitionsModule } from './modules/competitions/competitions.module.js'
 import { EvaluationModule } from './modules/evaluation/evaluation.module.js'
+import { AnnouncementsModule } from './modules/announcements/announcements.module.js'
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { EvaluationModule } from './modules/evaluation/evaluation.module.js'
     FilesModule,
     CompetitionsModule,
     EvaluationModule,
+    AnnouncementsModule,
   ],
 })
 export class AppModule {}

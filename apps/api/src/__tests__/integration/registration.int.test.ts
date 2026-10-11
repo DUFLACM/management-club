@@ -295,38 +295,34 @@ describe('邀请注册事务', () => {
     expect(result.results[1]).toMatchObject({ status: 'skipped', message: '学号已属于教职工主体' })
   })
 
-  it('Excel 导入按录取名次自动记入社基础分（第八条），每人一次，已有账号补记', async () => {
+  it('Excel 导入按「初始积分」列手动记分，每人一次，已有账号补记', async () => {
     const actor = makeActor()
     const result = await members.importMembers(actor, [
-      { studentNo: '202605101', realName: '名次一', admissionRank: 1 },
-      { studentNo: '202605102', realName: '名次三', admissionRank: 3, membershipStatus: 'provisional' },
-      { studentNo: '202605103', realName: '无名次' },
-      { studentNo: '202605104', realName: '名次越界', admissionRank: 9 },
-    ], { admissionTotal: 5, admissionMonth: '2025-10' })
-    expect(result).toMatchObject({ createdCount: 3, initialCount: 2, admissionTotal: 5 })
-    // m = 5：r=1 → 30；r=3 → 18 + 12 × (1 - 2/4) = 24
-    expect(result.results.map((r) => r.initialPoints)).toEqual(['30.00', '24.00', undefined, undefined])
-    expect(result.results[3]).toMatchObject({ status: 'skipped', message: '录取名次须为 1–5 的整数' })
+      { studentNo: '202605101', realName: '积分三十', initialPoints: 30 },
+      { studentNo: '202605102', realName: '积分小数', initialPoints: 24.5, membershipStatus: 'provisional' },
+      { studentNo: '202605103', realName: '无积分' },
+      { studentNo: '202605104', realName: '积分为零', initialPoints: 0 },
+      { studentNo: '202605106', realName: '积分越界', initialPoints: 2000 },
+    ], { admissionMonth: '2025-10' })
+    expect(result).toMatchObject({ createdCount: 4, initialCount: 2 })
+    expect(result.results.map((r) => r.initialPoints)).toEqual(['30.00', '24.50', undefined, undefined, undefined])
+    expect(result.results[4]).toMatchObject({ status: 'skipped', message: '初始积分须为 0–1000 的数' })
     const entries = await db.pointsLedgerEntry.findMany({ where: { category: 'initial', sourceKey: { startsWith: 'initial:' } }, orderBy: { amount: 'desc' } })
-    expect(entries.map((e) => [Number(e.amount), e.scoreMonth])).toEqual([[30, '2025-10'], [24, '2025-10']])
+    expect(entries.map((e) => [Number(e.amount), e.scoreMonth])).toEqual([[30, '2025-10'], [24.5, '2025-10']])
 
-    // 再导一次：账号已存在 → 不重复建号也不重复记分；之前没名次的已有账号补记
+    // 再导一次：账号已存在 → 不重复建号也不重复记分；之前没积分的已有账号补记
     const again = await members.importMembers(actor, [
-      { studentNo: '202605101', realName: '名次一', admissionRank: 1 },
-      { studentNo: '202605103', realName: '无名次', admissionRank: 2 },
-    ], { admissionTotal: 5, admissionMonth: '2025-10' })
+      { studentNo: '202605101', realName: '积分三十', initialPoints: 30 },
+      { studentNo: '202605103', realName: '无积分', initialPoints: 27 },
+    ], { admissionMonth: '2025-10' })
     expect(again).toMatchObject({ createdCount: 0, initialCount: 1 })
     expect(again.results[0].message).toBe('学号已存在（账号）')
-    expect(again.results[1]).toMatchObject({ initialPoints: '27.00', message: '学号已存在（账号），已补记入社基础分 27.00' })
-
-    // 默认 m = max(有名次行数, 最大名次)；仅一人 → 30
-    const solo = await members.importMembers(actor, [{ studentNo: '202605105', realName: '独苗', admissionRank: 1 }])
-    expect(solo).toMatchObject({ admissionTotal: 1, results: [{ initialPoints: '30.00' }] })
+    expect(again.results[1]).toMatchObject({ initialPoints: '27.00', message: '学号已存在（账号），已补记初始积分 27.00' })
   })
 
   it('成员概览：入社基础分照常计入 E，但从当月积分里拆出来单独显示', async () => {
     const month = monthKey(new Date())
-    const imported = await members.importMembers(makeActor(), [{ studentNo: '202605120', realName: '基础分展示', admissionRank: 1 }], { admissionTotal: 1, admissionMonth: month })
+    const imported = await members.importMembers(makeActor(), [{ studentNo: '202605120', realName: '基础分展示', initialPoints: 30 }], { admissionMonth: month })
     const user = await db.user.findUniqueOrThrow({ where: { studentNo: '202605120' } })
     expect(imported.initialCount).toBe(1)
     await db.pointsLedgerEntry.create({

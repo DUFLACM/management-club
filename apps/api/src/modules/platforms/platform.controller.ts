@@ -113,7 +113,7 @@ export class PlatformAdminController {
     return ok(await this.platforms.adminContestDirectory(platform, q))
   }
 
-  /** 同步任务状态（最近成功/失败/排队） */
+  /** 同步任务状态（最近成功/失败/排队）；账号同步任务附带对应平台账号与成员，失败时可直接定位 */
   @Get('jobs')
   @RequireAction('sync.manage')
   async jobs(@Query('limit') limit?: string) {
@@ -121,9 +121,25 @@ export class PlatformAdminController {
       where: { type: { startsWith: 'platform.' } },
       orderBy: { createdAt: 'desc' },
       take: Math.min(Number(limit ?? 30), 100),
-      select: { id: true, type: true, status: true, attempts: true, runAfter: true, lastError: true, createdAt: true },
+      select: { id: true, type: true, status: true, attempts: true, runAfter: true, lastError: true, createdAt: true, payload: true },
     })
-    return ok(rows)
+    const accountIdOf = (payload: unknown): string | null => {
+      const value = (payload as { accountId?: unknown } | null)?.accountId
+      return typeof value === 'string' && z.string().uuid().safeParse(value).success ? value : null
+    }
+    const accountIds = [...new Set(rows.map((row) => accountIdOf(row.payload)).filter((id): id is string => id !== null))]
+    const accounts = accountIds.length === 0 ? [] : await this.db.platformAccount.findMany({
+      where: { id: { in: accountIds } },
+      select: {
+        id: true, platform: true, externalId: true, displayHandle: true, status: true,
+        user: { select: { id: true, verifiedRealName: true, studentNo: true } },
+      },
+    })
+    const accountById = new Map(accounts.map((account) => [account.id, account]))
+    return ok(rows.map(({ payload, ...row }) => {
+      const accountId = accountIdOf(payload)
+      return { ...row, accountId, account: accountId ? accountById.get(accountId) ?? null : null }
+    }))
   }
 
   /** 重试失败任务（dead → queued） */

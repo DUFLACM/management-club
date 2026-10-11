@@ -64,7 +64,7 @@ export const ROLE_ACTIONS: Record<string, string[]> = {
     'activity.manage', 'attendance.review', 'attendance.qr', 'venue.manage', 'venue.suspend', 'venue.verify',
     'points.review', 'points.propose', 'claims.review', 'members.read', 'members.review', 'members.manage', 'invitations.manage',
     'disclosure.publish', 'badges.grant', 'badges.define', 'competitions.manage', 'rooms.approve', 'claims.review',
-    'evaluation.manage',
+    'evaluation.manage', 'announcements.manage',
   ],
   // 综评建议折算须经指导教师审核（附录三·九.3），故 advisor 同样可管理
   advisor: ['teacher.approve', 'members.read', 'members.review', 'points.review', 'disclosure.publish', 'competitions.manage', 'evaluation.manage'],

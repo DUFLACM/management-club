@@ -105,6 +105,7 @@ export function hasAnyAction(roles: string[], actions: string[]): boolean {
       'competitions.manage',
       'rooms.approve',
       'evaluation.manage',
+      'announcements.manage',
     ],
     advisor: [
       'teacher.approve',
@@ -122,6 +123,7 @@ export function hasAnyAction(roles: string[], actions: string[]): boolean {
       'audit.read',
       'platform.configure',
       'members.read',
+      'announcements.manage',
     ],
   };
   return actions.some((action) =>
