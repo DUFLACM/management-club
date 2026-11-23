@@ -100,6 +100,38 @@ describe('牛客实时榜单适配', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
+  it('预览限制翻页数：只抓指定页，但总人数取接口 rankCount，避免 X 百分位偏低', async () => {
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      const page = new URL(url).searchParams.get('page') ?? '1'
+      return jsonResponse({
+        code: 0, msg: 'OK',
+        data: {
+          problemData: [{ name: 'A', score: 100, problemId: 1 }],
+          rankData: [{ uid: Number(page), ranking: Number(page), scoreList: [] }],
+          basicInfo: { pageCount: 3, pageSize: 50, pageCurrent: Number(page), rankCount: 5000 },
+        },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await new ContestStandingsService().fetch('nowcoder', '140236', { maxPages: 2 })
+    if (!result.available) throw new Error('应当可用')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls.map(([url]) => new URL(url as string).searchParams.get('page')).sort()).toEqual(['1', '2'])
+    expect(result.totalEntries).toBe(5000)
+    expect(result.note).toContain('仅抓取前 2 页')
+  })
+
+  it('单场比赛超时会中止并返回可读原因，而不是让请求挂到网关 504', async () => {
+    const fetchMock = vi.fn().mockImplementation((_url: string, init: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await new ContestStandingsService().fetch('nowcoder', '140237', { timeoutMs: 1_000 })
+    expect(result.available).toBe(false)
+    if (result.available) return
+    expect(result.reason).toContain('超过 1 秒')
+  })
+
   it('空榜单（比赛 ID 无效）返回不可用而非报错', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ code: 0, data: { problemData: [], rankData: [] } })))
     const result = await new ContestStandingsService().fetch('nowcoder', '0')

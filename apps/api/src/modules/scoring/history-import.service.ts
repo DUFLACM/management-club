@@ -156,6 +156,7 @@ interface ContestSummary {
   endAt: string | null
   url: string | null
   totalEntries: number
+  note: string | null
   problemCount: number
   lambda: { key: LambdaKey; source: string } | null
   existingActivity: { id: string; title: string } | null
@@ -252,6 +253,25 @@ function resolveMember(
     }
   }
   return { error: '学号与姓名至少填写一项' }
+}
+
+/** 预览只等服务端约 40 秒；超过后返回明确错误，避免 Nginx 先返回 504 */
+const PREVIEW_DEADLINE_MS = 40_000
+const PREVIEW_CONTEST_CONCURRENCY = 3
+const PREVIEW_CONTEST_TIMEOUT_MS = 15_000
+/** 历史导入预览限制牛客翻页数；结算引擎仍抓全榜，避免一次预览拖到分钟级 */
+const PREVIEW_NOWCODER_MAX_PAGES = 60
+
+/** 有限并发执行；单个任务自行捕获异常，保证其它比赛继续处理 */
+async function runWithConcurrency<T>(items: T[], limit: number, fn: (item: T, index: number) => Promise<void>): Promise<void> {
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++
+      await fn(items[index], index)
+    }
+  })
+  await Promise.all(workers)
 }
 
 @Injectable()
@@ -367,61 +387,86 @@ export class HistoryImportService {
       groups.set(key, [...(groups.get(key) ?? []), row])
     }
 
-    const contests: ContestSummary[] = []
-    for (const rows of groups.values()) {
+    const contestInfos: Array<{ index: number; info: ContestSummary }> = []
+    const groupEntries = [...groups.entries()]
+    const deadline = Date.now() + PREVIEW_DEADLINE_MS
+    await runWithConcurrency(groupEntries, PREVIEW_CONTEST_CONCURRENCY, async ([, rows], index) => {
+      // 同一场全部成员都已解析失败时，不必再外呼榜单
+      if (!rows.some((row) => !row.error)) return
       const platform = rows[0].platform!
       const contestId = rows[0].contestId!
-      const summary = await this.loadContest(platform, contestId, rows.find((row) => row.activityTitle)?.activityTitle ?? null, input.lambdaKey)
-      contests.push(summary.info)
+      const remaining = deadline - Date.now()
+      if (remaining < 1_500) {
+        for (const row of rows) {
+          if (!row.error) row.error = '比赛榜单抓取超时（预览最多等待约 40 秒）；请减少一次导入的比赛数量后重试，或在积分列手填'
+        }
+        return
+      }
+      try {
+        const summary = await this.loadContest(
+          platform,
+          contestId,
+          rows.find((row) => row.activityTitle)?.activityTitle ?? null,
+          input.lambdaKey,
+          { maxPages: PREVIEW_NOWCODER_MAX_PAGES, timeoutMs: Math.min(PREVIEW_CONTEST_TIMEOUT_MS, remaining) },
+        )
+        contestInfos.push({ index, info: summary.info })
 
-      // 按表格里的平台账号查榜单成绩
-      const found = rows.map((row) => ({ row, entry: summary.entries && row.handle ? findEntry(platform, summary.entries, row.handle) : undefined }))
-      const valid = found
-        .filter((item): item is { row: Resolved; entry: StandingsEntry } => item.entry != null && hasValidSubmission({ ...item.entry, platformRank: item.entry.rank }))
-        .sort((a, b) => b.entry.solvedCount - a.entry.solvedCount || b.entry.score - a.entry.score)
-      // 同一成员同场多行时，只按第一次出现参与社内排名
-      const rankOf = new Map<string, number>()
-      for (const item of valid) if (!rankOf.has(item.row.studentNo)) rankOf.set(item.row.studentNo, rankOf.size + 1)
+        // 按表格里的平台账号查榜单成绩
+        const found = rows.map((row) => ({ row, entry: summary.entries && row.handle ? findEntry(platform, summary.entries, row.handle) : undefined }))
+        const valid = found
+          .filter((item): item is { row: Resolved; entry: StandingsEntry } => item.entry != null && hasValidSubmission({ ...item.entry, platformRank: item.entry.rank }))
+          .sort((a, b) => b.entry.solvedCount - a.entry.solvedCount || b.entry.score - a.entry.score)
+        // 同一成员同场多行时，只按第一次出现参与社内排名
+        const rankOf = new Map<string, number>()
+        for (const item of valid) if (!rankOf.has(item.row.studentNo)) rankOf.set(item.row.studentNo, rankOf.size + 1)
 
-      for (const { row, entry } of found) {
-        if (!row.activityTitle) row.activityTitle = summary.info.existingActivity?.title ?? summary.info.name ?? undefined
-        const startIso = summary.startAt ?? null
-        if (!row.activityDate && startIso) row.activityDate = shanghaiDate(startIso)
-        if (startIso) row.contestStartAt = startIso
-        if (summary.endAt) row.contestEndAt = summary.endAt
-        if (row.error) continue
+        for (const { row, entry } of found) {
+          if (!row.activityTitle) row.activityTitle = summary.info.existingActivity?.title ?? summary.info.name ?? undefined
+          const startIso = summary.startAt ?? null
+          if (!row.activityDate && startIso) row.activityDate = shanghaiDate(startIso)
+          if (startIso) row.contestStartAt = startIso
+          if (summary.endAt) row.contestEndAt = summary.endAt
+          if (row.error) continue
 
-        if (entry) {
-          const clubRank = rankOf.get(row.studentNo)
-          const formula = clubRank == null || !summary.info.lambda ? null : computeContestW({
-            solvedCount: entry.solvedCount,
-            score: entry.score,
-            platformRank: entry.rank,
-            clubRank,
-            validCount: rankOf.size,
-            totalProblems: summary.info.problemCount,
-            fullTotal: summary.fullTotal,
-            totalEntries: summary.info.totalEntries,
-            lambdaKey: summary.info.lambda.key,
-            remote: false,
-            cap: input.cap,
-          })
-          row.computed = { platformRank: entry.rank, solvedCount: entry.solvedCount, score: entry.score, formula }
-          if (row.amount == null) {
-            if (formula) {
-              row.amount = formula.W.toFixed(2)
-              row.amountSource = 'formula'
-            } else row.error = '榜上无有效提交，不自动计分（如需计分请在积分列手填）'
+          if (entry) {
+            const clubRank = rankOf.get(row.studentNo)
+            const formula = clubRank == null || !summary.info.lambda ? null : computeContestW({
+              solvedCount: entry.solvedCount,
+              score: entry.score,
+              platformRank: entry.rank,
+              clubRank,
+              validCount: rankOf.size,
+              totalProblems: summary.info.problemCount,
+              fullTotal: summary.fullTotal,
+              totalEntries: summary.info.totalEntries,
+              lambdaKey: summary.info.lambda.key,
+              remote: false,
+              cap: input.cap,
+            })
+            row.computed = { platformRank: entry.rank, solvedCount: entry.solvedCount, score: entry.score, formula }
+            if (row.amount == null) {
+              if (formula) {
+                row.amount = formula.W.toFixed(2)
+                row.amountSource = 'formula'
+              } else row.error = '榜上无有效提交，不自动计分（如需计分请在积分列手填）'
+            }
+          } else if (row.amount == null) {
+            row.error = !summary.info.available
+              ? `榜单抓取失败：${summary.info.reason}；可在积分列手填`
+              : !row.handle
+                ? '成员未在系统绑定该平台账号，表格也没填，无法从榜单查成绩（可填平台账号或在积分列手填）'
+                : `榜单中未找到账号「${row.handle}」，请核对平台账号`
           }
-        } else if (row.amount == null) {
-          row.error = !summary.info.available
-            ? `榜单抓取失败：${summary.info.reason}；可在积分列手填`
-            : !row.handle
-              ? '成员未在系统绑定该平台账号，表格也没填，无法从榜单查成绩（可填平台账号或在积分列手填）'
-              : `榜单中未找到账号「${row.handle}」，请核对平台账号`
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '未知错误'
+        for (const row of rows) {
+          if (!row.error) row.error = `比赛榜单抓取失败：${message}；可在积分列手填`
         }
       }
-    }
+    })
+    const contests = contestInfos.sort((a, b) => a.index - b.index).map((item) => item.info)
 
     // 同一活动同一成员同类别只发一次默认参与分（多写一行用来记另一个加分项）
     const participated = new Set<string>()
@@ -464,8 +509,15 @@ export class HistoryImportService {
   }
 
   /** 抓取单场比赛：榜单 + 元数据（榜单附带 → 已缓存的平台比赛 → 牛客比赛页）+ 已有活动 + λ */
-  private async loadContest(platform: string, contestId: string, titleHint: string | null, lambdaKey: HistoryPreviewInput['lambdaKey']) {
-    const result = await this.standings.fetch(platform, contestId)
+  private async loadContest(
+    platform: string,
+    contestId: string,
+    titleHint: string | null,
+    lambdaKey: HistoryPreviewInput['lambdaKey'],
+    options: { maxPages?: number; timeoutMs?: number } = {},
+  ) {
+    const startedAt = Date.now()
+    const result = await this.standings.fetch(platform, contestId, options)
     const [existing, cached] = await Promise.all([
       this.db.activity.findFirst({
         where: { platform, platformContestId: contestId, status: { not: 'cancelled' } },
@@ -479,11 +531,23 @@ export class HistoryImportService {
     let startAt = existing?.startAt.toISOString() ?? snapshot?.contest?.startAt ?? cached?.startTime.toISOString() ?? null
     let endAt = existing?.endAt.toISOString() ?? snapshot?.contest?.endAt ?? cached?.endTime?.toISOString() ?? null
     if (platform === 'nowcoder' && (!name || !startAt)) {
-      const meta = await fetchNowcoderContestMeta(this.db, contestId).catch(() => null)
-      if (meta?.contest) {
-        name = name ?? meta.contest.name
-        startAt = startAt ?? meta.contest.startTime.toISOString()
-        endAt = endAt ?? meta.contest.endTime?.toISOString() ?? null
+      // 比赛元数据只用于补名称/日期，不能把整个预览拖过网关超时
+      const budgetLeft = (options.timeoutMs ?? 20_000) - (Date.now() - startedAt)
+      if (budgetLeft > 1_500) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const meta = await Promise.race([
+          fetchNowcoderContestMeta(this.db, contestId).catch(() => null),
+          new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), Math.min(4_000, budgetLeft))
+          }),
+        ]).finally(() => {
+          if (timer) clearTimeout(timer)
+        })
+        if (meta?.contest) {
+          name = name ?? meta.contest.name
+          startAt = startAt ?? meta.contest.startTime.toISOString()
+          endAt = endAt ?? meta.contest.endTime?.toISOString() ?? null
+        }
       }
     }
     const lambda = lambdaKey === 'auto'
@@ -498,7 +562,8 @@ export class HistoryImportService {
       startAt,
       endAt,
       url: contestExternalUrl(platform, contestId),
-      totalEntries: snapshot?.entries.length ?? 0,
+      totalEntries: snapshot?.totalEntries ?? snapshot?.entries.length ?? 0,
+      note: snapshot?.note ?? null,
       problemCount: snapshot?.problems.length ?? 0,
       lambda: { key: lambda.lambdaKey, source: lambda.lambdaSource },
       existingActivity: existing ? { id: existing.id, title: existing.title } : null,

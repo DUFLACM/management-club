@@ -72,6 +72,7 @@ interface PreviewContest {
   startAt: string | null;
   url: string | null;
   totalEntries: number;
+  note: string | null;
   problemCount: number;
   lambda: { key: string; source: string } | null;
   existingActivity: { id: string; title: string } | null;
@@ -328,9 +329,18 @@ export function HistoryImportDialog({
             )}
 
             {previewMutation.isPending && (
-              <div className="flex items-center gap-2 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
-                <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" />
-                {contestRowCount > 0 ? `正在核对学号并抓取比赛榜单（${contestRowCount} 行比赛数据）…` : '正在核对学号…'}
+              <div className="flex flex-col gap-1 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+                <span className="flex items-center gap-2">
+                  <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" />
+                  {contestRowCount > 0
+                    ? `正在核对学号并抓取比赛榜单（${contestRowCount} 行比赛数据，最多约 40 秒）…`
+                    : '正在核对学号…'}
+                </span>
+                {contestRowCount > 0 && (
+                  <span className="text-xs">
+                    比赛较多时会并行抓取；超过约 40 秒仍未完成的场次会标红，可减少一次导入的比赛数量后重试，或在积分列手填。
+                  </span>
+                )}
               </div>
             )}
             {previewMutation.error && (
@@ -421,6 +431,9 @@ function ContestSummary({ contests }: { contests: PreviewContest[] }) {
               <a href={contest.url} target="_blank" rel="noreferrer" className="ml-auto inline-flex items-center gap-1 text-primary underline-offset-2 hover:underline">
                 官方页面 <ExternalLinkIcon className="size-3" aria-hidden="true" />
               </a>
+            )}
+            {contest.note && (
+              <span className="w-full text-xs leading-5 text-warning-foreground">{contest.note}</span>
             )}
           </li>
         ))}

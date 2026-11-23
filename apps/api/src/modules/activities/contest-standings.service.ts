@@ -42,6 +42,8 @@ export interface StandingsSnapshot {
   entries: StandingsEntry[]
   fetchedAt: string
   note: string | null
+  /** 榜单总人数（牛客翻页截断时仍用接口给出的总人数，避免 X 百分位被低估） */
+  totalEntries?: number
   /** 榜单接口附带的比赛元数据（仅部分平台提供，供历史导入预填名称与时间） */
   contest?: { name: string | null; startAt: string | null; endAt: string | null }
 }
@@ -51,6 +53,13 @@ export interface StandingsFailure {
   contestId: string
   available: false
   reason: string
+}
+
+export interface StandingsFetchOptions {
+  /** 仅牛客预览使用：限制翻页数，避免历史导入预览拖到网关超时；结算仍抓全榜 */
+  maxPages?: number
+  /** 单场比赛的总超时（毫秒）；默认 20 秒 */
+  timeoutMs?: number
 }
 
 export type StandingsResult = StandingsSnapshot | StandingsFailure
@@ -106,25 +115,40 @@ function str(value: unknown): string | null {
 export class ContestStandingsService {
   private readonly cache = new Map<string, { expiresAt: number; inflight?: Promise<StandingsResult>; result?: StandingsResult }>()
 
-  async fetch(platform: string, contestId: string): Promise<StandingsResult> {
-    const key = `${platform}:${contestId}`
+  async fetch(platform: string, contestId: string, options: StandingsFetchOptions = {}): Promise<StandingsResult> {
+    const maxPages = options.maxPages == null ? undefined : Math.max(1, Math.min(options.maxPages, NOWCODER_MAX_PAGES))
+    const timeoutMs = Math.max(1_000, options.timeoutMs ?? 20_000)
+    const key = `${platform}:${contestId}:${maxPages ?? 'all'}`
     const cached = this.cache.get(key)
     const now = Date.now()
     if (cached?.result && cached.expiresAt > now) return cached.result
     if (cached?.inflight) return cached.inflight
     const entry = { expiresAt: now + CACHE_TTL_MS, inflight: undefined as Promise<StandingsResult> | undefined, result: undefined as StandingsResult | undefined }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
     entry.inflight = (async () => {
       let result: StandingsResult
       try {
-        if (platform === 'nowcoder') result = await this.fetchNowcoder(contestId)
-        else if (platform === 'codeforces') result = await this.fetchCodeforces(contestId)
-        else if (platform === 'atcoder') result = await this.fetchAtcoder(contestId)
+        if (platform === 'nowcoder') result = await this.fetchNowcoder(contestId, maxPages ?? NOWCODER_MAX_PAGES, controller.signal)
+        else if (platform === 'codeforces') result = await this.fetchCodeforces(contestId, controller.signal)
+        else if (platform === 'atcoder') result = await this.fetchAtcoder(contestId, controller.signal)
         else result = { platform, contestId, available: false, reason: '该平台暂不支持榜单抓取，请通过外链前往查看' }
       } catch {
-        result = { platform, contestId, available: false, reason: '平台榜单暂时无法访问（网络或接口限制），请稍后重试或通过外链前往' }
+        result = {
+          platform,
+          contestId,
+          available: false,
+          reason: controller.signal.aborted
+            ? `榜单抓取超过 ${Math.round(timeoutMs / 1000)} 秒，已中止；请减少一次导入的比赛数量或稍后重试`
+            : '平台榜单暂时无法访问（网络或接口限制），请稍后重试或通过外链前往',
+        }
+      } finally {
+        clearTimeout(timer)
       }
       entry.result = result
       entry.inflight = undefined
+      // 失败结果只缓存 10 秒，避免一次网络抖动让管理员等满 60 秒
+      entry.expiresAt = Date.now() + (result.available ? CACHE_TTL_MS : 10_000)
       return result
     })()
     this.cache.set(key, entry)
@@ -132,16 +156,19 @@ export class ContestStandingsService {
   }
 
   /** 牛客 real-time-rank-data 单页（服务端固定 50 行/页，limit 不能放大页长） */
-  private async fetchNowcoderPage(contestId: string, page: number): Promise<Json> {
+  private async fetchNowcoderPage(contestId: string, page: number, signal: AbortSignal): Promise<Json> {
     const url = `https://ac.nowcoder.com/acm-heavy/acm/contest/real-time-rank-data?token=&id=${encodeURIComponent(contestId)}&rankScope=ALL&page=${page}&limit=0`
     for (let attempt = 1; ; attempt++) {
       try {
-        const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) club-activities/1.0', Accept: 'application/json' } })
+        const response = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) club-activities/1.0', Accept: 'application/json' },
+          signal,
+        })
         if (!response.ok) throw new Error(`nowcoder ${response.status}`)
         const body = (await response.json()) as Json
         return (body.data ?? {}) as Json
       } catch (error) {
-        if (attempt >= NOWCODER_PAGE_ATTEMPTS) throw error
+        if (signal.aborted || attempt >= NOWCODER_PAGE_ATTEMPTS) throw error
         await new Promise((resolve) => setTimeout(resolve, 300 * attempt))
       }
     }
@@ -152,14 +179,14 @@ export class ContestStandingsService {
    * 按 basicInfo.pageCount 翻完全部页（有限并发）；任一页失败整体失败，不返回残缺榜单
    * （残缺榜会让结算把 50 名以后的成员当作未参赛）。
    */
-  private async fetchNowcoder(contestId: string): Promise<StandingsResult> {
-    const data = await this.fetchNowcoderPage(contestId, 1)
+  private async fetchNowcoder(contestId: string, maxPages: number, signal: AbortSignal): Promise<StandingsResult> {
+    const data = await this.fetchNowcoderPage(contestId, 1, signal)
     const problemData = asArray(data.problemData)
     const basicInfo = (data.basicInfo ?? {}) as Json
     const pageCount = Math.max(1, num(basicInfo.pageCount) ?? 1)
-    const lastPage = Math.min(pageCount, NOWCODER_MAX_PAGES)
+    const lastPage = Math.min(pageCount, maxPages, NOWCODER_MAX_PAGES)
     const restPages = Array.from({ length: lastPage - 1 }, (_, i) => i + 2)
-    const restRows = await mapWithConcurrency(restPages, NOWCODER_PAGE_CONCURRENCY, async (page) => asArray((await this.fetchNowcoderPage(contestId, page)).rankData))
+    const restRows = await mapWithConcurrency(restPages, NOWCODER_PAGE_CONCURRENCY, async (page) => asArray((await this.fetchNowcoderPage(contestId, page, signal)).rankData))
     const rankData = [asArray(data.rankData), ...restRows].flat()
     if (problemData.length === 0 && rankData.length === 0) {
       return { platform: 'nowcoder', contestId, available: false, reason: '未找到该牛客比赛的榜单（请确认比赛 ID）' }
@@ -198,6 +225,7 @@ export class ContestStandingsService {
     const truncated = pageCount > lastPage
     return {
       platform: 'nowcoder', contestId, available: true, problems, entries, fetchedAt: new Date().toISOString(),
+      totalEntries: num(basicInfo.rankCount) ?? entries.length,
       note: truncated
         ? `牛客榜单共 ${pageCount} 页，仅抓取前 ${lastPage} 页（${entries.length} 行），之后的参赛者未纳入。`
         : `数据来自牛客实时榜单接口（共 ${pageCount} 页 ${entries.length} 行）；比赛结束后为最终成绩。`,
@@ -205,8 +233,8 @@ export class ContestStandingsService {
   }
 
   /** Codeforces 官方 API：必须匿名 GET（不带 UA / from / count 等额外参数，否则拒绝） */
-  private async fetchCodeforces(contestId: string): Promise<StandingsResult> {
-    const response = await fetch(`https://codeforces.com/api/contest.standings?contestId=${encodeURIComponent(contestId)}`, { headers: { Accept: 'application/json' } })
+  private async fetchCodeforces(contestId: string, signal: AbortSignal): Promise<StandingsResult> {
+    const response = await fetch(`https://codeforces.com/api/contest.standings?contestId=${encodeURIComponent(contestId)}`, { headers: { Accept: 'application/json' }, signal })
     if (!response.ok) throw new Error(`codeforces ${response.status}`)
     const body = (await response.json()) as Json
     if (body.status !== 'OK') throw new Error(`codeforces ${str(body.comment) ?? 'FAILED'}`)
@@ -252,14 +280,14 @@ export class ContestStandingsService {
   }
 
   /** AtCoder：standings/json 需登录态；未配置会话 Cookie 时通常 302 → 降级外链 */
-  private async fetchAtcoder(contestId: string): Promise<StandingsResult> {
+  private async fetchAtcoder(contestId: string, signal: AbortSignal): Promise<StandingsResult> {
     const headers: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) club-activities/1.0',
       Accept: 'application/json',
     }
     const session = process.env.ATCODER_SESSION
     if (session) headers.Cookie = session.startsWith('REVEL_SESSION') ? session : `REVEL_SESSION=${session}`
-    const response = await fetch(`https://atcoder.jp/contests/${encodeURIComponent(contestId)}/standings/json`, { headers, redirect: 'manual' })
+    const response = await fetch(`https://atcoder.jp/contests/${encodeURIComponent(contestId)}/standings/json`, { headers, redirect: 'manual', signal })
     if (response.status >= 300 && response.status < 400) {
       return { platform: 'atcoder', contestId, available: false, reason: 'AtCoder 榜单接口需要登录态，暂无法抓取；请点击外链前往官方榜单查看' }
     }
