@@ -5,6 +5,8 @@ import { PlatformService, bindAccountSchema } from './platform.service.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { newId } from '../../common/utils.js'
+import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import type { Prisma } from '@acm/db'
 
 @Controller('/api/v1/me')
 @UseGuards(SessionGuard, PermissionsGuard)
@@ -44,12 +46,30 @@ export class PlatformMeController {
   }
 }
 
+const JOB_SELECT = {
+  id: true, type: true, status: true, attempts: true, runAfter: true, lastError: true,
+  createdAt: true, updatedAt: true, payload: true,
+} as const
+
+type JobRow = {
+  id: string
+  type: string
+  status: string
+  attempts: number
+  runAfter: Date
+  lastError: string | null
+  createdAt: Date
+  updatedAt: Date
+  payload: unknown
+}
+
 @Controller('/api/v1/admin/platform')
 @UseGuards(SessionGuard, PermissionsGuard, ActionGuard)
 export class PlatformAdminController {
   constructor(
     private readonly platforms: PlatformService,
     private readonly db: PrismaService,
+    private readonly audit: AuditService,
   ) {}
 
   @Get('accounts')
@@ -64,6 +84,21 @@ export class PlatformAdminController {
     const parsed = z.object({ decision: z.enum(['verify', 'reject', 'revoke']), note: z.string().max(500).optional() }).parse(body)
     await this.platforms.reviewBinding(actor.principalId, id, parsed.decision, parsed.note)
     return ok({ reviewed: true })
+  }
+
+  /** 手动触发账号同步：失败任务被忽略、或成员没有主动刷新时由管理员补一次 */
+  @Post('accounts/:id/sync')
+  @RequireAction('sync.manage')
+  async syncAccount(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    const result = await this.platforms.adminRequestSync(id)
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'platform.account_sync',
+      resourceType: 'platform_account',
+      resourceId: id,
+      summary: `管理员触发平台账号同步${result.deduplicated ? '（30 秒内已有排队任务，复用）' : ''}`,
+    })
+    return ok(result)
   }
 
   /** 指定目录管理（competitions.manage）：列表 / 新增 / 删除；λ 供结算引擎匹配 */
@@ -116,13 +151,133 @@ export class PlatformAdminController {
   /** 同步任务状态（最近成功/失败/排队）；账号同步任务附带对应平台账号与成员，失败时可直接定位 */
   @Get('jobs')
   @RequireAction('sync.manage')
-  async jobs(@Query('limit') limit?: string) {
+  async jobs(@Query('limit') limit?: string, @Query('status') status?: string) {
+    const take = Math.min(Math.max(Number(limit ?? 50) || 50, 1), 200)
+    const where: Prisma.JobWhereInput = { type: { startsWith: 'platform.' } }
+    if (status === 'failed') where.status = { in: ['dead', 'failed'] }
+    else if (status === 'active') where.status = { in: ['queued', 'running'] }
+    else if (status && ['dead', 'failed', 'queued', 'running', 'done', 'cancelled'].includes(status)) where.status = status
     const rows = await this.db.job.findMany({
-      where: { type: { startsWith: 'platform.' } },
-      orderBy: { createdAt: 'desc' },
-      take: Math.min(Number(limit ?? 30), 100),
-      select: { id: true, type: true, status: true, attempts: true, runAfter: true, lastError: true, createdAt: true, payload: true },
+      where,
+      orderBy: { updatedAt: 'desc' },
+      take,
+      select: JOB_SELECT,
     })
+    return ok(await this.attachAccounts(rows))
+  }
+
+  /**
+   * 失败任务队列：不再受“最近 N 条”限制，确保总览里看到的同步失败一定能在这里定位。
+   * 返回全部 dead/failed 平台任务（最多 200 条）与真实总数。
+   */
+  @Get('jobs/failures')
+  @RequireAction('sync.manage')
+  async jobFailures() {
+    const where: Prisma.JobWhereInput = { type: { startsWith: 'platform.' }, status: { in: ['dead', 'failed'] } }
+    const [rows, total] = await Promise.all([
+      this.db.job.findMany({ where, orderBy: { updatedAt: 'desc' }, take: 200, select: JOB_SELECT }),
+      this.db.job.count({ where }),
+    ])
+    return ok({ items: await this.attachAccounts(rows), total })
+  }
+
+  /** 重试失败任务（dead/failed → queued）；也允许把退避等待中的任务立即重试 */
+  @Post('jobs/:id/retry')
+  @RequireAction('sync.manage')
+  async retry(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    const job = await this.db.job.findUnique({ where: { id } })
+    if (!job) return ok({ retried: false })
+    const retryable = job.status === 'dead' || job.status === 'failed' || (job.status === 'queued' && job.attempts > 0)
+    if (!retryable) return ok({ retried: false, reason: '仅失败或等待重试的任务可重试' })
+    const updated = await this.db.job.updateMany({
+      where: { id, status: job.status, ...(job.status === 'queued' ? { attempts: { gt: 0 } } : {}) },
+      data: {
+        status: 'queued',
+        attempts: 0,
+        runAfter: new Date(),
+        lastError: null,
+        leaseUntil: null,
+        lockedBy: null,
+        leaseToken: null,
+      },
+    })
+    if (updated.count === 0) return ok({ retried: false, reason: '任务状态已变化，请刷新后重试' })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'platform.job_retry',
+      resourceType: 'job',
+      resourceId: id,
+      summary: `重试平台同步任务 ${job.type}（原状态 ${job.status}，尝试 ${job.attempts} 次）`,
+    })
+    return ok({ retried: true })
+  }
+
+  /** 批量重试失败任务：最多 50 条，每 30 秒错峰执行，避免同时打满第三方平台限流 */
+  @Post('jobs/retry-failures')
+  @RequireAction('sync.manage')
+  async retryFailures(@CurrentActor() actor: SessionActor) {
+    const rows = await this.db.job.findMany({
+      where: { type: { startsWith: 'platform.' }, status: { in: ['dead', 'failed'] } },
+      orderBy: { updatedAt: 'asc' },
+      take: 50,
+      select: { id: true, type: true },
+    })
+    const start = Date.now()
+    let retried = 0
+    for (const [index, row] of rows.entries()) {
+      try {
+        const updated = await this.db.job.updateMany({
+          where: { id: row.id, status: { in: ['dead', 'failed'] } },
+          data: {
+            status: 'queued',
+            attempts: 0,
+            runAfter: new Date(start + index * 30_000),
+            lastError: null,
+            leaseUntil: null,
+            lockedBy: null,
+            leaseToken: null,
+          },
+        })
+        if (updated.count > 0) retried++
+      } catch {
+        // 同 dedupeKey 的另一个任务已排队时跳过该条，其余继续
+      }
+    }
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'platform.job_retry_all',
+      resourceType: 'job',
+      resourceId: 'platform-sync-failures',
+      summary: `批量重试平台同步失败任务 ${retried}/${rows.length} 条（每 30 秒错峰）`,
+    })
+    return ok({ retried, total: rows.length })
+  }
+
+  /** 忽略失败任务：标记 cancelled，不再进入自动重试；保留原错误供审计追溯 */
+  @Post('jobs/:id/cancel')
+  @RequireAction('sync.manage')
+  async cancelJob(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    const job = await this.db.job.findUnique({ where: { id } })
+    if (!job) return ok({ cancelled: false })
+    const cancellable = job.status === 'dead' || job.status === 'failed' || (job.status === 'queued' && job.attempts > 0)
+    if (!cancellable) return ok({ cancelled: false, reason: '仅失败或等待重试的任务可忽略' })
+    const updated = await this.db.job.updateMany({
+      where: { id, status: job.status, ...(job.status === 'queued' ? { attempts: { gt: 0 } } : {}) },
+      data: { status: 'cancelled', leaseUntil: null, lockedBy: null, leaseToken: null },
+    })
+    if (updated.count === 0) return ok({ cancelled: false, reason: '任务状态已变化，请刷新后重试' })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'platform.job_cancel',
+      resourceType: 'job',
+      resourceId: id,
+      summary: `忽略平台同步失败任务 ${job.type}（尝试 ${job.attempts} 次；${job.lastError ?? '无错误信息'}）`,
+    })
+    return ok({ cancelled: true })
+  }
+
+  /** 给任务行补上平台账号与成员，失败时管理员能直接定位到人 */
+  private async attachAccounts(rows: JobRow[]) {
     const accountIdOf = (payload: unknown): string | null => {
       const value = (payload as { accountId?: unknown } | null)?.accountId
       return typeof value === 'string' && z.string().uuid().safeParse(value).success ? value : null
@@ -136,20 +291,9 @@ export class PlatformAdminController {
       },
     })
     const accountById = new Map(accounts.map((account) => [account.id, account]))
-    return ok(rows.map(({ payload, ...row }) => {
+    return rows.map(({ payload, ...row }) => {
       const accountId = accountIdOf(payload)
       return { ...row, accountId, account: accountId ? accountById.get(accountId) ?? null : null }
-    }))
-  }
-
-  /** 重试失败任务（dead → queued） */
-  @Post('jobs/:id/retry')
-  @RequireAction('sync.manage')
-  async retry(@Param('id', ParseUUIDPipe) id: string) {
-    const job = await this.db.job.findUnique({ where: { id } })
-    if (!job) return ok({ retried: false })
-    if (job.status !== 'dead' && job.status !== 'failed') return ok({ retried: false, reason: '仅失败/死信任务可重试' })
-    await this.db.job.update({ where: { id }, data: { status: 'queued', attempts: 0, runAfter: new Date() } })
-    return ok({ retried: true })
+    })
   }
 }

@@ -205,7 +205,7 @@ export class MembersService {
       this.db.attendanceAttendanceResult.count({ where: { status: 'pending_review' } }),
       this.db.pointsClaim.count({ where: { status: 'pending' } }),
       this.db.disclosure.count({ where: { status: 'published', endsAt: { gt: now } } }),
-      this.db.job.count({ where: { type: { startsWith: 'platform.' }, status: 'dead' } }),
+      this.db.job.count({ where: { type: { startsWith: 'platform.' }, status: { in: ['dead', 'failed'] } } }),
       this.db.activity.findMany({ where: { startAt: { gte: todayStart, lt: todayEnd } }, orderBy: { startAt: 'asc' }, take: 10, include: { venueVersion: { include: { venue: true } } } }),
     ])
     return {

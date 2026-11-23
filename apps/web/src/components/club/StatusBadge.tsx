@@ -120,6 +120,7 @@ const STATUS_MAP: Record<StatusKind, Record<string, StatusEntry>> = {
     已同步: { tone: 'success', icon: RefreshCwIcon },
     已核验: { tone: 'success', icon: ShieldCheckIcon },
     已解绑: { tone: 'neutral', icon: Link2OffIcon },
+    已忽略: { tone: 'neutral', icon: FileMinusIcon },
     成功: { tone: 'success', icon: CheckCircle2Icon },
     失败: { tone: 'destructive', icon: XCircleIcon },
   },

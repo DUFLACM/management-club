@@ -142,20 +142,41 @@ async function main(): Promise<void> {
 }
 
 async function failJob(db: PrismaClient, jobId: string, leaseToken: string, error: string): Promise<void> {
-  const job = await db.job.findUnique({ where: { id: jobId }, select: { attempts: true, maxAttempts: true } })
+  const job = await db.job.findUnique({
+    where: { id: jobId },
+    select: { attempts: true, maxAttempts: true, type: true, payload: true },
+  })
   if (!job) return
+  let updated = 0
   if (job.attempts >= job.maxAttempts) {
-    await db.$executeRaw`
+    updated = await db.$executeRaw`
       UPDATE jobs SET status = 'dead', last_error = ${error}, lease_until = NULL, locked_by = NULL, lease_token = NULL
       WHERE id = ${jobId}::uuid AND lease_token = ${leaseToken}::uuid AND status = 'running'`
-    return
+  } else {
+    const jitter = Math.random() * 0.4 + 0.8
+    const delaySec = Math.round(10 * 2 ** Math.min(job.attempts, 6) * jitter)
+    updated = await db.$executeRaw`
+      UPDATE jobs SET status = 'queued', last_error = ${error}, run_after = now() + (${delaySec} || ' seconds')::interval,
+        lease_until = NULL, locked_by = NULL, lease_token = NULL
+      WHERE id = ${jobId}::uuid AND lease_token = ${leaseToken}::uuid AND status = 'running'`
   }
-  const jitter = Math.random() * 0.4 + 0.8
-  const delaySec = Math.round(10 * 2 ** Math.min(job.attempts, 6) * jitter)
-  await db.$executeRaw`
-    UPDATE jobs SET status = 'queued', last_error = ${error}, run_after = now() + (${delaySec} || ' seconds')::interval,
-      lease_until = NULL, locked_by = NULL, lease_token = NULL
-    WHERE id = ${jobId}::uuid AND lease_token = ${leaseToken}::uuid AND status = 'running'`
+  // 租约已失效（另一个 Worker 已完成/接管）时不能把账号误标成失败。
+  if (updated === 0) return
+  // 账号同步失败要落到平台账号本身：成员端和管理端都依赖 last_sync_status/error 展示失败原因。
+  // 否则任务失败后账号仍显示“上次同步成功”，管理员在绑定列表里看不到任何异常。
+  if (job.type === 'platform.sync_account') {
+    const accountId = (job.payload as { accountId?: unknown } | null)?.accountId
+    if (typeof accountId === 'string' && /^[0-9a-f-]{36}$/i.test(accountId)) {
+      try {
+        await db.platformAccount.update({
+          where: { id: accountId },
+          data: { lastSyncAt: new Date(), lastSyncStatus: 'failed', lastSyncError: error.slice(0, 1000) },
+        })
+      } catch {
+        // 账号可能已被删除；任务失败事实仍保留在 jobs 表
+      }
+    }
+  }
 }
 
 function sleep(ms: number): Promise<void> {

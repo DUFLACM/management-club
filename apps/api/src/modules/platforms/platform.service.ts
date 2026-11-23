@@ -118,6 +118,21 @@ export class PlatformService {
     })
   }
 
+  /** 管理端手动触发同步：用于失败任务被忽略后仍要重新拉取，或成员未主动点刷新 */
+  async adminRequestSync(accountId: string): Promise<{ jobId: string; deduplicated: boolean }> {
+    const account = await this.db.platformAccount.findUnique({ where: { id: accountId }, select: { id: true, status: true } })
+    if (!account) throw new PlatformError('绑定不存在', 'NOT_FOUND')
+    if (account.status !== 'verified') throw new PlatformError('账号持有核验通过后才能同步', 'NOT_VERIFIED')
+    const bucket = Math.floor(Date.now() / 30_000)
+    const enqueued = await this.jobs.enqueue({
+      type: 'platform.sync_account',
+      payload: { accountId, source: 'admin' },
+      dedupeKey: `sync:${accountId}:admin:${bucket}`,
+      priority: 8,
+    })
+    return { jobId: enqueued.id, deduplicated: enqueued.deduplicated }
+  }
+
   /** 管理端：绑定列表（按状态筛选） */
   async adminList(status?: string) {
     return this.db.platformAccount.findMany({
