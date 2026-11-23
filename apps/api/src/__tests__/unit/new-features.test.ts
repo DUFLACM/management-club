@@ -10,7 +10,6 @@ const ACTOR: SessionActor = {
   sessionId: 'sess-1',
   principalId: '11111111-1111-4111-8111-111111111111',
   principalKind: 'system',
-  userId: null,
   authzVersion: 1,
   roles: ['presidium', 'system_admin'],
 }
