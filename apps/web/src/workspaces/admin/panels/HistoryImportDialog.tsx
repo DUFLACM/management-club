@@ -43,6 +43,10 @@ const LAMBDA_OPTIONS = [
 
 interface PreviewRow extends HistoryImportRow {
   memberName: string | null;
+  /** 同名候选：姓名匹配到多人时由管理员在预览表里选择 */
+  candidates?: Array<{ userId: string; studentNo: string; name: string; displayName: string | null; grade: number | null }>;
+  matchSource?: 'studentNo' | 'name';
+  matchWarning?: string;
   /** 参与分来源：表格手填 / 按活动类型默认 / 按榜单 W 公式 */
   amountSource?: 'sheet' | 'default' | 'formula';
   /** 平台账号来源：表格手填 / 成员在系统绑定的账号 */
@@ -118,10 +122,15 @@ async function downloadTemplate() {
   XLSX.writeFile(workbook, '历史积分导入模板.xlsx');
 }
 
-/** 发给服务端的行字段（去掉本地展示用字段） */
+/** 发给服务端的行字段（去掉本地展示用字段；学号/姓名至少一项，空值不发送） */
 function toPayload(row: PreviewRow | HistoryImportRow) {
-  const { row: line, studentNo, amount, bonus, bonusAmount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note } = row;
-  const base = { row: line, studentNo, amount, bonus, bonusAmount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note };
+  const { row: line, studentNo, name, amount, bonus, bonusAmount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note } = row;
+  const base = {
+    row: line,
+    ...(studentNo ? { studentNo } : {}),
+    ...(name ? { name } : {}),
+    amount, bonus, bonusAmount, category, activityTitle, activityDate, platform, contestId, handle, activityType, scoreMonth, note,
+  };
   if ('contestStartAt' in row) return { ...base, contestStartAt: row.contestStartAt, contestEndAt: row.contestEndAt };
   return base;
 }
@@ -141,6 +150,8 @@ export function HistoryImportDialog({
   const [lambdaKey, setLambdaKey] = useState('auto');
   const [preview, setPreview] = useState<PreviewResult | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
+  /** 同名候选的选定结果：Excel 行号 → 学号 */
+  const [memberChoices, setMemberChoices] = useState<Record<number, string>>({});
 
   const localValid = parsed.filter((row) => !row.error);
   const localInvalid = parsed.filter((row) => row.error);
@@ -157,7 +168,9 @@ export function HistoryImportDialog({
 
   const importMutation = useMutation({
     mutationFn: async () => {
-      const rows = (preview?.rows ?? []).filter((row) => !row.error);
+      const rows = (preview?.rows ?? [])
+        .map((row) => (memberChoices[row.row] ? { ...row, studentNo: memberChoices[row.row]! } : row))
+        .filter((row) => !row.error);
       return (await api.post<ImportResult>('/admin/history-import/excel', { rows: rows.map(toPayload) })).data;
     },
     onSuccess: (data) => {
@@ -172,18 +185,33 @@ export function HistoryImportDialog({
     setParseError(null);
     setPreview(null);
     setResult(null);
+    setMemberChoices({});
     previewMutation.reset();
     importMutation.reset();
   };
 
-  const runPreview = (rows: HistoryImportRow[], key: string) => {
+  const runPreview = (rows: HistoryImportRow[], key: string, choices: Record<number, string> = memberChoices) => {
     setPreview(null);
-    if (rows.length > 0) previewMutation.mutate({ rows, lambdaKey: key });
+    const resolved = rows.map((row) => (choices[row.row] ? { ...row, studentNo: choices[row.row]! } : row));
+    if (resolved.length > 0) previewMutation.mutate({ rows: resolved, lambdaKey: key });
+  };
+
+  /** 选定同名成员后带上学号重新核对；成员姓名保持不变，服务端会校验一致 */
+  const chooseMember = (row: PreviewRow, studentNo: string) => {
+    const next = { ...memberChoices, [row.row]: studentNo };
+    setMemberChoices(next);
+    runPreview(localValid, lambdaKey, next);
   };
 
   const previewRows = preview?.rows ?? [];
-  const readyRows = previewRows.filter((row) => !row.error);
-  const serverErrors = previewRows.filter((row) => row.error);
+  const effectiveRows = previewRows.map((row) =>
+    row.candidates?.length && memberChoices[row.row]
+      ? { ...row, studentNo: memberChoices[row.row]!, error: undefined }
+      : row,
+  );
+  const readyRows = effectiveRows.filter((row) => !row.error);
+  const serverErrors = effectiveRows.filter((row) => row.error);
+  const pendingChoiceCount = previewRows.filter((row) => row.candidates?.length && !memberChoices[row.row]).length;
   const activityCount = new Set(
     readyRows.map((row) => (row.platform ? `${row.platform}:${row.contestId}` : `${row.activityTitle}\u0000${row.activityDate}`)),
   ).size;
@@ -276,7 +304,7 @@ export function HistoryImportDialog({
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              普通行必填：学号、活动名称、活动日期、活动类型（参与分留空按类型给默认分）。平台比赛行填「平台 + 比赛场次」即可，平台账号留空自动用成员在系统绑定的账号，比赛分 / 名称 / 日期由系统补全。
+              普通行必填：学号或姓名（二选一）、活动名称、活动日期、活动类型（参与分留空按类型给默认分）；同时填学号和姓名时会核对是否一致，只有姓名且同名多人时需在预览里选择成员。平台比赛行填「平台 + 比赛场次」即可，平台账号留空自动用成员在系统绑定的账号，比赛分 / 名称 / 日期由系统补全。
               加分项可选：{HISTORY_BONUS_ITEMS.map((item) => `${item.label}${item.amount != null ? ` +${item.amount}` : ''}`).join('、')}。模板里有逐列说明。
             </p>
 
@@ -320,13 +348,27 @@ export function HistoryImportDialog({
 
             {preview && preview.contests.length > 0 && <ContestSummary contests={preview.contests} />}
 
+            {pendingChoiceCount > 0 && (
+              <Alert variant="info">
+                <AlertTitle>{pendingChoiceCount} 行姓名重复，需要选择成员</AlertTitle>
+                <AlertDescription>
+                  在下方预览表的「成员」列选择具体成员；选择后会自动重新核对并计算分值。
+                </AlertDescription>
+              </Alert>
+            )}
+
             {preview && (
               <>
                 <p className="text-xs text-muted-foreground">
                   {fileName}：{readyRows.length} 行可导入，涉及 {activityCount} 个活动
                   {serverErrors.length > 0 && <span className="text-destructive">；{serverErrors.length} 行有问题，不会提交</span>}
                 </p>
-                <PreviewTable rows={previewRows} />
+                <PreviewTable
+                  rows={effectiveRows}
+                  choices={memberChoices}
+                  choosing={previewMutation.isPending}
+                  onChoose={chooseMember}
+                />
               </>
             )}
 
@@ -387,7 +429,17 @@ function ContestSummary({ contests }: { contests: PreviewContest[] }) {
   );
 }
 
-function PreviewTable({ rows }: { rows: PreviewRow[] }) {
+function PreviewTable({
+  rows,
+  choices,
+  choosing,
+  onChoose,
+}: {
+  rows: PreviewRow[];
+  choices: Record<number, string>;
+  choosing: boolean;
+  onChoose: (row: PreviewRow, studentNo: string) => void;
+}) {
   return (
     <div className="max-h-80 overflow-auto rounded-lg border border-border">
       <Table>
@@ -412,8 +464,38 @@ function PreviewTable({ rows }: { rows: PreviewRow[] }) {
               <TableRow key={row.row} className={row.error ? 'bg-destructive-subtle/40' : undefined}>
                 <TableCell className="py-1.5 pl-3 text-xs tabular-nums text-muted-foreground">{row.row}</TableCell>
                 <TableCell className="py-1.5 text-xs">
-                  <span className="block">{row.memberName ?? row.name ?? '—'}</span>
-                  <span className="block text-muted-foreground tabular-nums">{row.studentNo}</span>
+                  {row.candidates && row.candidates.length > 0 ? (
+                    <div className="flex min-w-40 flex-col gap-1">
+                      <Select
+                        value={choices[row.row] ?? ''}
+                        onValueChange={(value) => onChoose(row, value)}
+                        disabled={choosing}
+                      >
+                        <SelectTrigger className="h-7 px-2 text-xs" aria-label={`第 ${row.row} 行选择同名成员`}>
+                          <SelectValue placeholder={`${row.name ?? '同名'} · 选择成员`} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {row.candidates.map((candidate) => (
+                            <SelectItem key={candidate.userId} value={candidate.studentNo}>
+                              {candidate.studentNo} · {candidate.name}
+                              {candidate.grade != null ? ` · ${candidate.grade} 级` : ''}
+                              {candidate.displayName && candidate.displayName !== candidate.name ? `（${candidate.displayName}）` : ''}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <span className="text-destructive">姓名重复，需选择</span>
+                    </div>
+                  ) : (
+                    <>
+                      <span className="block">
+                        {row.memberName ?? row.name ?? '—'}
+                        {row.matchSource === 'name' && <SourceTag>姓名匹配</SourceTag>}
+                      </span>
+                      <span className="block text-muted-foreground tabular-nums">{row.studentNo || '—'}</span>
+                      {row.matchWarning && <span className="block text-warning-foreground">{row.matchWarning}</span>}
+                    </>
+                  )}
                 </TableCell>
                 <TableCell
                   className="py-1.5 text-xs tabular-nums"

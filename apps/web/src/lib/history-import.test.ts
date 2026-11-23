@@ -28,7 +28,22 @@ describe('历史积分 Excel 解析', () => {
 
   it('逐项列出行内错误', () => {
     const [row] = parseHistoryRows([{ 学号: '', 积分: 'abc', 类别: '未知', 活动名称: 'A', 活动日期: '2025-02-30' }]);
-    expect(row?.error).toBe('缺少学号；参与分需为数字；类别「未知」无法识别；活动名称至少 2 个字；活动日期格式无效');
+    expect(row?.error).toBe('学号与姓名至少填写一项；参与分需为数字；类别「未知」无法识别；活动名称至少 2 个字；活动日期格式无效');
+  });
+
+  it('学号与姓名二选一：只有姓名也能解析，同时填写时保留核对信息', () => {
+    const rows = parseHistoryRows([
+      { 姓名: '张三', 活动名称: '按姓名导入例会', 活动日期: '2025-03-08', 活动类型: '例会' },
+      { 学号: '202400002', 姓名: '李四', 活动名称: '双字段导入例会', 活动日期: '2025-03-08', 活动类型: '例会' },
+      { 学号: 'bad no', 姓名: '王五', 活动名称: '学号非法例会', 活动日期: '2025-03-08', 活动类型: '例会' },
+      { 活动名称: '两边都空例会', 活动日期: '2025-03-08', 活动类型: '例会' },
+    ]);
+    expect(rows[0]).toMatchObject({ studentNo: '', name: '张三' });
+    expect(rows[0]?.error).toBeUndefined();
+    expect(rows[1]).toMatchObject({ studentNo: '202400002', name: '李四' });
+    expect(rows[1]?.error).toBeUndefined();
+    expect(rows[2]?.error).toBe('学号格式不合法');
+    expect(rows[3]?.error).toContain('学号与姓名至少填写一项');
   });
 
   it('平台比赛行：积分 / 名称 / 日期可留空，链接提取场次，类别默认比赛', () => {

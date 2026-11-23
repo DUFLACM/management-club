@@ -1,4 +1,5 @@
 import { DomainError } from '../../common/domain-error.js'
+import type { Prisma } from '@acm/db'
 import { Inject, Injectable } from '@nestjs/common'
 import {
   buildSourceKey,
@@ -45,6 +46,37 @@ export const ledgerEntrySchema = z.object({
   evidenceRef: z.string().max(500).optional(),
   idempotencyKey: z.string().min(8).max(120).optional(),
 })
+
+interface MemberOption {
+  userId: string
+  studentNo: string
+  name: string
+  displayName: string | null
+  grade: number | null
+}
+
+export interface MemberQueryResult {
+  query: string
+  match: MemberOption | null
+  candidates: MemberOption[]
+  error?: string
+}
+
+function memberOption(user: {
+  id: string
+  studentNo: string
+  verifiedRealName: string
+  grade: number | null
+  profile: { displayName: string | null } | null
+}): MemberOption {
+  return {
+    userId: user.id,
+    studentNo: user.studentNo,
+    name: user.verifiedRealName,
+    displayName: user.profile?.displayName ?? null,
+    grade: user.grade,
+  }
+}
 
 @Injectable()
 export class ScoringService {
@@ -189,11 +221,14 @@ export class ScoringService {
    * 积分入账（审核通过后调用）：幂等（source_key 唯一 approved + idempotencyKey）；
    * 同来源重复入账直接返回原记录；不可静默覆盖。
    */
-  /** 批量手动入账：粘贴/导入行（学号+分数+备注），逐行解析成员并按批次幂等入账 */
+  /**
+   * 批量手动入账：粘贴/导入行（学号或姓名 + 分数 + 备注），逐行解析成员并按批次幂等入账。
+   * 同名多人时不会猜测，返回失败并提示改用学号；前端核对接口会先让管理员选择。
+   */
   async batchPostEntries(
     actor: SessionActor,
     input: {
-      rows: Array<{ studentNo: string; amount: string; note?: string }>;
+      rows: Array<{ studentNo?: string; name?: string; amount: string; note?: string }>;
       category: string;
       activityId?: string;
       scoreMonth?: string;
@@ -212,14 +247,25 @@ export class ScoringService {
       if (!activity) throw new ScoringError('关联活动不存在', 'NOT_FOUND')
       activityTitle = activity.title
     }
+    const identifiers = [...new Set(input.rows.flatMap((row) => [row.studentNo, row.name]).filter((value): value is string => Boolean(value)))]
+    const { byStudentNo, byName } = await this.loadMembersByIdentifiers(identifiers)
     const batchId = newId()
     const failed: Array<{ studentNo: string; error: string }> = []
     let posted = 0
     let deduplicated = 0
     for (const row of input.rows) {
-      const user = await this.db.user.findUnique({ where: { studentNo: row.studentNo }, select: { id: true } })
+      const label = row.studentNo ?? row.name ?? ''
+      let user = row.studentNo ? byStudentNo.get(row.studentNo) : undefined
+      if (!user && row.name) {
+        const matches = byName.get(row.name) ?? []
+        if (matches.length === 1) user = matches[0]
+        else if (matches.length > 1) {
+          failed.push({ studentNo: label, error: `姓名「${row.name}」对应 ${matches.length} 位成员，请改用学号或在核对表中先选择` })
+          continue
+        }
+      }
       if (!user) {
-        failed.push({ studentNo: row.studentNo, error: '成员不存在（学号未注册）' })
+        failed.push({ studentNo: label, error: '成员不存在（学号 / 姓名未匹配）' })
         continue
       }
       try {
@@ -234,10 +280,52 @@ export class ScoringService {
         if (result.deduplicated) deduplicated++
         else posted++
       } catch (error) {
-        failed.push({ studentNo: row.studentNo, error: error instanceof Error ? error.message : '入账失败' })
+        failed.push({ studentNo: label, error: error instanceof Error ? error.message : '入账失败' })
       }
     }
     return { batchId, scoreMonth, posted, deduplicated, failed }
+  }
+
+  /** 批量核对成员：输入学号或姓名，返回唯一匹配 / 同名候选 / 未找到 */
+  async resolveMemberQueries(queries: string[]): Promise<MemberQueryResult[]> {
+    const unique = [...new Set(queries.map((query) => query.trim()).filter(Boolean))]
+    const { byStudentNo, byName } = await this.loadMembersByIdentifiers(unique)
+    return unique.map((query) => {
+      const byNo = byStudentNo.get(query)
+      if (byNo) return { query, match: memberOption(byNo), candidates: [] }
+      const matches = byName.get(query) ?? []
+      if (matches.length === 1) return { query, match: memberOption(matches[0]!), candidates: [] }
+      if (matches.length > 1) {
+        return {
+          query,
+          match: null,
+          candidates: matches.map(memberOption),
+          error: `姓名「${query}」对应 ${matches.length} 位成员，请选择具体成员`,
+        }
+      }
+      return { query, match: null, candidates: [], error: '未找到学号或姓名匹配的成员' }
+    })
+  }
+
+  private async loadMembersByIdentifiers(identifiers: string[]) {
+    const users = identifiers.length === 0 ? [] : await this.db.user.findMany({
+      where: { OR: [{ studentNo: { in: identifiers } }, { verifiedRealName: { in: identifiers } }] },
+      select: {
+        id: true,
+        studentNo: true,
+        verifiedRealName: true,
+        grade: true,
+        profile: { select: { displayName: true } },
+      },
+    })
+    const byStudentNo = new Map(users.map((user) => [user.studentNo, user]))
+    const byName = new Map<string, typeof users>()
+    for (const user of users) {
+      const list = byName.get(user.verifiedRealName) ?? []
+      list.push(user)
+      byName.set(user.verifiedRealName, list)
+    }
+    return { byStudentNo, byName }
   }
 
   async postLedgerEntry(actor: SessionActor | null, input: z.infer<typeof ledgerEntrySchema>): Promise<{ entryId: string; deduplicated: boolean }> {
@@ -281,70 +369,79 @@ export class ScoringService {
     reason: string,
     replacementAmount: string | null,
   ): Promise<{ reversalId: string; replacementId: string | null }> {
-    return this.db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM points_ledger WHERE id = ${entryId}::uuid FOR UPDATE`
-      const original = await tx.pointsLedgerEntry.findUnique({ where: { id: entryId } })
-      if (!original) throw new ScoringError('原始记录不存在', 'NOT_FOUND')
-      if (original.status !== 'approved') throw new ScoringError('仅生效记录可冲正', 'STATE_INVALID')
-      const reversalId = newId()
+    return this.db.$transaction((tx) => this.reverseEntryTx(tx, actor, entryId, reason, replacementAmount))
+  }
+
+  /** 事务内的冲正，供撤回审核与独立冲正共用 */
+  private async reverseEntryTx(
+    tx: Prisma.TransactionClient,
+    actor: SessionActor,
+    entryId: string,
+    reason: string,
+    replacementAmount: string | null,
+  ): Promise<{ reversalId: string; replacementId: string | null }> {
+    await tx.$executeRaw`SELECT id FROM points_ledger WHERE id = ${entryId}::uuid FOR UPDATE`
+    const original = await tx.pointsLedgerEntry.findUnique({ where: { id: entryId } })
+    if (!original) throw new ScoringError('原始记录不存在', 'NOT_FOUND')
+    if (original.status !== 'approved') throw new ScoringError('仅生效记录可冲正', 'STATE_INVALID')
+    const reversalId = newId()
+    await tx.pointsLedgerEntry.create({
+      data: {
+        id: reversalId,
+        userId: original.userId,
+        sourceKey: `${original.sourceKey}:reversal:${Date.now()}`,
+        category: 'reversal',
+        amount: original.amount.neg().toFixed(10),
+        scoreMonth: original.scoreMonth,
+        recordedAt: new Date(),
+        status: 'approved',
+        ruleVersionId: original.ruleVersionId,
+        detail: { reason, originalEntryId: entryId } as never,
+        reversesEntryId: entryId,
+        reversalReason: reason,
+        approvedBy: actor.principalId,
+        idempotencyKey: `reversal:${entryId}`,
+      },
+    })
+    await tx.pointsLedgerEntry.update({
+      where: { id: entryId },
+      data: { status: 'reversed', reversalReason: reason },
+    })
+    let replacementId: string | null = null
+    if (replacementAmount != null) {
+      replacementId = newId()
       await tx.pointsLedgerEntry.create({
         data: {
-          id: reversalId,
+          id: replacementId,
           userId: original.userId,
-          sourceKey: `${original.sourceKey}:reversal:${Date.now()}`,
-          category: 'reversal',
-          amount: original.amount.neg().toFixed(10),
+          sourceKey: `${original.sourceKey}:replacement:${Date.now()}`,
+          category: original.category,
+          amount: replacementAmount,
           scoreMonth: original.scoreMonth,
           recordedAt: new Date(),
           status: 'approved',
           ruleVersionId: original.ruleVersionId,
-          detail: { reason, originalEntryId: entryId } as never,
-          reversesEntryId: entryId,
-          reversalReason: reason,
+          detail: { reason, replacesEntryId: entryId } as never,
           approvedBy: actor.principalId,
-          idempotencyKey: `reversal:${entryId}`,
+          idempotencyKey: `replacement:${entryId}:${replacementAmount}`,
         },
       })
       await tx.pointsLedgerEntry.update({
         where: { id: entryId },
-        data: { status: 'reversed', reversalReason: reason },
+        data: { replacedByEntryId: replacementId },
       })
-      let replacementId: string | null = null
-      if (replacementAmount != null) {
-        replacementId = newId()
-        await tx.pointsLedgerEntry.create({
-          data: {
-            id: replacementId,
-            userId: original.userId,
-            sourceKey: `${original.sourceKey}:replacement:${Date.now()}`,
-            category: original.category,
-            amount: replacementAmount,
-            scoreMonth: original.scoreMonth,
-            recordedAt: new Date(),
-            status: 'approved',
-            ruleVersionId: original.ruleVersionId,
-            detail: { reason, replacesEntryId: entryId } as never,
-            approvedBy: actor.principalId,
-            idempotencyKey: `replacement:${entryId}:${replacementAmount}`,
-          },
-        })
-        await tx.pointsLedgerEntry.update({
-          where: { id: entryId },
-          data: { replacedByEntryId: replacementId },
-        })
-      }
-      await tx.auditLog.create({
-        data: {
-          id: newId(),
-          actorPrincipalId: actor.principalId,
-          action: 'points.reverse',
-          resourceType: 'points_ledger',
-          resourceId: entryId,
-          summary: `冲正 ${original.amount}（${reason}）${replacementAmount != null ? `，替代 ${replacementAmount}` : ''}`,
-        },
-      })
-      return { reversalId, replacementId }
+    }
+    await tx.auditLog.create({
+      data: {
+        id: newId(),
+        actorPrincipalId: actor.principalId,
+        action: 'points.reverse',
+        resourceType: 'points_ledger',
+        resourceId: entryId,
+        summary: `冲正 ${original.amount}（${reason}）${replacementAmount != null ? `，替代 ${replacementAmount}` : ''}`,
+      },
     })
+    return { reversalId, replacementId }
   }
 
   /** 本人流水（含冲正历史） */
@@ -629,6 +726,111 @@ export class ScoringService {
       },
     })
     return { claimId: id }
+  }
+
+  /**
+   * 贡献申报审核：只允许从待审核 / 待补充 / 被驳回进入新状态。
+   * 通过并填分值时入账；重复点击或已被他人处理会返回 decided=false，不重复入账。
+   */
+  async decideClaim(
+    actor: SessionActor,
+    claimId: string,
+    decision: 'approve' | 'reject' | 'more_info',
+    note: string | undefined,
+    amount: string | undefined,
+  ): Promise<{ decided: boolean; reason?: string }> {
+    const claim = await this.db.pointsClaim.findUnique({ where: { id: claimId } })
+    if (!claim) return { decided: false, reason: '申报不存在' }
+    if (claim.status === 'approved') {
+      return { decided: false, reason: '该申报已通过；如需修改请先在「已处理」里撤回审核' }
+    }
+    const reviewedAt = new Date()
+    const updated = await this.db.pointsClaim.updateMany({
+      where: { id: claimId, status: { in: ['pending', 'more_info', 'rejected'] } },
+      data: {
+        status: decision === 'approve' ? 'approved' : decision === 'reject' ? 'rejected' : 'more_info',
+        reviewNote: note ?? null,
+        reviewedBy: actor.principalId,
+        reviewedAt,
+      },
+    })
+    if (updated.count !== 1) {
+      return { decided: false, reason: '申报已被其他管理员处理，请刷新后再试' }
+    }
+    if (decision === 'approve' && amount) {
+      try {
+        await this.postLedgerEntry(actor, {
+          userId: claim.userId,
+          sourceKey: `contribution:${claim.userId}:${claim.id}`,
+          category: claim.category === 'award' ? 'award' : 'contribution',
+          amount,
+          scoreMonth: claim.scoreMonth,
+          detail: { claimId: claim.id, title: claim.title },
+          evidenceRef: `claim:${claim.id}`,
+          // 撤回后再次通过要生成新的幂等键；旧流水已被冲正
+          idempotencyKey: `claim:${claim.id}:${newId()}`,
+        })
+      } catch (error) {
+        await this.db.pointsClaim.updateMany({
+          where: { id: claimId, status: 'approved', reviewedAt },
+          data: { status: 'pending', reviewedBy: null, reviewedAt: null },
+        })
+        throw error
+      }
+    }
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'points.claim_decision',
+      resourceType: 'points_claim',
+      resourceId: claimId,
+      summary: `贡献申报「${claim.title}」${decision === 'approve' ? '通过' : decision === 'reject' ? '驳回' : '要求补充材料'}${amount ? `，入账 ${amount}` : ''}`,
+    })
+    return { decided: true }
+  }
+
+  /**
+   * 撤回审核：已通过的申报先把对应流水冲正，再把申报退回待审核。
+   * 冲正与状态回退在同一事务内；退回后可重新审核，重新通过会生成新的入账记录。
+   */
+  async withdrawClaimDecision(
+    actor: SessionActor,
+    claimId: string,
+    reason: string,
+  ): Promise<{ withdrawn: boolean; reversedEntryId: string | null }> {
+    return this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM points_claims WHERE id = ${claimId}::uuid FOR UPDATE`
+      const claim = await tx.pointsClaim.findUnique({ where: { id: claimId } })
+      if (!claim) throw new ScoringError('申报不存在', 'NOT_FOUND')
+      if (claim.status === 'pending') throw new ScoringError('该申报尚未审核，无需撤回', 'STATE_INVALID')
+      let reversedEntryId: string | null = null
+      if (claim.status === 'approved') {
+        const entry = await tx.pointsLedgerEntry.findFirst({
+          where: { sourceKey: `contribution:${claim.userId}:${claim.id}`, status: 'approved' },
+          orderBy: { createdAt: 'desc' },
+          select: { id: true },
+        })
+        if (entry) {
+          await this.reverseEntryTx(tx, actor, entry.id, `撤回审核：${reason}`, null)
+          reversedEntryId = entry.id
+        }
+      }
+      await tx.pointsClaim.update({
+        where: { id: claimId },
+        data: { status: 'pending', reviewedBy: null, reviewedAt: null, reviewNote: null },
+      })
+      await tx.auditLog.create({
+        data: {
+          id: newId(),
+          actorPrincipalId: actor.principalId,
+          action: 'points.claim_withdraw',
+          resourceType: 'points_claim',
+          resourceId: claimId,
+          summary: `撤回贡献申报「${claim.title}」的审核结果${reversedEntryId ? '，并冲正已入账流水' : ''}（${reason}）`,
+          reason,
+        },
+      })
+      return { withdrawn: true, reversedEntryId }
+    })
   }
 
   /** 审核复核案件：单人裁决即结案（通过 / 驳回），more_info 只记录意见不结案 */

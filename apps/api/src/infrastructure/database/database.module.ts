@@ -1,4 +1,4 @@
-import { Global, Injectable, Module, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common'
+import { Global, Inject, Injectable, Module, type OnApplicationBootstrap, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common'
 import { PrismaClient } from '@acm/db'
 import { loadEnv } from '../../config/env.js'
 
@@ -20,9 +20,44 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
   }
 }
 
+/**
+ * 启动时检查新增功能依赖的表是否已迁移。
+ * 只做提示，不阻断启动：旧库升级时公告等功能由迁移补齐，API/Worker 其余能力不受影响。
+ * 结果缓存为状态位，避免迁移缺失时每个请求都打到数据库并刷错误日志。
+ */
+@Injectable()
+export class SchemaStateService implements OnApplicationBootstrap {
+  announcementsReady = true
+
+  constructor(@Inject(PrismaService) private readonly db: PrismaService) {}
+
+  async onApplicationBootstrap(): Promise<void> {
+    try {
+      const rows = await this.db.$queryRaw<Array<{ present: boolean }>>`
+        SELECT to_regclass('public.announcements') IS NOT NULL AS present
+      `
+      this.announcementsReady = rows[0]?.present !== false
+      if (!this.announcementsReady) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[schema] 数据库缺少 announcements 表：公告接口不可用，成员端公告查询会返回空列表。' +
+            '请在服务器仓库执行 `pnpm db:migrate:deploy` 后重启 API（勿只重启进程）。',
+        )
+      }
+    } catch (error) {
+      // 数据库暂时不可用时由 Prisma 的常规连接错误处理；这里不吞掉真实故障
+      // eslint-disable-next-line no-console
+      console.error('[schema] 无法检查数据库迁移状态：', error instanceof Error ? error.message : error)
+    }
+  }
+}
+
 @Global()
 @Module({
-  providers: [{ provide: PrismaService, useFactory: () => new PrismaService() }],
-  exports: [PrismaService],
+  providers: [
+    { provide: PrismaService, useFactory: () => new PrismaService() },
+    SchemaStateService,
+  ],
+  exports: [PrismaService, SchemaStateService],
 })
 export class DatabaseModule {}

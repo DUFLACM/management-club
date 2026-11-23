@@ -1,13 +1,13 @@
 /**
  * 管理端 · 积分审核（points.review / points.propose / claims.review）。
- * - 审核队列 GET /admin/reviews（cases / claims / appeals 三 Tab，宽屏左右分栏队列+详情）；
- * - claims 决定 POST /admin/claims/:id/decision；
+ * - 审核队列 GET /admin/reviews（待审申报 / 已处理 / 申诉 / 复核案件，宽屏左右分栏队列+详情）；
+ * - claims 决定 POST /admin/claims/:id/decision；撤回 POST /admin/claims/:id/withdraw（已入账会同时冲正）；
  * - 复核投票 POST /admin/reviews/:id/votes；
  * - 入账 POST /admin/ledger-entries（sourceKey 幂等）；冲正 POST /admin/ledger-entries/:id/reverse；
  * - 月度批次 POST /admin/scoring-batches（blocked=R01 提示）；
  * - 公示 POST /admin/disclosures（48h 校验错误显示）+ GET /admin/disclosures 列表。
  */
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { BookOpenIcon, ClipboardListIcon, CoinsIcon, HistoryIcon, LoaderCircleIcon, RotateCcwIcon } from 'lucide-react';
 
@@ -58,8 +58,26 @@ interface ClaimDto {
   scoreMonth: string;
   createdAt: string;
   evidenceNote: string | null;
+  reviewNote: string | null;
+  reviewedAt: string | null;
   assets: Array<{ assetId: string }>;
   user: { verifiedRealName: string | null; studentNo: string | null } | null;
+}
+
+interface ProcessedClaimDto extends ClaimDto {
+  ledgerEntry: {
+    id: string;
+    amount: string | number;
+    scoreMonth: string;
+    recordedAt: string;
+  } | null;
+}
+
+interface ReviewQueueDto {
+  cases: ReviewCaseDto[];
+  claims: ClaimDto[];
+  appeals: AppealDto[];
+  processedClaims: ProcessedClaimDto[];
 }
 
 /** 佐证图读取入口：thumb 供列表缩略，full 为原图（已剥除 EXIF/GPS） */
@@ -94,6 +112,29 @@ const CATEGORY_LABELS: Record<string, string> = {
   award: '奖项',
 };
 
+const CLAIM_STATUS_LABELS: Record<string, string> = {
+  pending: '待审核',
+  more_info: '待补充',
+  approved: '已通过',
+  rejected: '已驳回',
+};
+
+function ClaimStatusTag({ status }: { status: string }) {
+  const tone =
+    status === 'approved'
+      ? 'bg-success-subtle text-success-foreground'
+      : status === 'rejected'
+        ? 'bg-destructive-subtle text-destructive'
+        : status === 'more_info'
+          ? 'bg-warning-subtle text-warning-foreground'
+          : 'bg-info-subtle text-info-foreground';
+  return (
+    <span className={`rounded-sm px-1.5 py-0.5 text-xs font-medium ${tone}`}>
+      {CLAIM_STATUS_LABELS[status] ?? status}
+    </span>
+  );
+}
+
 export default function PointsPanel() {
   const principal = usePrincipal();
   return (
@@ -114,12 +155,10 @@ function PointsBody({ principalId }: { principalId: string }) {
   const [queueNotice, setQueueNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
 
   const queueQuery = usePrivateQuery<
-    { cases: ReviewCaseDto[]; claims: ClaimDto[]; appeals: AppealDto[] },
+    ReviewQueueDto,
     ApiError
   >(principalId, ['admin', 'reviews', 'queue'], async () => {
-    const { data } = await api.get<{ cases: ReviewCaseDto[]; claims: ClaimDto[]; appeals: AppealDto[] }>(
-      '/admin/reviews',
-    );
+    const { data } = await api.get<ReviewQueueDto>('/admin/reviews');
     return data;
   });
 
@@ -167,7 +206,7 @@ function PointsBody({ principalId }: { principalId: string }) {
     <div className="flex flex-col gap-4">
       <PanelHeader
         title="积分审核"
-        description="贡献申报、申诉与复核案件；入账/冲正与月度公示。"
+        description="贡献申报、申诉与复核案件；通过的申报可在「已处理」撤回，入账/冲正与月度公示。"
         actions={
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={() => setEntryOpen(true)}>
@@ -203,12 +242,20 @@ function PointsBody({ principalId }: { principalId: string }) {
           <Tabs value={tab} onValueChange={setTab}>
             <TabsList aria-label="审核队列">
               <TabsTrigger value="claims">贡献申报（{queue.claims.length}）</TabsTrigger>
+              <TabsTrigger value="processed">已处理（{queue.processedClaims.length}）</TabsTrigger>
               <TabsTrigger value="appeals">申诉（{queue.appeals.length}）</TabsTrigger>
               <TabsTrigger value="cases">复核案件（{queue.cases.length}）</TabsTrigger>
             </TabsList>
             <TabsContent value="claims" className="mt-4">
               <ClaimsQueue
                 claims={queue.claims}
+                onNotice={setQueueNotice}
+                onHandled={invalidateQueue}
+              />
+            </TabsContent>
+            <TabsContent value="processed" className="mt-4">
+              <ProcessedClaimsQueue
+                claims={queue.processedClaims}
                 onNotice={setQueueNotice}
                 onHandled={invalidateQueue}
               />
@@ -319,7 +366,7 @@ function ClaimsQueue({
         onNotice({ tone: 'error', text: result.reason ?? '未能处理该申报。' });
         return;
       }
-      onNotice({ tone: 'info', text: '申报已处理；通过且填写分值时已同时入账。' });
+      onNotice({ tone: 'info', text: '申报已处理；通过且填写分值时已同时入账。需要撤销时到「已处理」里撤回。' });
       onHandled();
       setSelectedId(null);
       setNote('');
@@ -351,6 +398,7 @@ function ClaimsQueue({
                   <span className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium text-foreground">{claim.title}</span>
                     <BadgeOfCategory category={claim.category} />
+                    {claim.status === 'more_info' && <ClaimStatusTag status={claim.status} />}
                     {claim.assets.length > 0 && (
                       <span className="rounded-sm bg-muted px-1.5 py-0.5 text-xs text-foreground/80 tabular-nums">
                         {claim.assets.length} 图
@@ -378,6 +426,11 @@ function ClaimsQueue({
               {CATEGORY_LABELS[selected.category] ?? selected.category} · 记分月份{' '}
               <span className="tabular-nums">{selected.scoreMonth}</span>
             </p>
+            {selected.status === 'more_info' && selected.reviewNote && (
+              <p className="rounded-md bg-warning-subtle px-2.5 py-2 text-xs leading-5 text-warning-foreground">
+                上次审核要求补充：{selected.reviewNote}
+              </p>
+            )}
             {selected.evidenceNote && (
               <p className="text-sm leading-[22px] break-words text-foreground/90">
                 <span className="text-muted-foreground">佐证说明：</span>
@@ -464,6 +517,152 @@ function BadgeOfCategory({ category }: { category: string }) {
     <span className="rounded-sm bg-muted px-1.5 py-0.5 text-xs text-foreground/80">
       {CATEGORY_LABELS[category] ?? category}
     </span>
+  );
+}
+
+function ProcessedClaimsQueue({
+  claims,
+  onNotice,
+  onHandled,
+}: {
+  claims: ProcessedClaimDto[];
+  onNotice: (notice: { tone: 'info' | 'error'; text: string } | null) => void;
+  onHandled: () => void;
+}) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [reason, setReason] = useState('');
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: async (claimId: string) => {
+      const { data } = await api.post<{ withdrawn: boolean; reversedEntryId: string | null }>(
+        `/admin/claims/${claimId}/withdraw`,
+        { reason: reason.trim() },
+      );
+      return data;
+    },
+    onSuccess: (result) => {
+      onNotice({
+        tone: 'info',
+        text: result.reversedEntryId
+          ? '已撤回审核，原入账分值已自动冲正；申报回到待审核。'
+          : '已撤回审核；申报回到待审核。',
+      });
+      setConfirmId(null);
+      setReason('');
+      setSelectedId(null);
+      onHandled();
+    },
+    onError: (error: ApiError) => onNotice({ tone: 'error', text: error.message }),
+  });
+
+  if (claims.length === 0) {
+    return <EmptyState kind="empty" description="还没有已处理的贡献申报。" />;
+  }
+  const selected = claims.find((claim) => claim.id === selectedId) ?? claims[0] ?? null;
+
+  return (
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <Card>
+        <CardContent className="p-0">
+          <ul className="flex flex-col divide-y divide-border">
+            {claims.map((claim) => (
+              <li key={claim.id}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedId(claim.id);
+                    setConfirmId(null);
+                    setReason('');
+                  }}
+                  aria-pressed={claim.id === selected?.id}
+                  className={`flex w-full flex-col gap-1 p-4 text-left hover:bg-muted/40 ${
+                    claim.id === selected?.id ? 'bg-info-subtle' : ''
+                  }`}
+                >
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium text-foreground">{claim.title}</span>
+                    <ClaimStatusTag status={claim.status} />
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    {claim.user?.verifiedRealName ?? '—'} · {claim.user?.studentNo ?? '—'} ·{' '}
+                    {claim.reviewedAt ? formatDateTime(claim.reviewedAt) : formatDateTime(claim.createdAt)}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </CardContent>
+      </Card>
+      {selected && (
+        <Card>
+          <CardContent className="flex flex-col gap-3 p-5">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-sm font-semibold text-foreground">{selected.title}</h3>
+              <ClaimStatusTag status={selected.status} />
+            </div>
+            <p className="text-sm leading-[22px] whitespace-pre-wrap text-foreground/90">
+              {selected.description}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {CATEGORY_LABELS[selected.category] ?? selected.category} · 记分月份{' '}
+              <span className="tabular-nums">{selected.scoreMonth}</span>
+              {selected.reviewedAt && ` · 处理于 ${formatDateTime(selected.reviewedAt)}`}
+            </p>
+            {selected.reviewNote && (
+              <p className="rounded-md bg-muted px-2.5 py-2 text-xs leading-5 text-foreground/80">
+                审核备注：{selected.reviewNote}
+              </p>
+            )}
+            {selected.ledgerEntry ? (
+              <p className="rounded-md bg-success-subtle px-2.5 py-2 text-xs leading-5 text-success-foreground">
+                已入账 {Number(selected.ledgerEntry.amount)} 分 · {selected.ledgerEntry.scoreMonth} ·{' '}
+                {formatDateTime(selected.ledgerEntry.recordedAt)}
+                <span className="mt-0.5 block break-all text-[11px] opacity-80">
+                  流水 {selected.ledgerEntry.id}
+                </span>
+              </p>
+            ) : (
+              <p className="rounded-md bg-muted px-2.5 py-2 text-xs leading-5 text-muted-foreground">
+                当前没有生效的入账记录（通过时未填分值，或流水已被冲正）。
+              </p>
+            )}
+            <div className="grid gap-1.5">
+              <Label htmlFor="withdraw-reason">撤回原因（3-500 字）</Label>
+              <Textarea
+                id="withdraw-reason"
+                value={reason}
+                onChange={(event) => {
+                  setReason(event.target.value);
+                  setConfirmId(null);
+                }}
+                rows={2}
+                maxLength={500}
+                placeholder="如：佐证材料与申报人不符 / 分值填错"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                variant={confirmId === selected.id ? 'destructive' : 'outline'}
+                disabled={mutation.isPending || reason.trim().length < 3}
+                onClick={() => {
+                  if (confirmId === selected.id) mutation.mutate(selected.id);
+                  else setConfirmId(selected.id);
+                }}
+              >
+                {mutation.isPending && mutation.variables === selected.id && (
+                  <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                )}
+                {confirmId === selected.id ? '确认撤回审核' : '撤回审核'}
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                撤回后申报回到待审核；已入账分值会生成冲正记录，不会直接删除。
+              </span>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
   );
 }
 
@@ -649,13 +848,29 @@ function CasesQueue({
 }
 
 interface ParsedBatchRow {
-  studentNo: string;
+  /** 学号或姓名 */
+  query: string;
   amount: string;
   note?: string;
   error?: string;
 }
 
-/** 解析粘贴/CSV 行：`学号 分数 备注`，分隔符支持逗号（中英）、Tab、空白 */
+interface BatchMemberOption {
+  userId: string;
+  studentNo: string;
+  name: string;
+  displayName: string | null;
+  grade: number | null;
+}
+
+interface BatchMemberResolution {
+  query: string;
+  match: BatchMemberOption | null;
+  candidates: BatchMemberOption[];
+  error?: string;
+}
+
+/** 解析粘贴/CSV 行：`学号或姓名 分数 备注`，分隔符支持逗号（中英）、Tab、空白 */
 function parseBatchRows(text: string): ParsedBatchRow[] {
   return text
     .split(/\r?\n/)
@@ -664,12 +879,12 @@ function parseBatchRows(text: string): ParsedBatchRow[] {
     .slice(0, 200)
     .map((line) => {
       const parts = line.split(/[\t,，;；]+|\s+/).filter((part) => part !== '');
-      const studentNo = parts[0] ?? '';
+      const query = parts[0] ?? '';
       const amount = parts[1] ?? '';
       const note = parts.slice(2).join(' ') || undefined;
-      if (studentNo.length < 3) return { studentNo, amount, note, error: '学号无效' };
-      if (!/^-?\d+(\.\d+)?$/.test(amount)) return { studentNo, amount, note, error: '分数需为十进制数字（可负）' };
-      return { studentNo, amount, note };
+      if (query.length < 2) return { query, amount, note, error: '学号或姓名至少 2 个字符' };
+      if (!/^-?\d+(\.\d+)?$/.test(amount)) return { query, amount, note, error: '分数需为十进制数字（可负）' };
+      return { query, amount, note };
     });
 }
 
@@ -690,6 +905,9 @@ function BatchLedgerDialog({
   const [rawText, setRawText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ posted: number; deduplicated: number; failed: Array<{ studentNo: string; error: string }> } | null>(null);
+  /** 同名候选：输入值 → 选定的学号 */
+  const [memberChoices, setMemberChoices] = useState<Record<string, string>>({});
+  const [debouncedQueries, setDebouncedQueries] = useState<string[]>([]);
 
   const activitiesQuery = usePrivateQuery<Array<{ id: string; title: string; status: string }>, ApiError>(
     principalId,
@@ -702,13 +920,57 @@ function BatchLedgerDialog({
   const parsed = parseBatchRows(rawText);
   const validRows = parsed.filter((row) => !row.error);
   const invalidRows = parsed.filter((row) => row.error);
+  const identifierKey = [...new Set(validRows.map((row) => row.query))].sort().join('\u0000');
+
+  // 输入停顿后再核对，避免每敲一个字都请求；学号或姓名都可作为输入
+  useEffect(() => {
+    if (!open) {
+      setDebouncedQueries([]);
+      return;
+    }
+    const timer = setTimeout(() => {
+      setDebouncedQueries(identifierKey ? identifierKey.split('\u0000') : []);
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [identifierKey, open]);
+
+  const resolveQuery = usePrivateQuery<BatchMemberResolution[], ApiError>(
+    principalId,
+    ['admin', 'members', 'resolve', debouncedQueries.join('\u0000')],
+    async () => (await api.post<BatchMemberResolution[]>('/admin/members/resolve', { queries: debouncedQueries })).data,
+    { enabled: open && debouncedQueries.length > 0, staleTime: 0 },
+  );
+  const resolutionByQuery = new Map((resolveQuery.data ?? []).map((item) => [item.query, item]));
+  const checking = resolveQuery.isFetching || identifierKey !== debouncedQueries.join('\u0000');
+
+  const resolveBatchRow = (row: ParsedBatchRow): { studentNo: string | null; member: BatchMemberOption | null; error?: string } => {
+    if (row.error) return { studentNo: null, member: null, error: row.error };
+    const resolution = resolutionByQuery.get(row.query);
+    if (!resolution) {
+      return { studentNo: null, member: null, error: resolveQuery.isError ? '成员核对失败' : '核对中…' };
+    }
+    if (resolution.match) return { studentNo: resolution.match.studentNo, member: resolution.match };
+    const chosen = memberChoices[row.query];
+    if (chosen) {
+      return {
+        studentNo: chosen,
+        member: resolution.candidates.find((candidate) => candidate.studentNo === chosen) ?? null,
+      };
+    }
+    return { studentNo: null, member: null, error: resolution.error ?? '待选择成员' };
+  };
+  const readyRows = validRows.filter((row) => resolveBatchRow(row).studentNo != null);
 
   const mutation = useMutation({
     mutationFn: async () => {
       const { data } = await api.post<{ batchId: string; posted: number; deduplicated: number; failed: Array<{ studentNo: string; error: string }> }>(
         '/admin/ledger-entries/batch',
         {
-          rows: validRows.map((row) => ({ studentNo: row.studentNo, amount: row.amount, note: row.note })),
+          rows: validRows.map((row) => ({
+            studentNo: resolveBatchRow(row).studentNo!,
+            amount: row.amount,
+            note: row.note,
+          })),
           category,
           scoreMonth,
           ...(activityId !== 'none' ? { activityId } : {}),
@@ -720,6 +982,7 @@ function BatchLedgerDialog({
       setResult({ posted: data.posted, deduplicated: data.deduplicated, failed: data.failed });
       setError(null);
       setRawText('');
+      setMemberChoices({});
       void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
     },
     onError: (cause: ApiError) => {
@@ -734,8 +997,9 @@ function BatchLedgerDialog({
         <DialogHeader>
           <DialogTitle>批量加分</DialogTitle>
           <DialogDescription>
-            每行一条：`学号 分数 备注`（分隔符支持逗号 / Tab / 空格，最多 200 行）；
-            关联活动后成员端活动详情会显示本次积分。同一批次内按学号幂等，重复提交整批不重复入账。
+            每行一条：`学号或姓名 分数 备注`（二选一即可，分隔符支持逗号 / Tab / 空格，最多 200 行）。
+            只有姓名且同名多人时，会在下方核对表里请你选择具体成员；关联活动后成员端活动详情会显示本次积分。
+            同一批次内按成员幂等，重复提交整批不重复入账。
           </DialogDescription>
         </DialogHeader>
         {error && (
@@ -803,7 +1067,7 @@ function BatchLedgerDialog({
           </div>
         </div>
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="batch-raw">粘贴名单（学号 分数 备注）</Label>
+          <Label htmlFor="batch-raw">粘贴名单（学号或姓名 分数 备注）</Label>
           <Textarea
             id="batch-raw"
             value={rawText}
@@ -812,7 +1076,7 @@ function BatchLedgerDialog({
               setResult(null);
             }}
             rows={6}
-            placeholder={'202600001 12 周赛到场\n202600002 8.5 周赛到场'}
+            placeholder={'202600001 12 周赛到场\n张三 8.5 周赛到场'}
             className="font-mono text-xs"
           />
           <div className="flex items-center justify-between text-xs text-muted-foreground">
@@ -839,38 +1103,86 @@ function BatchLedgerDialog({
               />
             </label>
           </div>
+          {resolveQuery.isError && (
+            <Alert variant="destructive">
+              <AlertDescription>成员核对失败：{resolveQuery.error.message}</AlertDescription>
+            </Alert>
+          )}
           {parsed.length > 0 && (
-            <div className="max-h-40 overflow-y-auto rounded-lg border border-border">
+            <div className="max-h-52 overflow-y-auto rounded-lg border border-border">
               <Table>
                 <TableHeader>
                   <TableRow className="h-8">
-                    <TableHead className="pl-3 text-xs">学号</TableHead>
+                    <TableHead className="pl-3 text-xs">输入</TableHead>
+                    <TableHead className="text-xs">成员</TableHead>
                     <TableHead className="text-xs">分数</TableHead>
                     <TableHead className="pr-3 text-xs">备注 / 问题</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {parsed.map((row, index) => (
-                    <TableRow key={index} className={row.error ? 'bg-destructive-subtle/40' : undefined}>
-                      <TableCell className="py-1.5 pl-3 text-xs tabular-nums">{row.studentNo}</TableCell>
-                      <TableCell className="py-1.5 text-xs tabular-nums">{row.amount}</TableCell>
-                      <TableCell className="py-1.5 pr-3 text-xs text-muted-foreground">
-                        {row.error ? <span className="text-destructive">{row.error}</span> : row.note ?? '—'}
-                      </TableCell>
-                    </TableRow>
-                  ))}
+                  {parsed.map((row, index) => {
+                    const resolved = resolveBatchRow(row);
+                    const resolution = resolutionByQuery.get(row.query);
+                    const needsChoice = !row.error && !resolution?.match && (resolution?.candidates.length ?? 0) > 1;
+                    return (
+                      <TableRow key={index} className={row.error ? 'bg-destructive-subtle/40' : undefined}>
+                        <TableCell className="py-1.5 pl-3 text-xs">{row.query}</TableCell>
+                        <TableCell className="py-1.5 text-xs">
+                          {needsChoice ? (
+                            <div className="flex min-w-36 flex-col gap-1">
+                              <Select
+                                value={memberChoices[row.query] ?? ''}
+                                onValueChange={(value) => setMemberChoices((previous) => ({ ...previous, [row.query]: value }))}
+                                disabled={checking}
+                              >
+                                <SelectTrigger className="h-7 px-2 text-xs" aria-label={`第 ${index + 1} 行选择同名成员`}>
+                                  <SelectValue placeholder={`${row.query} · 选择成员`} />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {resolution?.candidates.map((candidate) => (
+                                    <SelectItem key={candidate.userId} value={candidate.studentNo}>
+                                      {candidate.studentNo} · {candidate.name}
+                                      {candidate.grade != null ? ` · ${candidate.grade} 级` : ''}
+                                      {candidate.displayName && candidate.displayName !== candidate.name ? `（${candidate.displayName}）` : ''}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              <span className="text-destructive">姓名重复，需选择</span>
+                            </div>
+                          ) : resolved.member ? (
+                            <>
+                              <span className="block">{resolved.member.name}</span>
+                              <span className="block text-muted-foreground tabular-nums">{resolved.member.studentNo}</span>
+                            </>
+                          ) : (
+                            <span className="text-muted-foreground">{checking ? '核对中…' : resolved.error ?? '—'}</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="py-1.5 text-xs tabular-nums">{row.amount}</TableCell>
+                        <TableCell className="py-1.5 pr-3 text-xs text-muted-foreground">
+                          {row.error ? <span className="text-destructive">{row.error}</span> : row.note ?? '—'}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
                 </TableBody>
               </Table>
             </div>
           )}
         </div>
-        <Button
-          disabled={mutation.isPending || validRows.length === 0}
-          onClick={() => mutation.mutate()}
-        >
-          {mutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
-          提交 {validRows.length} 条入账
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            disabled={mutation.isPending || checking || readyRows.length === 0 || readyRows.length !== validRows.length}
+            onClick={() => mutation.mutate()}
+          >
+            {mutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+            提交 {readyRows.length} 条入账
+          </Button>
+          {validRows.length > 0 && readyRows.length !== validRows.length && (
+            <span className="text-xs text-destructive">请先核对成员并处理同名选择</span>
+          )}
+        </div>
       </DialogContent>
     </Dialog>
   );

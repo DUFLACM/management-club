@@ -73,7 +73,9 @@ const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '活动日期格式�
 
 const baseRowSchema = z.object({
   row: z.number().int().min(1),
-  studentNo: z.string().min(1).max(64),
+  /** 学号与姓名至少填一项；同时填写时按学号匹配并核对姓名 */
+  studentNo: z.string().trim().min(1).max(64).optional(),
+  name: z.string().trim().min(1).max(64).optional(),
   category: z.enum(HISTORY_CATEGORIES),
   activityType: z.enum(HISTORY_ACTIVITY_TYPES).optional(),
   scoreMonth: z.string().regex(/^\d{4}-\d{2}$/).optional(),
@@ -108,12 +110,39 @@ export const historyExcelSchema = z.object({
     contestStartAt: z.string().datetime().optional(),
     contestEndAt: z.string().datetime().optional(),
   })
+    .refine((row) => Boolean(row.studentNo || row.name), { message: '学号与姓名至少填写一项', path: ['studentNo'] })
     .refine((row) => !row.platform || row.contestId, { message: '填写了平台就必须填写比赛场次', path: ['contestId'] })
     .refine((row) => row.amount != null || row.bonusAmount != null, { message: '参与分与加分不能都为空', path: ['amount'] })
     .refine((row) => (row.bonus == null) === (row.bonusAmount == null), { message: '加分项与加分须同时提供', path: ['bonusAmount'] }),
   ).min(1).max(2000),
 })
 export type HistoryExcelInput = z.infer<typeof historyExcelSchema>
+
+interface MemberCandidate {
+  userId: string
+  studentNo: string
+  name: string
+  displayName: string | null
+  grade: number | null
+}
+
+interface MemberMatch {
+  user: {
+    id: string
+    studentNo: string
+    verifiedRealName: string
+    grade: number | null
+    profile: { displayName: string | null } | null
+  }
+  /** 学号优先；姓名匹配用于模板里只有姓名的历史数据 */
+  matchSource: 'studentNo' | 'name'
+  warning?: string
+}
+
+/** 预览异常行带候选成员，前端让管理员在同名成员里选一个后再复核 */
+type MemberResolution =
+  | MemberMatch
+  | { error: string; candidates?: MemberCandidate[] }
 
 type RowOutcome = { row: number; studentNo: string; status: 'posted' | 'duplicate' | 'failed'; error?: string }
 
@@ -161,6 +190,70 @@ function findEntry(platform: string, entries: StandingsEntry[], handle: string):
 
 const ARCHIVE_NOTE = '历史积分导入存档：系统上线前的活动记录，仅用于展示积分来源，不开放报名与签到。'
 
+interface ImportMember {
+  id: string
+  studentNo: string
+  verifiedRealName: string
+  grade: number | null
+  profile: { displayName: string | null } | null
+}
+
+function candidateOf(user: ImportMember): MemberCandidate {
+  return {
+    userId: user.id,
+    studentNo: user.studentNo,
+    name: user.verifiedRealName,
+    displayName: user.profile?.displayName ?? null,
+    grade: user.grade,
+  }
+}
+
+/**
+ * 学号优先、姓名兜底：
+ * - 只填学号：按学号匹配；
+ * - 只填姓名：恰好一人时匹配，同名多人时返回候选让管理员选；
+ * - 两者都填：按学号匹配，并核对姓名是否一致。
+ */
+function resolveMember(
+  row: { studentNo?: string; name?: string },
+  byStudentNo: Map<string, ImportMember>,
+  byName: Map<string, ImportMember[]>,
+): MemberResolution {
+  const studentNo = row.studentNo?.trim()
+  const name = row.name?.trim()
+  if (studentNo) {
+    const user = byStudentNo.get(studentNo)
+    if (user) {
+      if (name && user.verifiedRealName !== name) {
+        return { error: `学号 ${studentNo} 与姓名「${name}」不一致（该学号为「${user.verifiedRealName}」）` }
+      }
+      return { user, matchSource: 'studentNo' }
+    }
+    if (!name) return { error: '成员不存在（学号未注册，可先在成员管理导入）' }
+  }
+  if (name) {
+    const matches = byName.get(name) ?? []
+    if (matches.length === 1) {
+      const user = matches[0]!
+      return {
+        user,
+        matchSource: 'name',
+        ...(studentNo ? { warning: `学号 ${studentNo} 未注册，已按姓名匹配到 ${user.studentNo}` } : {}),
+      }
+    }
+    if (matches.length > 1) {
+      return {
+        error: `姓名「${name}」对应 ${matches.length} 位成员，请选择具体成员（可改填学号）`,
+        candidates: matches.map(candidateOf),
+      }
+    }
+    if (matches.length === 0) {
+      return { error: studentNo ? `学号 ${studentNo} 未注册，且未找到姓名「${name}」的成员` : `未找到姓名「${name}」的成员` }
+    }
+  }
+  return { error: '学号与姓名至少填写一项' }
+}
+
 @Injectable()
 export class HistoryImportService {
   constructor(
@@ -171,21 +264,47 @@ export class HistoryImportService {
   ) {}
 
   /**
-   * 预览：核对学号；对平台比赛行抓取表格中出现的比赛榜单，按平台账号查成绩（表格留空用成员绑定账号），
+   * 按学号 / 姓名批量取成员，供预览与入账共用。
+   * 姓名只用于历史表格里没有学号的行；同名多人由预览返回候选，入账必须落到唯一学号。
+   */
+  private async loadMembers(rows: Array<{ studentNo?: string; name?: string }>) {
+    const studentNos = [...new Set(rows.map((row) => row.studentNo).filter((value): value is string => Boolean(value)))]
+    const names = [...new Set(rows.map((row) => row.name).filter((value): value is string => Boolean(value)))]
+    const users = studentNos.length === 0 && names.length === 0
+      ? []
+      : await this.db.user.findMany({
+        where: {
+          OR: [
+            ...(studentNos.length > 0 ? [{ studentNo: { in: studentNos } }] : []),
+            ...(names.length > 0 ? [{ verifiedRealName: { in: names } }] : []),
+          ],
+        },
+        select: {
+          id: true,
+          studentNo: true,
+          verifiedRealName: true,
+          grade: true,
+          profile: { select: { displayName: true } },
+          platformAccounts: { where: { status: { not: 'revoked' } }, select: { platform: true, externalId: true, status: true } },
+        },
+      })
+    const byStudentNo = new Map(users.map((user) => [user.studentNo, user]))
+    const byName = new Map<string, ImportMember[]>()
+    for (const user of users) {
+      const list = byName.get(user.verifiedRealName) ?? []
+      list.push(user)
+      byName.set(user.verifiedRealName, list)
+    }
+    return { users, byStudentNo, byName }
+  }
+
+  /**
+   * 预览：核对学号 / 姓名；对平台比赛行抓取表格中出现的比赛榜单，按平台账号查成绩（表格留空用成员绑定账号），
    * 积分留空的按 W 公式计算，比赛名称 / 日期留空的用平台元数据补全。不入账。
    */
   async preview(input: HistoryPreviewInput) {
-    const studentNos = [...new Set(input.rows.map((row) => row.studentNo))]
-    const users = await this.db.user.findMany({
-      where: { studentNo: { in: studentNos } },
-      select: {
-        studentNo: true,
-        verifiedRealName: true,
-        profile: { select: { displayName: true } },
-        platformAccounts: { where: { status: { not: 'revoked' } }, select: { platform: true, externalId: true, status: true } },
-      },
-    })
-    const nameByNo = new Map(users.map((user) => [user.studentNo, memberName(user)]))
+    const { users, byStudentNo, byName } = await this.loadMembers(input.rows)
+
     // 成员在系统里绑定的平台账号：每平台一个活跃绑定，已核验优先
     const boundHandle = new Map<string, string>()
     for (const user of users) {
@@ -197,7 +316,14 @@ export class HistoryImportService {
     }
 
     type Resolved = (typeof input.rows)[number] & {
+      /** 解析后的学号；同名待选行为空字符串 */
+      studentNo: string
       memberName: string | null
+      candidates?: MemberCandidate[]
+      /** 学号匹配 / 姓名兜底 */
+      matchSource?: 'studentNo' | 'name'
+      /** 姓名兜底时的提示（学号填了但未注册等） */
+      matchWarning?: string
       /** 平台账号来源：表格手填 / 成员在系统绑定的账号 */
       handleSource?: 'sheet' | 'bound'
       /** 参与分来源：表格手填 / 按活动类型默认 / 按榜单 W 公式 */
@@ -210,13 +336,27 @@ export class HistoryImportService {
       error?: string
     }
     const resolved: Resolved[] = input.rows.map((row) => {
-      const bound = row.platform && !row.handle ? boundHandle.get(`${row.studentNo}\u0000${row.platform}`) : undefined
+      const match = resolveMember(row, byStudentNo, byName)
+      if (!('user' in match)) {
+        return {
+          ...row,
+          studentNo: row.studentNo ?? '',
+          memberName: null,
+          error: match.error,
+          ...(match.candidates ? { candidates: match.candidates } : {}),
+        }
+      }
+      // 姓名兜底后把学号补回行里，后续分组、幂等键与提交载荷都使用解析后的成员
+      const studentNo = match.user.studentNo
+      const bound = row.platform && !row.handle ? boundHandle.get(`${studentNo}\u0000${row.platform}`) : undefined
       return {
         ...row,
+        studentNo,
+        ...(match.warning ? { matchWarning: match.warning } : {}),
+        ...(match.matchSource === 'name' ? { matchSource: 'name' as const } : {}),
         ...(row.handle ? { handleSource: 'sheet' as const } : bound ? { handle: bound, handleSource: 'bound' as const } : {}),
         ...(row.amount != null ? { amountSource: 'sheet' as const } : {}),
-        memberName: nameByNo.get(row.studentNo) ?? null,
-        ...(nameByNo.has(row.studentNo) ? {} : { error: '成员不存在（学号未注册，可先在成员管理导入）' }),
+        memberName: memberName(match.user),
       }
     })
 
@@ -381,17 +521,16 @@ export class HistoryImportService {
     rows: RowOutcome[]
   }> {
     const batchId = newId()
-    const studentNos = [...new Set(input.rows.map((row) => row.studentNo))]
-    const users = await this.db.user.findMany({ where: { studentNo: { in: studentNos } }, select: { id: true, studentNo: true } })
-    const userByNo = new Map(users.map((user) => [user.studentNo, user.id]))
+    const { byStudentNo, byName } = await this.loadMembers(input.rows)
 
-    type Row = HistoryExcelInput['rows'][number] & { userId: string }
+    type Row = HistoryExcelInput['rows'][number] & { studentNo: string; userId: string }
     const outcomes: RowOutcome[] = []
     const groups = new Map<string, Row[]>()
     for (const row of input.rows) {
-      const userId = userByNo.get(row.studentNo)
-      if (!userId) {
-        outcomes.push({ row: row.row, studentNo: row.studentNo, status: 'failed', error: '成员不存在（学号未注册，可先在成员管理导入）' })
+      const match = resolveMember(row, byStudentNo, byName)
+      const label = row.studentNo ?? row.name ?? `第 ${row.row} 行`
+      if (!('user' in match)) {
+        outcomes.push({ row: row.row, studentNo: label, status: 'failed', error: match.error })
         continue
       }
       shanghaiDay(row.activityDate)
@@ -399,7 +538,7 @@ export class HistoryImportService {
       const key = row.platform && row.contestId
         ? `contest\u0000${row.platform}\u0000${row.contestId}`
         : `history\u0000${row.activityTitle}\u0000${row.activityDate}`
-      groups.set(key, [...(groups.get(key) ?? []), { ...row, userId }])
+      groups.set(key, [...(groups.get(key) ?? []), { ...row, studentNo: match.user.studentNo, userId: match.user.id }])
     }
 
     const activities: Array<{ id: string; title: string; date: string; created: boolean }> = []

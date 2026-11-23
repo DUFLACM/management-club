@@ -1,5 +1,5 @@
 import { beforeAll, afterAll, describe, expect, it } from 'vitest'
-import { PrismaService } from '../../infrastructure/database/database.module.js'
+import { PrismaService, SchemaStateService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { AnnouncementsService } from '../../modules/announcements/announcements.service.js'
 import { ensureTestDatabase, TEST_URL } from './setup.js'
@@ -18,7 +18,7 @@ let announcements: AnnouncementsService
 beforeAll(async () => {
   const url = ensureTestDatabase()
   db = new PrismaService(url)
-  announcements = new AnnouncementsService(db, new AuditService(db))
+  announcements = new AnnouncementsService(db, new AuditService(db), new SchemaStateService(db))
 })
 
 afterAll(async () => {

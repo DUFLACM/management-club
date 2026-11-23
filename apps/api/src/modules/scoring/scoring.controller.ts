@@ -99,16 +99,29 @@ export class ScoringAdminController {
     return ok(await this.scoring.postLedgerEntry(actor, input))
   }
 
-  /** 批量手动加分（粘贴/导入：学号+分数+备注；可关联活动，成员端活动详情展示积分） */
+  /** 批量核对成员：粘贴的学号或姓名可能同名，先返回候选让管理员选 */
+  @Post('members/resolve')
+  @RequireAction('points.review')
+  async resolveMembers(@Body() body: unknown) {
+    const parsed = z.object({
+      queries: z.array(z.string().trim().min(1).max(64)).min(1).max(200),
+    }).safeParse(body)
+    if (!parsed.success) throw new ScoringError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.scoring.resolveMemberQueries(parsed.data.queries))
+  }
+
+  /** 批量手动加分（粘贴/导入：学号或姓名 + 分数 + 备注；可关联活动，成员端活动详情展示积分） */
   @Post('ledger-entries/batch')
   @RequireAction('points.review')
   async postEntriesBatch(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
+    const rowSchema = z.object({
+      studentNo: z.string().trim().min(1).max(64).optional(),
+      name: z.string().trim().min(1).max(64).optional(),
+      amount: z.string().regex(/^-?\d+(\.\d+)?$/, '分数为十进制（可负）'),
+      note: z.string().max(300).optional(),
+    }).refine((row) => Boolean(row.studentNo || row.name), { message: '学号与姓名至少填写一项', path: ['studentNo'] })
     const parsed = z.object({
-      rows: z.array(z.object({
-        studentNo: z.string().min(3).max(64),
-        amount: z.string().regex(/^-?\d+(\.\d+)?$/, '分数为十进制（可负）'),
-        note: z.string().max(300).optional(),
-      })).min(1).max(200),
+      rows: z.array(rowSchema).min(1).max(200),
       category: z.enum(['contest', 'remote_contest', 'activity', 'contribution', 'service', 'award', 'initial', 'penalty']).default('activity'),
       activityId: z.string().uuid().optional(),
       scoreMonth: z.string().regex(/^\d{4}-\d{2}$/).optional(),
@@ -168,7 +181,7 @@ export class ScoringAdminController {
       include: { votes: true },
     })
     const claims = await this.db.pointsClaim.findMany({
-      where: { status: 'pending' },
+      where: { status: { in: ['pending', 'more_info'] } },
       orderBy: { createdAt: 'asc' },
       take: 50,
       include: {
@@ -177,7 +190,27 @@ export class ScoringAdminController {
       },
     })
     const appeals = await this.db.appeal.findMany({ where: { status: 'submitted' }, orderBy: { createdAt: 'asc' }, take: 50, include: { user: { select: { verifiedRealName: true, studentNo: true } } } })
-    return ok({ cases, claims, appeals })
+    // 已处理申报：保留最近 50 条，供撤回审核 / 查看当时的入账记录
+    const processed = await this.db.pointsClaim.findMany({
+      where: { status: { in: ['approved', 'rejected'] } },
+      orderBy: { reviewedAt: 'desc' },
+      take: 50,
+      include: {
+        user: { select: { verifiedRealName: true, studentNo: true } },
+        assets: { orderBy: { sortOrder: 'asc' }, select: { assetId: true } },
+      },
+    })
+    const processedSourceKeys = processed.map((claim) => `contribution:${claim.userId}:${claim.id}`)
+    const ledgerEntries = processedSourceKeys.length === 0 ? [] : await this.db.pointsLedgerEntry.findMany({
+      where: { sourceKey: { in: processedSourceKeys }, status: 'approved' },
+      select: { id: true, sourceKey: true, amount: true, scoreMonth: true, recordedAt: true },
+    })
+    const entryBySourceKey = new Map(ledgerEntries.map((entry) => [entry.sourceKey, entry]))
+    const processedClaims = processed.map((claim) => ({
+      ...claim,
+      ledgerEntry: entryBySourceKey.get(`contribution:${claim.userId}:${claim.id}`) ?? null,
+    }))
+    return ok({ cases, claims, appeals, processedClaims })
   }
 
   @Post('reviews/:id/votes')
@@ -191,24 +224,15 @@ export class ScoringAdminController {
   @RequireAction('claims.review')
   async claimDecision(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
     const parsed = z.object({ decision: z.enum(['approve', 'reject', 'more_info']), note: z.string().max(500).optional(), amount: z.string().regex(/^-?\d+(\.\d+)?$/).optional() }).parse(body)
-    const claim = await this.db.pointsClaim.findUnique({ where: { id } })
-    if (!claim) return ok({ decided: false })
-    await this.db.pointsClaim.update({
-      where: { id },
-      data: { status: parsed.decision === 'approve' ? 'approved' : parsed.decision === 'reject' ? 'rejected' : 'more_info', reviewNote: parsed.note, reviewedBy: actor.principalId, reviewedAt: new Date() },
-    })
-    if (parsed.decision === 'approve' && parsed.amount) {
-      await this.scoring.postLedgerEntry(actor, {
-        userId: claim.userId,
-        sourceKey: `contribution:${claim.userId}:${claim.id}`,
-        category: claim.category === 'award' ? 'award' : 'contribution',
-        amount: parsed.amount,
-        scoreMonth: claim.scoreMonth,
-        detail: { claimId: claim.id, title: claim.title },
-        evidenceRef: `claim:${claim.id}`,
-      })
-    }
-    return ok({ decided: true })
+    return ok(await this.scoring.decideClaim(actor, id, parsed.decision, parsed.note, parsed.amount))
+  }
+
+  /** 撤回审核：已通过的申报会同时冲正对应流水，申报退回待审核 */
+  @Post('claims/:id/withdraw')
+  @RequireAction('claims.review')
+  async withdrawClaim(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const { reason } = z.object({ reason: z.string().trim().min(3, '撤回原因至少 3 个字').max(500) }).parse(body)
+    return ok(await this.scoring.withdrawClaimDecision(actor, id, reason))
   }
 
   /** 平台赛积分结算（引擎：有效提交自动核验 + λ 目录匹配；结束后 5 分钟窗口） */

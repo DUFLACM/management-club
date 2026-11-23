@@ -222,3 +222,53 @@ describe('Excel 平台比赛行', () => {
     expect(c.error).toContain('未在系统绑定')
   })
 })
+
+describe('学号 / 姓名二选一匹配', () => {
+  it('只有姓名且唯一时自动匹配；同名多人返回候选，选定学号后可入账', async () => {
+    const unique = await createTestUser(db, { studentNo: '202607001', name: '独名同学' })
+    const dupA = await createTestUser(db, { studentNo: '202607002', name: '同名同学' })
+    const dupB = await createTestUser(db, { studentNo: '202607003', name: '同名同学' })
+    const base = { category: 'activity' as const, activityType: 'meeting' as const, activityDate: '2025-08-01' }
+    const preview = await history.preview({
+      lambdaKey: 'auto', cap: 20,
+      rows: [
+        { row: 2, name: '独名同学', activityTitle: '按姓名匹配例会', ...base },
+        { row: 3, name: '同名同学', activityTitle: '同名候选例会', ...base },
+        { row: 4, name: '查无此人', activityTitle: '查无此人例会', ...base },
+        { row: 5, studentNo: '202607001', name: '独名同学', activityTitle: '双字段核对例会', ...base },
+        { row: 6, studentNo: '202607003', name: '独名同学', activityTitle: '学号姓名不一致例会', ...base },
+      ],
+    })
+    const byRow = new Map(preview.rows.map((row) => [row.row, row]))
+    expect(byRow.get(2)).toMatchObject({ studentNo: '202607001', memberName: '独名同学', matchSource: 'name' })
+    expect(byRow.get(2)?.error).toBeUndefined()
+    expect(byRow.get(3)?.error).toContain('对应 2 位成员')
+    expect(byRow.get(3)?.candidates?.map((candidate) => candidate.studentNo).sort()).toEqual(['202607002', '202607003'])
+    expect(byRow.get(4)?.error).toContain('未找到姓名')
+    expect(byRow.get(5)?.error).toBeUndefined()
+    expect(byRow.get(6)?.error).toContain('与姓名「独名同学」不一致')
+
+    // 管理员在预览里选择 dupB 后，入账使用明确学号；只有姓名的唯一匹配行也可直接入账
+    const commit = historyExcelSchema.parse({
+      rows: [
+        { row: 2, name: '独名同学', amount: '2', category: 'activity', activityType: 'meeting', activityTitle: '按姓名匹配例会', activityDate: '2025-08-01' },
+        { row: 3, studentNo: '202607003', name: '同名同学', amount: '2', category: 'activity', activityType: 'meeting', activityTitle: '同名候选例会', activityDate: '2025-08-01' },
+      ],
+    })
+    const result = await history.importExcel(makeActor(), commit)
+    expect(result).toMatchObject({ posted: 2, duplicate: 0, failed: 0 })
+    expect(await db.pointsLedgerEntry.count({ where: { userId: unique.userId } })).toBe(1)
+    expect(await db.pointsLedgerEntry.count({ where: { userId: dupB.userId } })).toBe(1)
+    expect(await db.pointsLedgerEntry.count({ where: { userId: dupA.userId } })).toBe(0)
+
+    // 入账接口同样拒绝同名多人，避免绕过选择直接落到某个人
+    const ambiguous = historyExcelSchema.parse({
+      rows: [
+        { row: 7, name: '同名同学', amount: '2', category: 'activity', activityType: 'meeting', activityTitle: '直接按姓名入账例会', activityDate: '2025-08-01' },
+      ],
+    })
+    const rejected = await history.importExcel(makeActor(), ambiguous)
+    expect(rejected).toMatchObject({ posted: 0, failed: 1 })
+    expect(rejected.rows[0]?.error).toContain('对应 2 位成员')
+  })
+})

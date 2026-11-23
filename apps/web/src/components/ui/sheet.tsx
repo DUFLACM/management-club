@@ -5,7 +5,8 @@ import { XIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 /**
- * Sheet：桌面右侧抽屉（详情用，宽 560–640px、圆角 20px、全高）。
+ * Sheet：桌面右侧抽屉（详情用，宽 560–640px、全高）。
+ * 贴视口一侧保持直角，只给朝向页面的一侧加 20px 圆角；手机全宽时不留圆角。
  * 手机上的全高底部抽屉请使用 drawer.tsx。
  */
 
@@ -41,15 +42,16 @@ function SheetContent({
       <DialogPrimitive.Content
         data-slot="sheet-content"
         className={cn(
-          'fixed z-50 flex flex-col gap-4 bg-card text-card-foreground shadow-overlay',
-          // 大 Drawer 圆角 20px
-          'rounded-[20px]',
+          'fixed z-50 flex flex-col gap-4 overflow-hidden bg-card text-card-foreground shadow-overlay',
+          // 只圆内侧：贴视口的那一边必须保持直角，否则会露出背后的遮罩。
           side === 'right' &&
-            'inset-y-0 right-0 h-full w-full max-w-none border-l border-border p-0 sm:max-w-[640px]',
+            'inset-y-0 right-0 h-full w-full max-w-none rounded-l-[20px] border-l border-border p-0 sm:max-w-[640px]',
           side === 'left' &&
-            'inset-y-0 left-0 h-full w-full max-w-none border-r border-border p-0 sm:max-w-[640px]',
-          side === 'top' && 'inset-x-0 top-0 border-b border-border',
-          side === 'bottom' && 'inset-x-0 bottom-0 border-t border-border',
+            'inset-y-0 left-0 h-full w-full max-w-none rounded-r-[20px] border-r border-border p-0 sm:max-w-[640px]',
+          side === 'top' && 'inset-x-0 top-0 rounded-b-[20px] border-b border-border',
+          side === 'bottom' && 'inset-x-0 bottom-0 rounded-t-[20px] border-t border-border',
+          // 手机端左右抽屉占满全宽，两侧都贴边，不能再留圆角。
+          (side === 'right' || side === 'left') && 'max-sm:rounded-none',
           className,
         )}
         {...props}

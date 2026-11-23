@@ -1,6 +1,7 @@
 /**
  * 历史积分导入：Excel 模板定义与行解析（纯函数，便于单测）。
  * 模板列：学号 | 姓名 | 活动名称 | 活动日期 | 活动类型 | 参与分 | 加分项 | 加分 | 类别 | 平台 | 比赛场次 | 平台账号 | 计分月份 | 备注
+ * - 成员匹配：学号与姓名至少填一项；同时填写时按学号匹配并核对姓名，只有姓名且同名多人时由预览选择具体成员；
  * - 普通行：活动名称、活动日期必填，服务端按「活动名称 + 活动日期」归组建归档活动存档；
  *   参与分留空时服务端按活动类型给默认参与分（参加即得）；
  * - 加分项：从固定选项里选（讲题 / 分享 / 题解 / 出题 / 工作人员 / 主持 / 其他），加分留空按标准分；
@@ -62,8 +63,8 @@ export const HISTORY_TEMPLATE_EXAMPLES: string[][] = [
 
 export const HISTORY_TEMPLATE_GUIDE: string[][] = [
   ['列名', '是否必填', '说明'],
-  ['学号', '必填', '成员学号，须已在系统中注册（可先在「成员管理 → Excel 导入」建账号）'],
-  ['姓名', '选填', '仅用于核对，不参与匹配'],
+  ['学号', '与姓名二选一', '成员学号，须已在系统中注册（可先在「成员管理 → Excel 导入」建账号）。与姓名至少填一项；同时填写时按学号匹配并核对姓名'],
+  ['姓名', '与学号二选一', '成员真实姓名。只有姓名时按姓名匹配；同名多人时预览会列出候选，选定后才能入账'],
   ['活动名称', '普通行必填', '积分对应的活动或比赛名称；同名同日期的行归为同一个活动存档；平台比赛行留空则用比赛官方名称'],
   ['活动日期', '普通行必填', 'YYYY-MM-DD（也支持 2025/4/12、2025年4月12日）；平台比赛行留空则用比赛开始日期'],
   ['活动类型', '建议填写', '周赛 / 月赛 / 自定义比赛 / 讲座 / 训练 / 例会 / 团建 / 集训 / 服务；参与分留空时按它给默认参与分'],
@@ -284,7 +285,9 @@ export function parseHistoryRows(records: Array<Record<string, unknown>>): Histo
       if (raw.handle) row.handle = raw.handle;
     }
 
-    if (!/^[A-Za-z0-9._-]{1,64}$/.test(row.studentNo)) errors.push(row.studentNo ? '学号格式不合法' : '缺少学号');
+    if (!row.studentNo && !row.name) errors.push('学号与姓名至少填写一项');
+    else if (row.studentNo && !/^[A-Za-z0-9._-]{1,64}$/.test(row.studentNo)) errors.push('学号格式不合法');
+    if (row.name.length > 64) errors.push('姓名过长（≤64 字）');
     if (row.amount != null && !/^-?\d+(\.\d+)?$/.test(row.amount)) errors.push('参与分需为数字');
     if (row.bonusAmount != null && !/^-?\d+(\.\d+)?$/.test(row.bonusAmount)) errors.push('加分需为数字');
     if (row.bonus === 'other' && row.bonusAmount == null) errors.push('加分项为「其他加分」时请填写加分');

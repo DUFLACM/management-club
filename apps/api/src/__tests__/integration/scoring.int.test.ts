@@ -192,3 +192,104 @@ describe('当前有效榜包含零积分成员', () => {
     expect(second.map((r) => r.userId)).toEqual(first.map((r) => r.userId))
   })
 })
+
+describe('贡献申报审核撤回', () => {
+  it('通过入账后可撤回：冲正流水并退回待审核，重新通过生成新的生效记录', async () => {
+    const u = await createTestUser(db, { studentNo: '202604030', name: '撤回测试' })
+    const reviewer = makeActor()
+    const { claimId } = await scoring.submitClaim(u.userId, {
+      category: 'contribution_lecture',
+      title: '撤回测试申报',
+      description: '用于验证撤回审核与冲正流程',
+    })
+    const approved = await scoring.decideClaim(reviewer, claimId, 'approve', '材料齐全', '3')
+    expect(approved.decided).toBe(true)
+    expect((await db.pointsClaim.findUniqueOrThrow({ where: { id: claimId } })).status).toBe('approved')
+
+    const before = await db.pointsLedgerEntry.findMany({ where: { userId: u.userId }, orderBy: { recordedAt: 'asc' } })
+    expect(before).toHaveLength(1)
+    expect(Number(before[0]!.amount)).toBe(3)
+    const originalId = before[0]!.id
+
+    const withdrawn = await scoring.withdrawClaimDecision(reviewer, claimId, '分值填错')
+    expect(withdrawn).toEqual({ withdrawn: true, reversedEntryId: originalId })
+    const claim = await db.pointsClaim.findUniqueOrThrow({ where: { id: claimId } })
+    expect(claim).toMatchObject({ status: 'pending', reviewedBy: null, reviewedAt: null, reviewNote: null })
+
+    const afterWithdraw = await db.pointsLedgerEntry.findMany({ where: { userId: u.userId }, orderBy: { recordedAt: 'asc' } })
+    expect(afterWithdraw).toHaveLength(2)
+    expect(afterWithdraw.find((entry) => entry.id === originalId)?.status).toBe('reversed')
+    expect(afterWithdraw.filter((entry) => entry.status === 'approved')).toHaveLength(1)
+    expect(afterWithdraw.reduce((sum, entry) => sum + Number(entry.amount), 0)).toBe(0)
+
+    // 撤回后可以重新审核；新审批生成新的入账记录，旧记录保持 reversed
+    const reapproved = await scoring.decideClaim(reviewer, claimId, 'approve', '重新核定分值', '2')
+    expect(reapproved.decided).toBe(true)
+    const afterReapprove = await db.pointsLedgerEntry.findMany({ where: { userId: u.userId, status: 'approved', category: { not: 'reversal' } } })
+    expect(afterReapprove).toHaveLength(1)
+    expect(Number(afterReapprove[0]!.amount)).toBe(2)
+    expect((await scoring.decideClaim(reviewer, claimId, 'approve', '重复点击', '2')).decided).toBe(false)
+  })
+
+  it('驳回的申报可撤回并回到待审核；未入账时只回退状态', async () => {
+    const u = await createTestUser(db, { studentNo: '202604031' })
+    const reviewer = makeActor()
+    const { claimId } = await scoring.submitClaim(u.userId, {
+      category: 'solution',
+      title: '驳回撤回测试',
+      description: '用于验证驳回后撤回',
+    })
+    expect((await scoring.decideClaim(reviewer, claimId, 'reject', '证据不足', undefined)).decided).toBe(true)
+    const rejectedWithdraw = await scoring.withdrawClaimDecision(reviewer, claimId, '重新核对材料')
+    expect(rejectedWithdraw.reversedEntryId).toBeNull()
+    expect((await db.pointsClaim.findUniqueOrThrow({ where: { id: claimId } })).status).toBe('pending')
+
+    expect((await scoring.decideClaim(reviewer, claimId, 'approve', '补充后通过', '2')).decided).toBe(true)
+    const active = await db.pointsLedgerEntry.findMany({ where: { userId: u.userId, status: 'approved' } })
+    expect(active).toHaveLength(1)
+    const withdrawn = await scoring.withdrawClaimDecision(reviewer, claimId, '撤回复核')
+    expect(withdrawn.reversedEntryId).toBe(active[0]!.id)
+    expect((await db.pointsClaim.findUniqueOrThrow({ where: { id: claimId } })).status).toBe('pending')
+  })
+})
+
+describe('批量加分：学号 / 姓名二选一', () => {
+  it('姓名唯一可入账；同名多人在核对接口返回候选，入账时拒绝猜测', async () => {
+    const unique = await createTestUser(db, { studentNo: '202604040', name: '批量独名' })
+    const dupA = await createTestUser(db, { studentNo: '202604041', name: '批量同名' })
+    const dupB = await createTestUser(db, { studentNo: '202604042', name: '批量同名' })
+    const resolved = await scoring.resolveMemberQueries(['202604040', '批量独名', '批量同名', '查无此人'])
+    const byQuery = new Map(resolved.map((row) => [row.query, row]))
+    expect(byQuery.get('202604040')).toMatchObject({ match: { userId: unique.userId } })
+    expect(byQuery.get('批量独名')).toMatchObject({ match: { studentNo: '202604040' } })
+    expect(byQuery.get('批量同名')?.match).toBeNull()
+    expect(byQuery.get('批量同名')?.candidates.map((candidate) => candidate.studentNo).sort()).toEqual(['202604041', '202604042'])
+    expect(byQuery.get('查无此人')?.error).toContain('未找到')
+
+    const batch = await scoring.batchPostEntries(makeActor(), {
+      rows: [
+        { name: '批量独名', amount: '2', note: '姓名匹配' },
+        { studentNo: '202604041', amount: '3', note: '学号匹配' },
+        { name: '批量同名', amount: '1' },
+      ],
+      category: 'activity',
+      scoreMonth: '2026-09',
+    })
+    expect(batch).toMatchObject({ posted: 2 })
+    expect(batch.failed).toHaveLength(1)
+    expect(batch.failed[0]?.error).toContain('对应 2 位成员')
+    expect(await db.pointsLedgerEntry.count({ where: { userId: unique.userId, status: 'approved' } })).toBe(1)
+    expect(await db.pointsLedgerEntry.count({ where: { userId: dupB.userId, status: 'approved' } })).toBe(0)
+
+    // 管理员在核对表选定后，带明确学号入账
+    const chosen = await scoring.batchPostEntries(makeActor(), {
+      rows: [{ studentNo: '202604042', amount: '1' }],
+      category: 'activity',
+      scoreMonth: '2026-09',
+    })
+    expect(chosen).toMatchObject({ posted: 1 })
+    expect(chosen.failed).toHaveLength(0)
+    expect(await db.pointsLedgerEntry.count({ where: { userId: dupB.userId, status: 'approved' } })).toBe(1)
+    expect(await db.pointsLedgerEntry.count({ where: { userId: dupA.userId, status: 'approved' } })).toBe(1)
+  })
+})
