@@ -31,7 +31,7 @@ pnpm dev:worker
 
 打开 [本地登录页](http://localhost:5173/login)，选择「使用校园 CAS 登录」将跳转学校 `https://cas.dlufl.edu.cn/cas/login`。数字大外密码在学校页面输入，本站不收集该密码。当前已配置真实模式，学校登录页返回 HTTP 200，项目 CAS 客户端调用真实校验接口收到合成无效票 INVALID_TICKET，完成只读验证；**尚未证明有效校园账号登录成功，也未完成校方生产联调**。
 
-本机当前已实际 deploy 全部 **19 个迁移**，`prisma migrate status` 显示 schema up to date；API 已按 `AUTH_DEV_SIMULATOR=false` 的真实 CAS 配置重启，`GET /api/v1/auth/csrf` 返回 200。它们证明本地迁移和匿名认证入口可用，不等同于有效校园票据成功。
+本机当前已实际 deploy 全部 **18 个迁移**，`prisma migrate status` 显示 schema up to date；API 已按 `AUTH_DEV_SIMULATOR=false` 的真实 CAS 配置重启，`GET /api/v1/auth/csrf` 返回 200。它们证明本地迁移和匿名认证入口可用，不等同于有效校园票据成功。
 
 本地精确回调为 `http://localhost:5173/api/v1/auth/cas/callback?flow=<random>`，每次 flow 独立且需要浏览器绑定。校方 service 白名单、成功票据属性契约仍需核验；生产应使用同域 HTTPS 域名。CAS 返回的 `id_number` 按 1–64 位 `[A-Za-z0-9._-]` opaque 校园编号原样保存，不按长度推断学生或教职工。普通新学生身份不能绕过协会邀请注册；受控 CLI 预登记的教职工可从登录入口首次绑定稳定 CAS subject，不消耗学生邀请。
 
@@ -108,7 +108,7 @@ packages/db           Prisma schema、迁移、种子（schema 在根 prisma/）
 packages/scoring-core 积分纯函数与 R01–R13 显式阻塞
 packages/integrations 牛客/CF/AtCoder 适配器与 Hydro 协议
 packages/hydro-bridge Hydro outbox、签名 webhook、只读桥接路由
-prisma/               schema.prisma、19 个迁移与自定义约束
+prisma/               schema.prisma、18 个迁移与自定义约束
 scripts/              本地数据库工具
 docs/                 制度原文、方案、部署、状态、验收与截图证据
 ```
