@@ -59,7 +59,7 @@ NODE_ENV=development AUTH_DEV_SIMULATOR=true pnpm dev:api
 ```bash
 pnpm build                       # 7 个包构建
 pnpm test                        # 247：scoring-core 59 + Hydro Bridge 60 + API 98 + web 30
-pnpm test:integration             # 102 项，真实 PG；重建专用 acm_club_test 库
+pnpm test:integration             # 103 项，真实 PG；重建专用 acm_club_test 库
 pnpm run typecheck
 pnpm db:migrate:deploy            # 生产迁移（每次升级代码后必须先执行）
 pnpm cli                         # 管理 CLI

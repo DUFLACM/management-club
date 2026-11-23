@@ -3,8 +3,8 @@
  * GET /admin/platform/jobs（最近任务）+ GET /admin/platform/jobs/failures（完整失败队列）
  * + GET /admin/platform/accounts?status=（绑定审核，POST /admin/platform/accounts/:id/review，
  * POST /admin/platform/accounts/:id/sync）+ POST /admin/platform/jobs/:id/{retry,cancel}
- * + POST /admin/platform/jobs/retry-failures。
- * 失败任务单独成队列，不受“最近 N 条”截断；支持重试、全部重试、忽略与账号级重新同步。
+ * + POST /admin/platform/jobs/{retry-failures,cancel-failures}。
+ * 失败任务单独成队列，不受“最近 N 条”截断；支持重试、全部重试、忽略、全部忽略与账号级重新同步。
  */
 import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
@@ -251,6 +251,28 @@ function SyncBody({ principalId }: { principalId: string }) {
     },
   });
 
+  const cancelAllMutation = useMutation({
+    mutationFn: async () => {
+      const { data } = await api.post<{ cancelled: number; total: number }>(
+        '/admin/platform/jobs/cancel-failures',
+      );
+      return data;
+    },
+    onSuccess: (result) => {
+      setActionError(null);
+      setActionNotice(
+        result.cancelled === 0
+          ? '当前没有可忽略的失败任务。'
+          : `已忽略 ${result.cancelled} 个失败任务，不会再自动重试；错误记录保留在审计中。`,
+      );
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'platform'] });
+    },
+    onError: (error: ApiError) => {
+      setActionNotice(null);
+      setActionError(error.message);
+    },
+  });
+
   const cancelJobMutation = useMutation({
     mutationFn: async (job: JobDto) => {
       const { data } = await api.post<{ cancelled: boolean; reason?: string }>(
@@ -338,6 +360,21 @@ function SyncBody({ principalId }: { principalId: string }) {
                 >
                   {retryAllMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
                   全部重试（{Math.min(failureTotal, 50)}）
+                </Button>
+              )}
+              {failureTotal > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="text-destructive hover:text-destructive"
+                  disabled={cancelAllMutation.isPending || failuresQuery.isFetching}
+                  onClick={() => {
+                    if (!window.confirm(`确认忽略全部 ${failureTotal} 个失败任务？忽略后不会自动重试，错误记录仍保留在审计中。`)) return;
+                    cancelAllMutation.mutate();
+                  }}
+                >
+                  {cancelAllMutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
+                  全部忽略（{failureTotal}）
                 </Button>
               )}
               <Button

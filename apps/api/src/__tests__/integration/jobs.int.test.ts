@@ -151,4 +151,26 @@ describe('任务队列', () => {
     expect(manual).toMatchObject({ type: 'platform.sync_account', status: 'queued' })
     expect(manual.payload).toMatchObject({ accountId, source: 'admin' })
   })
+
+  it('批量忽略全部失败任务：cancelled 后不再在失败队列中，错误保留', async () => {
+    const owner = await createTestUser(db, { studentNo: '20269903', name: '批量忽略成员' })
+    const accountId = randomUUID()
+    await db.platformAccount.create({ data: { id: accountId, platform: 'atcoder', externalId: 'ignore-all', userId: owner.userId, status: 'verified' } })
+    const first = await jobs.enqueue({ type: 'platform.sync_account', payload: { accountId } })
+    const second = await jobs.enqueue({ type: 'platform.sync_account', payload: { accountId: randomUUID() } })
+    await db.job.updateMany({
+      where: { id: { in: [first.id, second.id] } },
+      data: { status: 'dead', lastError: 'platform unavailable' },
+    })
+
+    const controller = new PlatformAdminController(null as never, db, new AuditService(db))
+    const result = await controller.cancelFailures(makeActor())
+    expect(result.data.cancelled).toBeGreaterThanOrEqual(2)
+    expect(result.data.total).toBeGreaterThanOrEqual(2)
+
+    const cancelled = await db.job.findMany({ where: { id: { in: [first.id, second.id] } } })
+    expect(cancelled.every((job) => job.status === 'cancelled' && job.lastError === 'platform unavailable')).toBe(true)
+    const failures = await controller.jobFailures()
+    expect(failures.data.items.some((job) => job.id === first.id || job.id === second.id)).toBe(false)
+  })
 })

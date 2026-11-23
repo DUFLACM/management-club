@@ -253,6 +253,28 @@ export class PlatformAdminController {
     return ok({ retried, total: rows.length })
   }
 
+  /** 批量忽略全部失败任务：不再进入自动重试，错误仍保留在 jobs/审计中供追溯 */
+  @Post('jobs/cancel-failures')
+  @RequireAction('sync.manage')
+  async cancelFailures(@CurrentActor() actor: SessionActor) {
+    const where: Prisma.JobWhereInput = { type: { startsWith: 'platform.' }, status: { in: ['dead', 'failed'] } }
+    const total = await this.db.job.count({ where })
+    const updated = await this.db.job.updateMany({
+      where,
+      data: { status: 'cancelled', leaseUntil: null, lockedBy: null, leaseToken: null },
+    })
+    if (updated.count > 0) {
+      await this.audit.log({
+        actorPrincipalId: actor.principalId,
+        action: 'platform.job_cancel_all',
+        resourceType: 'job',
+        resourceId: 'platform-sync-failures',
+        summary: `批量忽略平台同步失败任务 ${updated.count}/${total} 条`,
+      })
+    }
+    return ok({ cancelled: updated.count, total })
+  }
+
   /** 忽略失败任务：标记 cancelled，不再进入自动重试；保留原错误供审计追溯 */
   @Post('jobs/:id/cancel')
   @RequireAction('sync.manage')
