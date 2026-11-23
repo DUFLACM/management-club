@@ -65,6 +65,7 @@ const PLATFORM_ADDRESS_ENV: Record<string, string> = {
   'codeforces.com': 'PLATFORM_CODEFORCES_ADDRESS',
   'atcoder.jp': 'PLATFORM_ATCODER_ADDRESS',
   'kenkoooo.com': 'PLATFORM_ATCODER_PROBLEMS_ADDRESS',
+  'vjudge.net': 'PLATFORM_VJUDGE_ADDRESS',
 }
 
 export interface SafeFetchOptions {
@@ -221,4 +222,5 @@ export const PLATFORM_HOSTS = {
   codeforces: ['codeforces.com'],
   atcoder: ['atcoder.jp'],
   atcoderProblems: ['kenkoooo.com'],
+  vjudge: ['vjudge.net'],
 } as const

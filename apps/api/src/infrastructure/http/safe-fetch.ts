@@ -199,4 +199,5 @@ export const PLATFORM_HOSTS = {
   codeforces: ['codeforces.com'],
   atcoder: ['atcoder.jp'],
   atcoderProblems: ['kenkoooo.com'],
+  vjudge: ['vjudge.net'],
 } as const

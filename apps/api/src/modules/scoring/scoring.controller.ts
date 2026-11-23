@@ -58,6 +58,11 @@ export class ScoringMeController {
     return ok(await this.scoring.submitClaim(user.userId, parsed))
   }
 
+  @Get('appeals')
+  async myAppeals(@CurrentUser() user: { userId: string }) {
+    return ok(await this.scoring.myAppeals(user.userId))
+  }
+
   @Post('appeals')
   async appeal(@CurrentUser() user: { userId: string }, @Body() body: unknown) {
     const parsed = z.object({
@@ -189,7 +194,18 @@ export class ScoringAdminController {
         assets: { orderBy: { sortOrder: 'asc' }, select: { assetId: true } },
       },
     })
-    const appeals = await this.db.appeal.findMany({ where: { status: 'submitted' }, orderBy: { createdAt: 'asc' }, take: 50, include: { user: { select: { verifiedRealName: true, studentNo: true } } } })
+    const appeals = await this.db.appeal.findMany({
+      where: { status: { in: ['submitted', 'in_review'] } },
+      orderBy: { createdAt: 'asc' },
+      take: 50,
+      include: { user: { select: { verifiedRealName: true, studentNo: true } } },
+    })
+    const processedAppeals = await this.db.appeal.findMany({
+      where: { status: { in: ['resolved', 'rejected'] } },
+      orderBy: { closedAt: 'desc' },
+      take: 30,
+      include: { user: { select: { verifiedRealName: true, studentNo: true } } },
+    })
     // 已处理申报：保留最近 50 条，供撤回审核 / 查看当时的入账记录
     const processed = await this.db.pointsClaim.findMany({
       where: { status: { in: ['approved', 'rejected'] } },
@@ -210,7 +226,23 @@ export class ScoringAdminController {
       ...claim,
       ledgerEntry: entryBySourceKey.get(`contribution:${claim.userId}:${claim.id}`) ?? null,
     }))
-    return ok({ cases, claims, appeals, processedClaims })
+    return ok({ cases, claims, appeals, processedAppeals, processedClaims })
+  }
+
+  /** 处理申诉：标记受理中 / 采纳结案 / 驳回结案（带处理结论并写审计） */
+  @Post('appeals/:id/decision')
+  @RequireAction('points.review')
+  async appealDecision(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({
+      decision: z.enum(['in_review', 'resolved', 'rejected']),
+      resolutionNote: z.string().trim().max(2000).optional(),
+    }).safeParse(body)
+    if (!parsed.success) throw new ScoringError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    const note = parsed.data.resolutionNote ?? ''
+    if ((parsed.data.decision === 'resolved' || parsed.data.decision === 'rejected') && note.length < 3) {
+      throw new ScoringError('结案或驳回时请填写至少 3 个字的处理说明', 'INVALID_INPUT')
+    }
+    return ok(await this.scoring.decideAppeal(actor, id, parsed.data.decision, note))
   }
 
   @Post('reviews/:id/votes')
@@ -246,7 +278,7 @@ export class ScoringAdminController {
   @Get('activities/:id/standings')
   @RequireAction('activity.manage')
   async adminStandings(@Param('id', ParseUUIDPipe) id: string) {
-    return ok(await this.activities.activityStandings(null as never, id, this.standings))
+    return ok(await this.activities.activityStandings(null, id, this.standings))
   }
 
 }

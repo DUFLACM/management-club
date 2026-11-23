@@ -75,6 +75,7 @@ const GROUP_FIELDS: Record<string, ReadonlyArray<FieldSpec>> = {
     { key: 'codeforcesEnabled', label: 'Codeforces', type: 'boolean' },
     { key: 'atcoderEnabled', label: 'AtCoder', type: 'boolean' },
     { key: 'atcoderProblemsEnabled', label: 'AtCoder 题库', type: 'boolean' },
+    { key: 'vjudgeEnabled', label: 'VJudge', type: 'boolean' },
   ],
   worker: [
     { key: 'concurrency', label: '并发（1-16）', type: 'number' },
@@ -125,7 +126,7 @@ const GROUP_DEFAULTS: Record<string, Record<string, unknown>> = {
   invite_policy: { defaultExpiresInDays: 14, defaultMaxUses: 1 },
   badges: { publicDisplayAllowed: true },
   privacy_disclosures: { publicProfilesEnabled: false },
-  platforms: { nowcoderEnabled: true, codeforcesEnabled: true, atcoderEnabled: true, atcoderProblemsEnabled: false },
+  platforms: { nowcoderEnabled: true, codeforcesEnabled: true, atcoderEnabled: true, atcoderProblemsEnabled: false, vjudgeEnabled: true },
   worker: { concurrency: 2, jobTimeoutMinutes: 10 },
   review_rules: { minReviewers: 2, teacherEscalationEnabled: true },
   cas: {},

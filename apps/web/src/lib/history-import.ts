@@ -72,9 +72,9 @@ export const HISTORY_TEMPLATE_GUIDE: string[][] = [
   ['加分项', '选填', '从「加分项」工作表里选一项（如 讲题·中档、主持），在参与分之外另记一条流水；同一人多个加分项请写多行'],
   ['加分', '选填', '留空按加分项标准分；填了以表格为准；只填加分不选加分项 = 其他加分'],
   ['类别', '选填', '活动 / 比赛 / 服务 / 远程赛 / 贡献 / 奖励 / 期初积分 / 扣分；留空按活动类型推断（比赛类 → 比赛，服务 → 服务，其余 → 活动）。远程赛 / 贡献 / 奖励 / 期初积分 / 扣分没有默认分，须填参与分'],
-  ['平台', '选填', '牛客 / Codeforces / AtCoder；填了即为平台比赛行，系统会抓取该场比赛榜单'],
-  ['比赛场次', '平台比赛行必填', '比赛 ID 或比赛链接，如 Codeforces 2043、AtCoder abc380、牛客 95323'],
-  ['平台账号', '选填', '留空 = 自动使用该成员在系统里绑定的平台账号；成员没绑定或要覆盖时再填：牛客填数字 ID，Codeforces / AtCoder 填用户名'],
+  ['平台', '选填', '牛客 / Codeforces / AtCoder / VJudge；填了即为平台比赛行，系统会抓取该场比赛榜单'],
+  ['比赛场次', '平台比赛行必填', '比赛 ID 或比赛链接，如 Codeforces 2043、AtCoder abc380、牛客 95323、VJudge 654321'],
+  ['平台账号', '选填', '留空 = 自动使用该成员在系统里绑定的平台账号；组队赛可填全队共用的 VJudge/平台用户名；牛客填数字 ID，Codeforces / AtCoder / VJudge 填用户名'],
   ['计分月份', '选填', 'YYYY-MM，留空取活动日期所在月份'],
   ['备注', '选填', '成员在流水与活动详情里能看到'],
   ['', '', ''],
@@ -128,6 +128,7 @@ const PLATFORM_ALIASES: Record<string, string> = {
   牛客: 'nowcoder', 牛客网: 'nowcoder', nowcoder: 'nowcoder', nc: 'nowcoder',
   codeforces: 'codeforces', cf: 'codeforces',
   atcoder: 'atcoder', at: 'atcoder', abc: 'atcoder',
+  vjudge: 'vjudge', vj: 'vjudge', virtualjudge: 'vjudge',
 };
 
 /** 加分项别名：去掉空白、点号、括号、横杠后匹配（讲题·中档 / 讲题（中档）/ 讲题-中档 / 讲题中档） */
@@ -226,6 +227,7 @@ export function extractContestId(platform: string, input: string): string {
     nowcoder: /nowcoder\.com\/acm\/contest\/(\d+)/,
     codeforces: /codeforces\.com\/(?:contest|gym)\/(\d+)/,
     atcoder: /atcoder\.jp\/contests\/([A-Za-z0-9_-]+)/,
+    vjudge: /vjudge\.net\/contest\/(\d+)/,
   };
   const match = patterns[platform]?.exec(text);
   return match?.[1] ?? text;
@@ -250,7 +252,7 @@ export function parseHistoryRows(records: Array<Record<string, unknown>>): Histo
 
     const errors: string[] = [];
     const platform = raw.platform ? normalizePlatform(raw.platform) : null;
-    if (raw.platform && !platform) errors.push(`平台「${raw.platform}」无法识别（牛客 / Codeforces / AtCoder）`);
+    if (raw.platform && !platform) errors.push(`平台「${raw.platform}」无法识别（牛客 / Codeforces / AtCoder / VJudge）`);
     const isContest = platform != null;
 
     let activityType: string | undefined;

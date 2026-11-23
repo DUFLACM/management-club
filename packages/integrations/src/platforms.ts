@@ -74,11 +74,12 @@ export async function acquireRateSlot(db: PrismaClient, host: string): Promise<v
   throw new AdapterError(`无法获得 ${host} 的出站限流槽`, 'RATE_SLOT', false)
 }
 
-async function fetchJson(db: PrismaClient, host: string, url: string, opts: { maxBytes?: number; expect?: string[] } = {}): Promise<unknown> {
+async function fetchJson(db: PrismaClient, host: string, url: string, opts: { maxBytes?: number; expect?: string[]; headers?: Record<string, string> } = {}): Promise<unknown> {
   await acquireRateSlot(db, host)
   try {
     const res = await safeFetch(url, {
       allowedHosts: [host],
+      headers: opts.headers,
       expectContentTypes: opts.expect ?? ['application/json'],
       maxBytes: opts.maxBytes,
     })
@@ -446,4 +447,364 @@ export function atCoderEntryToParticipation(entry: AtCoderHistoryEntry): Normali
 
 export function sourceSnapshotInput(platform: string, url: string, text: string, adapterVersion: string) {
   return { platform, sourceUrl: url, adapterVersion, contentType: 'application/json', contentHash: sha256Hex(text), byteSize: text.length }
+}
+
+// ============================ VJudge ============================
+
+export interface VjudgeProblemMeta {
+  index: string
+  name: string | null
+}
+
+export interface VjudgeContestMeta {
+  contestId: string
+  title: string
+  startTime: Date | null
+  endTime: Date | null
+  durationSeconds: number | null
+  problems: VjudgeProblemMeta[]
+}
+
+export interface VjudgeParsedEntry {
+  handle: string
+  displayName: string | null
+  rank: number | null
+  score: number
+  solvedCount: number
+  penaltySeconds: number
+  cells: Array<{ index: string; score: number; solved: boolean; failedCount: number | null }>
+}
+
+export interface VjudgeParsedRank {
+  contestId: string
+  title: string | null
+  startTime: Date | null
+  endTime: Date | null
+  durationSeconds: number | null
+  isReplay: boolean
+  problems: Array<{ index: string; name: string | null; fullScore: number | null; url: string | null }>
+  entries: VjudgeParsedEntry[]
+  upsolvingSkipped: number
+  problemCountFromSubmissions: boolean
+}
+
+/** 构造 VJudge Cookie 请求头（公开赛留空；密码赛/校内 Group 赛在服务端配置 VJUDGE_COOKIE） */
+export function vjudgeCookieHeader(rawCookie?: string): string | undefined {
+  const value = (rawCookie ?? process.env.VJUDGE_COOKIE ?? '').trim()
+  if (!value) return undefined
+  return value.includes('=') ? value : `JSESSIONID=${value}`
+}
+
+/** 0 → A, 25 → Z, 26 → AA */
+export function vjudgeProblemLabel(index: number): string {
+  let n = index
+  let label = ''
+  do {
+    label = String.fromCharCode(65 + (n % 26)) + label
+    n = Math.floor(n / 26) - 1
+  } while (n >= 0)
+  return label
+}
+
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+}
+
+/** 解析 VJudge 比赛页 HTML 中的 <textarea name="dataJson"> 静态 JSON（绝不 eval 页面脚本） */
+export function parseVjudgeContestDataJson(html: string, fallbackContestId?: string): VjudgeContestMeta | null {
+  const m = /<textarea[^>]*\bname=["']dataJson["'][^>]*>([\s\S]*?)<\/textarea>/i.exec(html)
+  if (!m) return null
+  try {
+    const raw = JSON.parse(decodeHtmlEntities(m[1].trim())) as Record<string, unknown>
+    const contestId = raw.id != null ? String(raw.id) : (fallbackContestId ?? '')
+    const title = typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : ''
+    const beginMs = typeof raw.begin === 'number' && Number.isFinite(raw.begin) ? raw.begin : null
+    const endMs = typeof raw.end === 'number' && Number.isFinite(raw.end)
+      ? raw.end
+      : beginMs != null && typeof raw.length === 'number' && Number.isFinite(raw.length)
+        ? beginMs + raw.length
+        : null
+    const durationSeconds = beginMs != null && endMs != null && endMs > beginMs
+      ? Math.round((endMs - beginMs) / 1000)
+      : typeof raw.length === 'number' && raw.length > 0
+        ? Math.round(raw.length / 1000)
+        : null
+    const rawProblems = Array.isArray(raw.problems) ? raw.problems : []
+    const problems: VjudgeProblemMeta[] = rawProblems.map((item, i) => {
+      const p = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>
+      const index = typeof p.num === 'string' && p.num.trim() ? p.num.trim() : vjudgeProblemLabel(i)
+      const titlePart = typeof p.title === 'string' && p.title.trim() ? p.title.trim() : null
+      const ojPart = typeof p.oj === 'string' && typeof p.probNum === 'string' ? `${p.oj}-${p.probNum}` : null
+      return { index, name: titlePart ?? ojPart }
+    })
+    return {
+      contestId,
+      title: title || (contestId ? `VJudge Contest ${contestId}` : 'VJudge Contest'),
+      startTime: beginMs != null ? new Date(beginMs) : null,
+      endTime: endMs != null ? new Date(endMs) : null,
+      durationSeconds,
+      problems,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 解析 VJudge 单场榜单 JSON（/contest/rank/single/{contestId}）：
+ * - 过滤赛后补题（timeSeconds > length/1000 或 timeSeconds < 0），防止补题计入比赛成绩；
+ * - 按提交时间升序聚合每题是否 AC 及 AC 前失败次数，计算标准 ICPC 罚时（秒）并按 (过题数 DESC, 罚时 ASC) 排定名次；
+ * - 优先使用 dataJson 中的准确题目列表（避免 0 提交题目导致 S 分母偏小）。
+ */
+export function parseVjudgeRankSingle(
+  body: unknown,
+  contestId: string,
+  metaProblems?: VjudgeProblemMeta[],
+): VjudgeParsedRank {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new AdapterError('VJudge 榜单返回格式无效', 'SHAPE_CHANGED', false)
+  }
+  const data = body as Record<string, unknown>
+  const participantsRaw = data.participants
+  const submissionsRaw = data.submissions
+  if ((!participantsRaw || typeof participantsRaw !== 'object') && !Array.isArray(submissionsRaw)) {
+    throw new AdapterError('VJudge 榜单缺少 participants 或 submissions 字段', 'SHAPE_CHANGED', false)
+  }
+  const title = typeof data.title === 'string' && data.title.trim() ? data.title.trim() : null
+  const beginMs = typeof data.begin === 'number' && Number.isFinite(data.begin) ? data.begin : null
+  const lengthMs = typeof data.length === 'number' && Number.isFinite(data.length) && data.length > 0 ? data.length : null
+  const durationSeconds = lengthMs != null ? Math.floor(lengthMs / 1000) : null
+  const startTime = beginMs != null ? new Date(beginMs) : null
+  const endTime = beginMs != null && lengthMs != null ? new Date(beginMs + lengthMs) : null
+  const isReplay = data.isReplay === true
+
+  const participantMap = new Map<string, { handle: string; displayName: string | null }>()
+  if (participantsRaw && typeof participantsRaw === 'object' && !Array.isArray(participantsRaw)) {
+    for (const [uid, info] of Object.entries(participantsRaw as Record<string, unknown>)) {
+      if (Array.isArray(info)) {
+        const handle = typeof info[0] === 'string' ? info[0].trim() : ''
+        const nick = typeof info[1] === 'string' && info[1].trim() ? info[1].trim() : null
+        if (handle) participantMap.set(uid, { handle, displayName: nick })
+      } else if (info && typeof info === 'object') {
+        const obj = info as Record<string, unknown>
+        const handle = String(obj.name ?? obj.username ?? '').trim()
+        const nickRaw = obj.nick ?? obj.nickname
+        const nick = typeof nickRaw === 'string' && nickRaw.trim() ? nickRaw.trim() : null
+        if (handle) participantMap.set(uid, { handle, displayName: nick })
+      }
+    }
+  }
+
+  interface RawSub {
+    uid: string
+    problemIndex: number
+    status: number
+    timeSeconds: number
+    order: number
+  }
+  const inContestSubs: RawSub[] = []
+  let upsolvingSkipped = 0
+  let maxProblemIndex = -1
+
+  if (Array.isArray(submissionsRaw)) {
+    submissionsRaw.forEach((item, order) => {
+      if (!Array.isArray(item) || item.length < 4) return
+      const uid = String(item[0] ?? '')
+      const problemIndex = Number(item[1])
+      const status = Number(item[2])
+      const timeSeconds = Number(item[3])
+      if (!uid || !Number.isInteger(problemIndex) || problemIndex < 0 || !Number.isFinite(timeSeconds)) return
+      if (problemIndex > maxProblemIndex) maxProblemIndex = problemIndex
+      if (timeSeconds < 0 || (durationSeconds != null && timeSeconds > durationSeconds)) {
+        upsolvingSkipped++
+        return
+      }
+      inContestSubs.push({ uid, problemIndex, status, timeSeconds, order })
+    })
+  }
+
+  // 按提交时间升序处理，保证 AC 前后的失败提交顺序正确
+  inContestSubs.sort((a, b) => a.timeSeconds - b.timeSeconds || a.order - b.order)
+
+  const problemCountFromSubmissions = !metaProblems || metaProblems.length === 0
+  const problemCount = Math.max(metaProblems?.length ?? 0, maxProblemIndex + 1)
+  const problems = Array.from({ length: problemCount }, (_, i) => {
+    const meta = metaProblems?.[i]
+    const index = meta?.index ?? vjudgeProblemLabel(i)
+    return {
+      index,
+      name: meta?.name ?? null,
+      fullScore: null,
+      url: `https://vjudge.net/contest/${encodeURIComponent(contestId)}#problem/${encodeURIComponent(index)}`,
+    }
+  })
+
+  interface CellAgg {
+    solved: boolean
+    failedCount: number
+    acTimeSeconds: number | null
+  }
+  const userStates = new Map<string, { cells: Map<number, CellAgg>; hasAttempt: boolean }>()
+  for (const sub of inContestSubs) {
+    let state = userStates.get(sub.uid)
+    if (!state) {
+      state = { cells: new Map(), hasAttempt: false }
+      userStates.set(sub.uid, state)
+    }
+    let cell = state.cells.get(sub.problemIndex)
+    if (!cell) {
+      cell = { solved: false, failedCount: 0, acTimeSeconds: null }
+      state.cells.set(sub.problemIndex, cell)
+    }
+    if (cell.solved) continue // 已 AC 后的重复提交不计罚时
+    if (sub.status === 1) {
+      cell.solved = true
+      cell.acTimeSeconds = sub.timeSeconds
+      state.hasAttempt = true
+    } else if (sub.status === 0) {
+      cell.failedCount += 1
+      state.hasAttempt = true
+    } else {
+      // status=2（评测中）等仅计入尝试痕迹但不加罚时
+      state.hasAttempt = true
+    }
+  }
+
+  // 聚合全部赛内有提交的参赛者（纯赛后补题者不入比赛榜）
+  const rawEntries: VjudgeParsedEntry[] = []
+  for (const [uid, state] of userStates.entries()) {
+    if (!state.hasAttempt) continue
+    const participant = participantMap.get(uid)
+    const handle = participant?.handle ?? uid
+    let solvedCount = 0
+    let penaltySeconds = 0
+    const cells = problems.map((p, idx) => {
+      const agg = state.cells.get(idx)
+      const solved = agg?.solved === true
+      const failedCount = agg ? agg.failedCount : 0
+      if (solved && agg?.acTimeSeconds != null) {
+        solvedCount += 1
+        penaltySeconds += agg.acTimeSeconds + failedCount * 1200
+      }
+      return {
+        index: p.index,
+        score: solved ? 1 : 0,
+        solved,
+        failedCount: agg ? failedCount : null,
+      }
+    })
+    rawEntries.push({
+      handle,
+      displayName: participant?.displayName ?? null,
+      rank: null,
+      score: solvedCount,
+      solvedCount,
+      penaltySeconds,
+      cells,
+    })
+  }
+
+  rawEntries.sort((a, b) =>
+    b.solvedCount - a.solvedCount
+    || a.penaltySeconds - b.penaltySeconds
+    || a.handle.localeCompare(b.handle),
+  )
+
+  // 标准竞赛排名：过题数与罚时都相同时并列；0 题且无罚时时仍按榜尾次序或并列排定
+  let prevRank = 0
+  for (let i = 0; i < rawEntries.length; i++) {
+    const cur = rawEntries[i]
+    const prev = i > 0 ? rawEntries[i - 1] : null
+    if (prev && cur.solvedCount === prev.solvedCount && cur.penaltySeconds === prev.penaltySeconds) {
+      cur.rank = prevRank
+    } else {
+      prevRank = i + 1
+      cur.rank = prevRank
+    }
+  }
+
+  return {
+    contestId,
+    title,
+    startTime,
+    endTime,
+    durationSeconds,
+    isReplay,
+    problems,
+    entries: rawEntries,
+    upsolvingSkipped,
+    problemCountFromSubmissions,
+  }
+}
+
+/** VJudge 比赛元数据导入：优先读取比赛页 HTML 的 dataJson，失败时降级读 rank/single JSON */
+export async function fetchVjudgeContestMeta(
+  db: PrismaClient,
+  contestId: string,
+): Promise<{ found: boolean; contest: NormalizedContestRecord | null; problems: VjudgeProblemMeta[] }> {
+  const host = PLATFORM_HOSTS.vjudge[0]
+  const cookie = vjudgeCookieHeader()
+  const headers: Record<string, string> = cookie ? { Cookie: cookie } : {}
+
+  await acquireRateSlot(db, host)
+  const htmlRes = await safeFetch(`https://${host}/contest/${encodeURIComponent(contestId)}`, {
+    allowedHosts: [host],
+    headers,
+    expectContentTypes: ['text/html'],
+    maxBytes: 2 * 1024 * 1024,
+  }).catch(() => null)
+
+  if (htmlRes && htmlRes.status === 200) {
+    const meta = parseVjudgeContestDataJson(htmlRes.text, contestId)
+    if (meta && meta.startTime) {
+      return {
+        found: true,
+        problems: meta.problems,
+        contest: {
+          externalContestId: contestId,
+          name: meta.title,
+          startTime: meta.startTime,
+          endTime: meta.endTime,
+          durationSeconds: meta.durationSeconds,
+          problemCount: meta.problems.length || null,
+          fullScore: null,
+          raw: { source: 'vjudge_contest_page', problemCount: meta.problems.length },
+        },
+      }
+    }
+  }
+
+  // 降级：直接读单场榜单 JSON 获取标题与起止时间
+  const rankBody = await fetchJson(db, host, `https://${host}/contest/rank/single/${encodeURIComponent(contestId)}`, {
+    headers,
+    maxBytes: loadEnv().OUTBOUND_MAX_STANDINGS_BYTES,
+  }).catch(() => null)
+  if (!rankBody) return { found: false, contest: null, problems: [] }
+  try {
+    const parsed = parseVjudgeRankSingle(rankBody, contestId)
+    if (!parsed.startTime) return { found: false, contest: null, problems: [] }
+    return {
+      found: true,
+      problems: parsed.problems.map((p) => ({ index: p.index, name: p.name })),
+      contest: {
+        externalContestId: contestId,
+        name: parsed.title ?? `VJudge Contest ${contestId}`,
+        startTime: parsed.startTime,
+        endTime: parsed.endTime,
+        durationSeconds: parsed.durationSeconds,
+        problemCount: parsed.problems.length || null,
+        fullScore: null,
+        raw: { source: 'vjudge_rank_single', isReplay: parsed.isReplay },
+      },
+    }
+  } catch {
+    return { found: false, contest: null, problems: [] }
+  }
 }

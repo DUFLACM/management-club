@@ -77,6 +77,23 @@ interface FailureQueueDto {
   total: number;
 }
 
+interface WorkerStatusDto {
+  online: boolean;
+  onlineCount: number;
+  queuedJobs: number;
+  runningJobs: number;
+  checkedAt: string;
+  workers: Array<{
+    workerId: string;
+    online: boolean;
+    state: string;
+    startedAt: string | null;
+    lastSeenAt: string;
+    activeJobs: number;
+    handledJobTypes: string[];
+  }>;
+}
+
 const JOB_STATUS_LABELS: Record<string, string> = {
   queued: '排队中',
   running: '更新中',
@@ -153,6 +170,13 @@ function SyncBody({ principalId }: { principalId: string }) {
     principalId,
     ['admin', 'platform', 'jobs', 'failures'],
     async () => (await api.get<FailureQueueDto>('/admin/platform/jobs/failures')).data,
+    { refetchInterval: 15_000 },
+  );
+
+  const workerStatusQuery = usePrivateQuery<WorkerStatusDto, ApiError>(
+    principalId,
+    ['admin', 'platform', 'worker-status'],
+    async () => (await api.get<WorkerStatusDto>('/admin/platform/worker-status')).data,
     { refetchInterval: 15_000 },
   );
 
@@ -311,6 +335,7 @@ function SyncBody({ principalId }: { principalId: string }) {
               void jobsQuery.refetch();
               void failuresQuery.refetch();
               void accountsQuery.refetch();
+              void workerStatusQuery.refetch();
             }}
           >
             <RefreshCwIcon aria-hidden="true" />
@@ -318,6 +343,39 @@ function SyncBody({ principalId }: { principalId: string }) {
           </Button>
         }
       />
+
+      {workerStatusQuery.data && (
+        workerStatusQuery.data.online ? (
+          <Card className="border-success/25 bg-success-subtle/30">
+            <CardContent className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-xs">
+              <div className="flex items-center gap-2 text-foreground">
+                <span className="inline-block size-2 rounded-full bg-success" aria-hidden="true" />
+                <span className="font-medium">
+                  后台 Worker 运行中（{workerStatusQuery.data.onlineCount} 个实例在线）
+                </span>
+                {workerStatusQuery.data.workers[0]?.lastSeenAt && (
+                  <span className="text-muted-foreground tabular-nums">
+                    最近心跳 {formatDateTime(workerStatusQuery.data.workers[0].lastSeenAt)}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-3 text-muted-foreground tabular-nums">
+                <span>排队 {workerStatusQuery.data.queuedJobs}</span>
+                <span>执行中 {workerStatusQuery.data.runningJobs}</span>
+              </div>
+            </CardContent>
+          </Card>
+        ) : (
+          <Alert variant="destructive">
+            <TriangleAlertIcon className="size-4" aria-hidden="true" />
+            <AlertTitle>未检测到在线的后台 Worker</AlertTitle>
+            <AlertDescription>
+              平台同步、头像处理与缺勤结算等异步任务将停留在排队中（当前排队 {workerStatusQuery.data.queuedJobs} 个）。
+              请在服务器检查并启动 Worker 进程（本地开发可执行 <code className="rounded bg-muted px-1 py-0.5 text-[11px]">pnpm dev:worker</code>）。
+            </AlertDescription>
+          </Alert>
+        )
+      )}
 
       {actionError && (
         <Alert variant="destructive">

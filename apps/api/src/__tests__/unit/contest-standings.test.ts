@@ -170,6 +170,107 @@ describe('Codeforces 官方 API 适配', () => {
   })
 })
 
+describe('VJudge 单场榜单适配', () => {
+  afterEach(() => {
+    delete process.env.VJUDGE_COOKIE
+  })
+
+  it('拉取 rank/single + 比赛页 dataJson：准确题数、过滤赛后补题、计算 ICPC 排名并支持 VJUDGE_COOKIE', async () => {
+    process.env.VJUDGE_COOKIE = 'test-session-token'
+    const dataJson = JSON.stringify({
+      id: 654321,
+      title: '社团周赛 VJudge #12',
+      begin: 1730000000000,
+      end: 1730007200000,
+      problems: [
+        { num: 'A', title: 'Watermelon', oj: 'CodeForces', probNum: '4A' },
+        { num: 'B', title: 'Shortest Path', oj: 'CodeForces', probNum: '20C' },
+        { num: 'C', title: 'Hard DP', oj: 'AtCoder', probNum: 'abc300_g' },
+      ],
+    })
+    const html = `<html><body><textarea style="display:none" name="dataJson">${dataJson.replace(/"/g, '&quot;')}</textarea></body></html>`
+    const rankPayload = {
+      id: 654321,
+      title: '社团周赛 VJudge #12',
+      begin: 1730000000000,
+      length: 7200000, // 2h = 7200s
+      isReplay: false,
+      participants: {
+        101: ['team_alpha', 'Alpha 队'],
+        102: ['bob_vj', 'Bob'],
+        103: ['charlie_wa', 'Charlie'],
+        104: ['upsolver_only', '赛后补题'],
+      },
+      submissions: [
+        [101, 0, 0, 300], // team_alpha A WA at 5m
+        [101, 0, 1, 600], // team_alpha A AC at 10m (penalty = 600 + 1200 = 1800)
+        [101, 1, 1, 2400], // team_alpha B AC at 40m (total penalty = 4200)
+        [102, 0, 1, 900], // bob_vj A AC at 15m (penalty = 900)
+        [102, 1, 1, 2100], // bob_vj B AC at 35m (total penalty = 3000 -> ranks ahead of team_alpha!)
+        [103, 0, 0, 1000], // charlie_wa A WA only -> 0 solved, valid submission
+        [104, 0, 1, 9000], // upsolver_only AC after 7200s -> filtered out!
+        [101, 2, 1, 8500], // team_alpha C AC after 7200s -> filtered out!
+      ],
+    }
+
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/rank/single/')) return jsonResponse(rankPayload)
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([['content-type', 'text/html; charset=utf-8']]),
+        text: async () => html,
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await new ContestStandingsService().fetch('vjudge', '654321')
+    if (!result.available) throw new Error(`应当可用，实际原因: ${result.reason}`)
+
+    // 验证传递了 VJUDGE_COOKIE
+    const [, init] = fetchMock.mock.calls[0]
+    expect((init as { headers?: Record<string, string> }).headers?.Cookie).toBe('JSESSIONID=test-session-token')
+
+    // 题目数来自 dataJson（含无人赛内通过的 C 题）
+    expect(result.problems).toEqual([
+      { index: 'A', name: 'Watermelon', fullScore: null, url: 'https://vjudge.net/contest/654321#problem/A' },
+      { index: 'B', name: 'Shortest Path', fullScore: null, url: 'https://vjudge.net/contest/654321#problem/B' },
+      { index: 'C', name: 'Hard DP', fullScore: null, url: 'https://vjudge.net/contest/654321#problem/C' },
+    ])
+    expect(result.contest).toEqual({
+      name: '社团周赛 VJudge #12',
+      startAt: new Date(1730000000000).toISOString(),
+      endAt: new Date(1730007200000).toISOString(),
+    })
+
+    // 赛后纯补题者被排除，总人数 = 3
+    expect(result.totalEntries).toBe(3)
+    expect(result.entries.map((e: { handle: string; rank: number; solvedCount: number }) => [e.handle, e.rank, e.solvedCount])).toEqual([
+      ['bob_vj', 1, 2],
+      ['team_alpha', 2, 2],
+      ['charlie_wa', 3, 0],
+    ])
+    // team_alpha 的赛后补题 C 题不计为通过
+    const alpha = result.entries.find((e: { handle: string }) => e.handle === 'team_alpha')
+    expect(alpha.cells).toEqual([
+      { index: 'A', score: 1, solved: true, failedCount: 1 },
+      { index: 'B', score: 1, solved: true, failedCount: 0 },
+      { index: 'C', score: 0, solved: false, failedCount: null },
+    ])
+    // charlie_wa 保留失败记录，供 hasValidSubmission 判定有效参赛
+    const charlie = result.entries.find((e: { handle: string }) => e.handle === 'charlie_wa')
+    expect(charlie.cells[0]).toEqual({ index: 'A', score: 0, solved: false, failedCount: 1 })
+    expect(result.note).toContain('过滤 2 条赛外/补题提交')
+  })
+
+  it('密码赛/权限受限（403）时优雅降级并提示配置 VJUDGE_COOKIE', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 403, headers: new Map(), json: async () => null, text: async () => '' }))
+    const result = await new ContestStandingsService().fetch('vjudge', '999999')
+    expect(result.available).toBe(false)
+    if (!result.available) expect(result.reason).toContain('VJUDGE_COOKIE')
+  })
+})
+
 describe('AtCoder 降级与未知平台', () => {
   it('standings/json 重定向到登录（302）时降级为外链提示，不抛错', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 302, headers: new Map(), json: async () => null }))

@@ -19,7 +19,7 @@ export class PlatformError extends DomainError {
 }
 
 export const bindAccountSchema = z.object({
-  platform: z.enum(['nowcoder', 'codeforces', 'atcoder']),
+  platform: z.enum(['nowcoder', 'codeforces', 'atcoder', 'vjudge']),
   externalId: z.string().min(2).max(64).regex(/^[A-Za-z0-9_.-]+$/, '仅接受平台 UID/handle 字符'),
   proofNote: z.string().max(500).optional(),
 })
@@ -28,6 +28,7 @@ const CANONICAL: Record<string, (v: string) => string> = {
   nowcoder: (v) => v.trim(), // UID 数字，保留原样
   codeforces: (v) => v.trim(), // CF handle 大小写敏感，不 lowercase
   atcoder: (v) => v.trim(),
+  vjudge: (v) => v.trim(),
 }
 
 @Injectable()

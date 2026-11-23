@@ -26,6 +26,7 @@ import { useDebouncedValue, LoadMoreButton } from '@/lib/hooks';
 import { ACTIVITY_TYPE_LABELS, activityTypeLabel, formatDateTime, formatStartEnd, policyLabel, toLocalInputValue, fromLocalInputValue, memberName } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { AttendanceQrBoard } from '@/components/club/AttendanceQrBoard';
+import { AdminRoomBookingsTab } from '@/components/club/AdminRoomBookingsTab';
 import { PrincipalGate } from '@/components/club/QueryBoundary';
 import { EmptyState } from '@/components/club/EmptyState';
 import { ErrorState } from '@/components/club/ErrorState';
@@ -224,13 +225,14 @@ export default function ActivitiesPanel() {
 
 function ActivitiesBody({ principalId }: { principalId: string }) {
   const [searchParams, setSearchParams] = useSearchParams();
-  const tab = searchParams.get('tab') === 'venues' ? 'venues' : 'activities';
+  const rawTab = searchParams.get('tab');
+  const tab = rawTab === 'venues' ? 'venues' : rawTab === 'rooms' ? 'rooms' : 'activities';
 
   return (
     <div className="flex flex-col gap-4">
       <PanelHeader
         title="活动与地点"
-        description="创建与发布活动、导入平台赛事；地点认证与现场码。"
+        description="创建与发布活动、导入平台赛事；地点认证、现场码与训练室预约审批。"
       />
       <Tabs
         value={tab}
@@ -245,15 +247,19 @@ function ActivitiesBody({ principalId }: { principalId: string }) {
           })
         }
       >
-        <TabsList aria-label="活动/地点">
+        <TabsList aria-label="活动/地点/训练室">
           <TabsTrigger value="activities">活动</TabsTrigger>
           <TabsTrigger value="venues">地点</TabsTrigger>
+          <TabsTrigger value="rooms">训练室预约</TabsTrigger>
         </TabsList>
         <TabsContent value="activities" className="mt-4">
           <ActivitiesTab principalId={principalId} />
         </TabsContent>
         <TabsContent value="venues" className="mt-4">
           <VenuesTab principalId={principalId} />
+        </TabsContent>
+        <TabsContent value="rooms" className="mt-4">
+          <AdminRoomBookingsTab principalId={principalId} />
         </TabsContent>
       </Tabs>
     </div>
@@ -815,11 +821,12 @@ function ActivityDetailSheet({
             )}
 
             <Tabs value={detailTab} onValueChange={setDetailTab}>
-              <TabsList aria-label="活动管理分区">
+              <TabsList aria-label="活动管理分区" className="flex flex-wrap h-auto">
                 <TabsTrigger value="announcement">公告设置</TabsTrigger>
                 <TabsTrigger value="registrations">报名候补</TabsTrigger>
                 <TabsTrigger value="attendance">现场出勤</TabsTrigger>
                 <TabsTrigger value="leave">请假审批</TabsTrigger>
+                <TabsTrigger value="remote">远程审批</TabsTrigger>
                 <TabsTrigger value="participants">参与核验</TabsTrigger>
                 <TabsTrigger value="lecture">讲题审批</TabsTrigger>
                 <TabsTrigger value="standings">比赛榜单</TabsTrigger>
@@ -843,6 +850,9 @@ function ActivityDetailSheet({
               </TabsContent>
               <TabsContent value="leave" className="mt-3">
                 <LeaveRequestsSection principalId={principalId} activityId={activityId} />
+              </TabsContent>
+              <TabsContent value="remote" className="mt-3">
+                <RemoteRequestsSection principalId={principalId} activityId={activityId} remoteAllowed={query.data.remoteAllowed} />
               </TabsContent>
               <TabsContent value="participants" className="mt-3">
                 <ParticipantsSection principalId={principalId} activityId={activityId} />
@@ -991,10 +1001,14 @@ interface AdminStandingsDto {
   reason?: string;
   note: string | null;
   fetchedAt: string;
+  isTeam?: boolean;
   problems: Array<{ index: string; name: string | null; fullScore: number | null; url: string | null; clubSolved: number }>;
   clubRanking: Array<{
     clubRank: number;
     userId: string;
+    teamId?: string;
+    teamName?: string;
+    memberUserIds?: string[];
     name: string;
     handle: string;
     displayName?: string | null;
@@ -1053,7 +1067,8 @@ function AdminStandingsSection({ principalId, activityId }: { principalId: strin
         <div className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
             <span>
-              榜单共 {query.data.totalEntries} 人 · 社团上榜 {query.data.clubRanking.length} 人 · 更新于{' '}
+              榜单共 {query.data.totalEntries} {query.data.isTeam ? '队/人' : '人'} · 社团上榜 {query.data.clubRanking.length}{' '}
+              {query.data.isTeam ? '队' : '人'} · 更新于{' '}
               {formatDateTime(query.data.fetchedAt)}
             </span>
             <Button size="sm" variant="ghost" disabled={query.isFetching} onClick={() => void query.refetch()}>
@@ -1083,7 +1098,7 @@ function AdminStandingsSection({ principalId, activityId }: { principalId: strin
           ) : (
             <ol className="flex flex-col divide-y divide-border rounded-xl border border-border">
               {query.data.clubRanking.map((row) => (
-                <li key={row.userId} className="flex items-center gap-3 px-3 py-2.5 text-sm">
+                <li key={row.teamId ?? row.userId} className="flex items-center gap-3 px-3 py-2.5 text-sm">
                   <span className="w-8 shrink-0 text-center font-semibold text-foreground tabular-nums">{row.clubRank}</span>
                   <span className="min-w-0 flex-1 truncate text-foreground">{row.name}</span>
                   <span className="hidden truncate text-xs text-muted-foreground sm:block">{row.displayName ?? row.handle}</span>
@@ -1344,6 +1359,148 @@ function LeaveRequestsSection({
       )}
       <p className="text-xs text-muted-foreground">
         批准后该成员本次出勤记为「请假通过」，不计缺席；驳回已批准的请假会把出勤结果退回待复核。
+      </p>
+    </div>
+  );
+}
+
+interface RemoteRequestRow {
+  id: string;
+  reason: string;
+  status: string;
+  monthKey: string;
+  monthApprovedCount: number;
+  approvedAt: string | null;
+  createdAt: string;
+  user: LectureRequestRow['user'];
+}
+
+function RemoteRequestsSection({
+  principalId,
+  activityId,
+  remoteAllowed,
+}: {
+  principalId: string;
+  activityId: string;
+  remoteAllowed: boolean;
+}) {
+  const queryClient = useQueryClient();
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const query = usePrivateQuery<RemoteRequestRow[], ApiError>(
+    principalId,
+    ['admin', 'activities', 'remote-requests', activityId],
+    async () => (await api.get<RemoteRequestRow[]>(`/admin/activities/${activityId}/remote-requests`)).data,
+  );
+
+  const decisionMutation = useMutation({
+    mutationFn: async (input: { requestId: string; decision: 'approve' | 'reject' }) => {
+      await api.post(`/admin/remote-requests/${input.requestId}/decision`, { decision: input.decision });
+      return input.decision;
+    },
+    onSuccess: () => {
+      setActionError(null);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'activities'] });
+    },
+    onError: (error: ApiError) => setActionError(error.message),
+  });
+
+  if (query.isPending) return <Skeleton className="h-40 rounded-xl" />;
+  if (query.isError) return <ErrorState description={query.error.message} onRetry={() => void query.refetch()} />;
+
+  const pendingCount = query.data.filter((request) => request.status === 'pending').length;
+
+  return (
+    <div className="flex flex-col gap-3">
+      {!remoteAllowed && (
+        <Alert>
+          <AlertTitle>本活动未开启远程参赛</AlertTitle>
+          <AlertDescription>成员端不会展示远程申请入口；若存在历史申请仍可在此查看与处理。</AlertDescription>
+        </Alert>
+      )}
+      {actionError && (
+        <Alert variant="destructive">
+          <AlertTitle>操作未完成</AlertTitle>
+          <AlertDescription>{actionError}</AlertDescription>
+        </Alert>
+      )}
+      {query.data.length === 0 ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">还没有成员提交本次活动的远程参赛申请。</p>
+      ) : (
+        <>
+          <p className="text-xs text-muted-foreground">
+            共 {query.data.length} 条，待审批 {pendingCount} 条。
+          </p>
+          <ul className="flex flex-col divide-y divide-border">
+            {query.data.map((request) => {
+              const busy = decisionMutation.isPending && decisionMutation.variables?.requestId === request.id;
+              const quotaWarning = request.status !== 'approved' && request.monthApprovedCount >= 1;
+              return (
+                <li key={request.id} className="flex flex-wrap items-center gap-3 py-2.5">
+                  <div className="min-w-0 flex-1">
+                    <p className="flex flex-wrap items-center gap-2 text-sm font-medium text-foreground">
+                      {memberName(request.user)}
+                      <span className="font-normal text-muted-foreground tabular-nums">{request.user.studentNo}</span>
+                      <StatusBadge
+                        kind="disclosure"
+                        value={
+                          request.status === 'approved' ? '已批准' : request.status === 'pending' ? '待审批' : '已驳回'
+                        }
+                      />
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[11px] tabular-nums ${
+                          quotaWarning
+                            ? 'bg-warning-subtle text-warning-foreground'
+                            : 'bg-muted text-muted-foreground'
+                        }`}
+                      >
+                        {request.monthKey} 已批 {request.monthApprovedCount} 次
+                      </span>
+                    </p>
+                    <p className="mt-0.5 text-sm leading-[22px] break-words whitespace-pre-wrap text-foreground">
+                      {request.reason}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      提交于 {formatDateTime(request.createdAt)}
+                      {request.approvedAt ? ` · 处理于 ${formatDateTime(request.approvedAt)}` : ''}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    {request.status !== 'approved' && (
+                      <Button
+                        size="sm"
+                        variant={request.status === 'pending' ? 'default' : 'outline'}
+                        disabled={decisionMutation.isPending}
+                        onClick={() => decisionMutation.mutate({ requestId: request.id, decision: 'approve' })}
+                      >
+                        {busy && decisionMutation.variables?.decision === 'approve' && (
+                          <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                        )}
+                        {request.status === 'pending' ? '批准远程' : '改为批准'}
+                      </Button>
+                    )}
+                    {request.status !== 'rejected' && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decisionMutation.isPending}
+                        onClick={() => decisionMutation.mutate({ requestId: request.id, decision: 'reject' })}
+                      >
+                        {busy && decisionMutation.variables?.decision === 'reject' && (
+                          <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                        )}
+                        {request.status === 'pending' ? '驳回' : '改为驳回'}
+                      </Button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+      <p className="text-xs text-muted-foreground">
+        按制度每自然月原则上最多 1 次合规远程计分；批准后会同步标记该成员本次出勤为「已批远程」，驳回已批准申请会退回待复核。
       </p>
     </div>
   );
@@ -3014,6 +3171,7 @@ function ActivityFormFields({
                       <SelectItem value="nowcoder">牛客</SelectItem>
                       <SelectItem value="codeforces">Codeforces</SelectItem>
                       <SelectItem value="atcoder">AtCoder</SelectItem>
+                      <SelectItem value="vjudge">VJudge</SelectItem>
                       <SelectItem value="hydro">Hydro（校内）</SelectItem>
                     </SelectContent>
                   </Select>

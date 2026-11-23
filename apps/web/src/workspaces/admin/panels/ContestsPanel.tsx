@@ -374,6 +374,7 @@ function CreateEventForm({
                     <SelectItem value="nowcoder">牛客</SelectItem>
                     <SelectItem value="codeforces">Codeforces</SelectItem>
                     <SelectItem value="atcoder">AtCoder</SelectItem>
+                    <SelectItem value="vjudge">VJudge</SelectItem>
                     <SelectItem value="hydro">校内 OJ</SelectItem>
                   </SelectContent>
                 </Select>
@@ -1643,6 +1644,7 @@ function DesignatedCatalogSection({ principalId }: { principalId: string }) {
                     <SelectItem value="nowcoder">牛客</SelectItem>
                     <SelectItem value="codeforces">Codeforces</SelectItem>
                     <SelectItem value="atcoder">AtCoder</SelectItem>
+                    <SelectItem value="vjudge">VJudge</SelectItem>
                     <SelectItem value="hydro">校内 OJ</SelectItem>
                     <SelectItem value="other">其他/无</SelectItem>
                   </SelectContent>

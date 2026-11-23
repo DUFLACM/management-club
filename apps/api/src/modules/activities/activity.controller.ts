@@ -33,6 +33,36 @@ export class ActivityUserController {
     return ok(await this.activities.listForUser(user.userId, { tab: whitelist(tab, ['all', 'open', 'mine', 'ongoing', 'ended']), type, q, cursor }))
   }
 
+  /** 月度日历视图数据（必须在 activities/:id 之前注册） */
+  @Get('activities/calendar')
+  async calendar(
+    @CurrentUser() user: { userId: string },
+    @Query('month') month?: string,
+  ) {
+    return ok(await this.activities.calendarForMonth(user.userId, month ?? monthKey(new Date())))
+  }
+
+  /** 个人 iCalendar 订阅链接（含服务端签名，可供手机/系统日历免登录订阅） */
+  @Get('activities/calendar-subscription')
+  async calendarSubscription(@CurrentUser() user: { userId: string }) {
+    return ok(await this.activities.calendarSubscriptionLinks(user.userId))
+  }
+
+  /** 直接下载 .ics 日历文件（scope=all|mine） */
+  @Get('activities/calendar.ics')
+  async downloadCalendarIcs(
+    @CurrentUser() user: { userId: string },
+    @Query('scope') scope: string | undefined,
+    @Res() res: Response,
+  ) {
+    const validScope = scope === 'mine' ? 'mine' : 'all'
+    const ics = await this.activities.buildCalendarIcs(user.userId, validScope)
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="dlufl-acm-${validScope}.ics"`)
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.send(ics)
+  }
+
   @Get('activities/:id')
   async detail(
     @CurrentActor() actor: SessionActor,
@@ -99,17 +129,36 @@ export class ActivityUserController {
     return ok(await this.activities.createMaterial(actor, user.userId, id, file, parsed.data))
   }
 
-  /** 材料下载：登录成员可见（社团内部资料，no-store） */
+  /** 跨活动资料与题解中心（检索讲题幻灯片、题解与数据） */
+  @Get('materials')
+  async materialsLibrary(
+    @Query('q') q?: string,
+    @Query('kind') kind?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return ok(await this.activities.listMaterialsLibrary({ q, kind, cursor }))
+  }
+
+  /** 材料下载：登录成员可见（社团内部资料，no-store；PDF/纯文本支持安全 inline 预览） */
   @Get('activities/:id/materials/:materialId/download')
   async downloadMaterial(
     @Param('id', ParseUUIDPipe) id: string,
     @Param('materialId', ParseUUIDPipe) materialId: string,
+    @Query('inline') inline: string | undefined,
     @Res({ passthrough: true }) res: Response,
   ): Promise<StreamableFile> {
     const { material, filePath } = await this.activities.materialForDownload(id, materialId)
+    const mime = material.mimeType ?? 'application/octet-stream'
+    const safeInline =
+      inline === '1' &&
+      (mime === 'application/pdf' || mime === 'text/plain' || mime === 'text/markdown')
     res.setHeader('Cache-Control', 'private, no-store')
-    res.setHeader('Content-Type', material.mimeType ?? 'application/octet-stream')
-    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(material.fileName)}`)
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('Content-Type', mime === 'text/markdown' ? 'text/plain; charset=utf-8' : mime)
+    res.setHeader(
+      'Content-Disposition',
+      `${safeInline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(material.fileName)}`,
+    )
     return new StreamableFile(createReadStream(filePath))
   }
 
@@ -241,7 +290,7 @@ export class ActivityAdminController {
   @RequireAction('activity.manage')
   async importContest(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
     const parsed = z.object({
-      platform: z.enum(['nowcoder', 'codeforces', 'atcoder', 'hydro']),
+      platform: z.enum(['nowcoder', 'codeforces', 'atcoder', 'vjudge', 'hydro']),
       contestId: z.string().min(1).max(64).optional(),
       officialUrl: z.string().url().optional(),
       hydroInstanceId: z.string().uuid().optional(),
@@ -357,5 +406,30 @@ export class ActivityAdminController {
         pendingReview: withStatus.filter((r) => r.resultStatus === 'pending_review').length,
       },
     })
+  }
+}
+
+/** 免 Cookie 的签名 iCalendar 订阅端点（供 Apple Calendar / Google Calendar / 手机日历订阅） */
+@Controller('/api/v1/public')
+export class ActivityCalendarPublicController {
+  constructor(private readonly activities: ActivityService) {}
+
+  @Get('calendar.ics')
+  async subscribe(
+    @Query('uid') uid: string | undefined,
+    @Query('scope') scope: string | undefined,
+    @Query('sig') sig: string | undefined,
+    @Res() res: Response,
+  ) {
+    const validScope = scope === 'mine' ? 'mine' : 'all'
+    if (!uid || !sig || !(await this.activities.verifyCalendarSignature(uid, validScope, sig))) {
+      res.status(403).type('text/plain; charset=utf-8').send('Invalid calendar subscription signature')
+      return
+    }
+    const ics = await this.activities.buildCalendarIcs(uid, validScope)
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8')
+    res.setHeader('Content-Disposition', `inline; filename="dlufl-acm-${validScope}.ics"`)
+    res.setHeader('Cache-Control', 'private, max-age=300')
+    res.send(ics)
   }
 }

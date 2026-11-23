@@ -28,20 +28,31 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 @Injectable()
 export class SchemaStateService implements OnApplicationBootstrap {
   announcementsReady = true
+  notificationsReady = true
 
   constructor(@Inject(PrismaService) private readonly db: PrismaService) {}
 
   async onApplicationBootstrap(): Promise<void> {
     try {
-      const rows = await this.db.$queryRaw<Array<{ present: boolean }>>`
-        SELECT to_regclass('public.announcements') IS NOT NULL AS present
+      const rows = await this.db.$queryRaw<Array<{ announcements: boolean; notifications: boolean }>>`
+        SELECT
+          to_regclass('public.announcements') IS NOT NULL AS announcements,
+          to_regclass('public.user_notifications') IS NOT NULL AS notifications
       `
-      this.announcementsReady = rows[0]?.present !== false
+      this.announcementsReady = rows[0]?.announcements !== false
+      this.notificationsReady = rows[0]?.notifications !== false
       if (!this.announcementsReady) {
         // eslint-disable-next-line no-console
         console.error(
           '[schema] 数据库缺少 announcements 表：公告接口不可用，成员端公告查询会返回空列表。' +
             '请在服务器仓库执行 `pnpm db:migrate:deploy` 后重启 API（勿只重启进程）。',
+        )
+      }
+      if (!this.notificationsReady) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[schema] 数据库缺少 user_notifications 表：个人通知将降级为空列表。' +
+            '请执行 `pnpm db:migrate:deploy` 后重启 API。',
         )
       }
     } catch (error) {

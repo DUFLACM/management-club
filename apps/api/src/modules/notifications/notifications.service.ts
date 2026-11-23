@@ -1,0 +1,102 @@
+import { Inject, Injectable } from '@nestjs/common'
+import { PrismaService, SchemaStateService } from '../../infrastructure/database/database.module.js'
+import { newId } from '../../common/utils.js'
+
+export type NotificationKind =
+  | 'leave_decision'
+  | 'remote_decision'
+  | 'appeal_decision'
+  | 'claim_decision'
+  | 'room_booking'
+  | 'badge_awarded'
+  | 'platform_review'
+  | 'general'
+
+export interface NotifyInput {
+  userId: string
+  kind: NotificationKind
+  title: string
+  body: string
+  link?: string | null
+}
+
+/**
+ * 个人事件通知服务：
+ * - 写入采用 best-effort（通知表未迁移或瞬时异常绝不阻断核心审批/记分主流程）；
+ * - 查询按用户倒序返回最近 50 条及未读数，支持单条已读与一键全部已读。
+ */
+@Injectable()
+export class NotificationsService {
+  constructor(
+    @Inject(PrismaService) private readonly db: PrismaService,
+    @Inject(SchemaStateService) private readonly schema: SchemaStateService,
+  ) {}
+
+  async notify(input: NotifyInput): Promise<void> {
+    if (!this.schema.notificationsReady) return
+    try {
+      await this.db.userNotification.create({
+        data: {
+          id: newId(),
+          userId: input.userId,
+          kind: input.kind,
+          title: input.title.slice(0, 120),
+          body: input.body.slice(0, 1000),
+          link: input.link ?? null,
+        },
+      })
+    } catch {
+      // 通知写失败不中断业务主流程
+    }
+  }
+
+  async listForUser(userId: string | null) {
+    if (!userId || !this.schema.notificationsReady) {
+      return { items: [], unreadCount: 0 }
+    }
+    try {
+      const [rows, unreadCount] = await Promise.all([
+        this.db.userNotification.findMany({
+          where: { userId },
+          orderBy: { createdAt: 'desc' },
+          take: 50,
+          select: { id: true, kind: true, title: true, body: true, link: true, readAt: true, createdAt: true },
+        }),
+        this.db.userNotification.count({ where: { userId, readAt: null } }),
+      ])
+      return {
+        items: rows.map((row) => ({
+          id: row.id,
+          kind: row.kind,
+          title: row.title,
+          body: row.body,
+          link: row.link,
+          read: row.readAt !== null,
+          readAt: row.readAt?.toISOString() ?? null,
+          createdAt: row.createdAt.toISOString(),
+        })),
+        unreadCount,
+      }
+    } catch {
+      return { items: [], unreadCount: 0 }
+    }
+  }
+
+  async markRead(userId: string, id: string): Promise<{ marked: boolean }> {
+    if (!this.schema.notificationsReady) return { marked: false }
+    const res = await this.db.userNotification.updateMany({
+      where: { id, userId, readAt: null },
+      data: { readAt: new Date() },
+    })
+    return { marked: res.count > 0 }
+  }
+
+  async markAllRead(userId: string): Promise<{ updated: number }> {
+    if (!this.schema.notificationsReady) return { updated: 0 }
+    const res = await this.db.userNotification.updateMany({
+      where: { userId, readAt: null },
+      data: { readAt: new Date() },
+    })
+    return { updated: res.count }
+  }
+}

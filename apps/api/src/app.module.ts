@@ -13,10 +13,12 @@ import { FilesModule } from './modules/files/files.module.js'
 import { CompetitionsModule } from './modules/competitions/competitions.module.js'
 import { EvaluationModule } from './modules/evaluation/evaluation.module.js'
 import { AnnouncementsModule } from './modules/announcements/announcements.module.js'
+import { NotificationsModule } from './modules/notifications/notifications.module.js'
 
 @Module({
   imports: [
     DatabaseModule,
+    NotificationsModule,
     AuthModule,
     VenueModule,
     ActivitiesModule,

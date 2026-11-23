@@ -50,14 +50,16 @@ describe('历史积分 Excel 解析', () => {
     const rows = parseHistoryRows([
       { 学号: '202400002', 平台: 'CF', 比赛场次: 'https://codeforces.com/contest/2043', 平台账号: 'lisi_cf' },
       { 学号: '202400003', 平台: '牛客', 比赛场次: '95323' },
+      { 学号: '202400006', 平台: 'VJ', 比赛场次: 'https://vjudge.net/contest/654321#rank', 平台账号: 'team_alpha' },
       { 学号: '202400004', 积分: '3', 平台账号: 'x', 活动名称: '周训练', 活动日期: '2025-01-01' },
       { 学号: '202400005', 平台: '洛谷', 比赛场次: '1' },
     ]);
     expect(rows[0]).toEqual({ row: 2, studentNo: '202400002', name: '', category: 'contest', platform: 'codeforces', contestId: '2043', handle: 'lisi_cf' });
     // 平台账号留空：由服务端取成员绑定账号，前端不再拦截
     expect(rows[1]?.error).toBeUndefined();
-    expect(rows[2]?.error).toBe('填写了比赛场次 / 平台账号时请同时填写平台');
-    expect(rows[3]?.error).toContain('平台「洛谷」无法识别');
+    expect(rows[2]).toEqual({ row: 4, studentNo: '202400006', name: '', category: 'contest', platform: 'vjudge', contestId: '654321', handle: 'team_alpha' });
+    expect(rows[3]?.error).toBe('填写了比赛场次 / 平台账号时请同时填写平台');
+    expect(rows[4]?.error).toContain('平台「洛谷」无法识别');
   });
 
   it('日期与月份规范化', () => {
@@ -71,6 +73,7 @@ describe('历史积分 Excel 解析', () => {
     expect(extractContestId('nowcoder', 'https://ac.nowcoder.com/acm/contest/95323')).toBe('95323');
     expect(extractContestId('codeforces', 'https://codeforces.com/contest/2043/standings')).toBe('2043');
     expect(extractContestId('atcoder', 'https://atcoder.jp/contests/abc380/tasks')).toBe('abc380');
+    expect(extractContestId('vjudge', 'https://vjudge.net/contest/654321#rank')).toBe('654321');
     expect(extractContestId('codeforces', ' 2043 ')).toBe('2043');
   });
 

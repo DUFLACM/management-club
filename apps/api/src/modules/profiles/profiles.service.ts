@@ -1,7 +1,8 @@
 import { DomainError } from '../../common/domain-error.js'
-import { Inject, Injectable } from '@nestjs/common'
+import { Inject, Injectable, Optional } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { newId, memberName } from '../../common/utils.js'
 import { z } from 'zod'
 import type { SessionActor } from '../auth/session.service.js'
@@ -33,6 +34,7 @@ export class ProfilesService {
   constructor(
     @Inject(PrismaService) private readonly db: PrismaService,
     private readonly jobs: JobsService,
+    @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
   async myProfile(userId: string) {
@@ -220,6 +222,13 @@ export class ProfilesService {
     } catch {
       throw new ProfileError('同一成果已授予过该徽标（幂等）', 'DUPLICATE')
     }
+    await this.notifications?.notify({
+      userId: input.userId,
+      kind: 'badge_awarded',
+      title: `获得新徽标：${def.name}`,
+      body: `${def.description}${input.reason ? `（依据：${input.reason}）` : ''}。可前往个人主页置顶展示。`,
+      link: '/app?section=profile',
+    })
     return { awardId: id }
   }
 
@@ -228,6 +237,259 @@ export class ProfilesService {
     if (!award) throw new ProfileError('授予不存在', 'NOT_FOUND')
     await this.db.badgeAward.update({ where: { id: awardId }, data: { status: 'revoked', revokedReason: reason } })
     await this.db.profileFeaturedBadge.deleteMany({ where: { awardId } })
+    void actor
     return { revoked: true }
+  }
+
+  /** 管理端查看近期徽标授予记录 */
+  async listBadgeAwards() {
+    const rows = await this.db.badgeAward.findMany({
+      orderBy: { grantedAt: 'desc' },
+      take: 100,
+      include: {
+        definition: true,
+        user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
+      },
+    })
+    return rows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      sourceKey: row.sourceKey,
+      evidenceRef: row.evidenceRef,
+      revokedReason: row.revokedReason,
+      grantedAt: row.grantedAt.toISOString(),
+      expiresAt: row.expiresAt?.toISOString() ?? null,
+      definition: {
+        id: row.definition.id,
+        key: row.definition.key,
+        name: row.definition.name,
+        theme: row.definition.theme,
+        category: row.definition.category,
+        grantMethod: row.definition.grantMethod,
+      },
+      user: {
+        id: row.user.id,
+        studentNo: row.user.studentNo,
+        name: memberName(row.user),
+      },
+    }))
+  }
+
+  /**
+   * 规则自动发章引擎（支持 dryRun 预览）：
+   * 扫描全体在册活跃成员的真实出勤、讲题、资料上传、贡献、平台参赛与 CF Rating 里程碑，
+   * 按幂等 sourceKey 补发尚未获得的规则型徽标并推送站内通知。
+   */
+  async autoGrantBadges(actor: SessionActor, dryRun: boolean) {
+    const builtInRules: Array<{
+      key: string
+      name: string
+      description: string
+      icon: string
+      theme: string
+      category: string
+      isOfficialHonor: boolean
+    }> = [
+      {
+        key: 'first_lecture',
+        name: '首讲达人',
+        description: '完成首次获批讲题，向社团分享解题思路。',
+        icon: 'book-open',
+        theme: 'blue',
+        category: 'contribution',
+        isOfficialHonor: false,
+      },
+      {
+        key: 'ontime_5',
+        name: '全勤先锋',
+        description: '累计准时到场参与协会活动达到 5 场。',
+        icon: 'target',
+        theme: 'mint',
+        category: 'activity',
+        isOfficialHonor: false,
+      },
+      {
+        key: 'material_contributor',
+        name: '题解共享者',
+        description: '向协会资料库上传讲题幻灯片或题解材料。',
+        icon: 'code',
+        theme: 'lilac',
+        category: 'contribution',
+        isOfficialHonor: false,
+      },
+      {
+        key: 'claim_3',
+        name: '高产贡献者',
+        description: '累计通过 3 项及以上社团贡献或服务申报。',
+        icon: 'heart',
+        theme: 'amber',
+        category: 'service',
+        isOfficialHonor: false,
+      },
+      {
+        key: 'contest_5',
+        name: '竞赛常青树',
+        description: '累计完成 5 场及以上算法竞赛平台有效参赛记录。',
+        icon: 'zap',
+        theme: 'blue',
+        category: 'growth',
+        isOfficialHonor: false,
+      },
+      {
+        key: 'cf_specialist',
+        name: 'CF Specialist',
+        description: 'Codeforces 算法 Rating 突破 1400 分。',
+        icon: 'star',
+        theme: 'mint',
+        category: 'honor',
+        isOfficialHonor: true,
+      },
+      {
+        key: 'cf_expert',
+        name: 'CF Expert',
+        description: 'Codeforces 算法 Rating 突破 1600 分。',
+        icon: 'award',
+        theme: 'blue',
+        category: 'honor',
+        isOfficialHonor: true,
+      },
+    ]
+
+    const existingDefs = await this.db.badgeDefinition.findMany({
+      where: { key: { in: builtInRules.map((r) => r.key) } },
+    })
+    const defMap = new Map(existingDefs.map((d) => [d.key, d]))
+    if (!dryRun) {
+      for (const rule of builtInRules) {
+        if (!defMap.has(rule.key)) {
+          const created = await this.db.badgeDefinition.create({
+            data: { id: newId(), ...rule, grantMethod: 'rule' },
+          })
+          defMap.set(rule.key, created)
+        }
+      }
+    }
+
+    const [users, lectureCounts, ontimeCounts, materialCounts, claimCounts, contestResults, cfRatings, existingAwards] =
+      await Promise.all([
+        this.db.user.findMany({
+          where: { accountStatus: 'active' },
+          select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } },
+        }),
+        this.db.lectureRequest.groupBy({ by: ['userId'], where: { status: 'approved' }, _count: { _all: true } }),
+        this.db.attendanceAttendanceResult.groupBy({ by: ['userId'], where: { status: 'ontime' }, _count: { _all: true } }),
+        this.db.activityMaterial.groupBy({ by: ['uploaderUserId'], _count: { _all: true } }),
+        this.db.pointsClaim.groupBy({ by: ['userId'], where: { status: 'approved' }, _count: { _all: true } }),
+        this.db.platformResult.findMany({
+          where: { status: 'complete' },
+          select: { platformAccount: { select: { userId: true } } },
+        }),
+        this.db.platformRatingPoint.findMany({
+          where: { platform: 'codeforces', seriesType: 'algorithm_rating', newValue: { gte: 1400 } },
+          select: { newValue: true, platformAccount: { select: { userId: true } } },
+        }),
+        this.db.badgeAward.findMany({
+          where: { sourceKey: { startsWith: 'badge:auto:' } },
+          select: { sourceKey: true },
+        }),
+      ])
+
+    const lectureMap = new Map(lectureCounts.map((r) => [r.userId, r._count._all]))
+    const ontimeMap = new Map(ontimeCounts.map((r) => [r.userId, r._count._all]))
+    const materialMap = new Map(materialCounts.map((r) => [r.uploaderUserId, r._count._all]))
+    const claimMap = new Map(claimCounts.map((r) => [r.userId, r._count._all]))
+    const contestCountMap = new Map<string, number>()
+    for (const r of contestResults) {
+      const uid = r.platformAccount.userId
+      contestCountMap.set(uid, (contestCountMap.get(uid) ?? 0) + 1)
+    }
+    const maxCfRatingMap = new Map<string, number>()
+    for (const pt of cfRatings) {
+      const uid = pt.platformAccount?.userId
+      if (!uid || pt.newValue == null) continue
+      const val = Number(pt.newValue)
+      if (val > (maxCfRatingMap.get(uid) ?? 0)) maxCfRatingMap.set(uid, val)
+    }
+    const ownedKeys = new Set(existingAwards.map((a) => a.sourceKey))
+
+    const candidates: Array<{
+      userId: string
+      userName: string
+      studentNo: string
+      badgeKey: string
+      badgeName: string
+      reason: string
+      sourceKey: string
+    }> = []
+
+    const pushIfNew = (user: (typeof users)[number], badgeKey: string, reason: string) => {
+      const sourceKey = `badge:auto:${badgeKey}:${user.id}`
+      if (ownedKeys.has(sourceKey)) return
+      const rule = builtInRules.find((r) => r.key === badgeKey)
+      if (!rule) return
+      candidates.push({
+        userId: user.id,
+        userName: memberName(user),
+        studentNo: user.studentNo,
+        badgeKey,
+        badgeName: rule.name,
+        reason,
+        sourceKey,
+      })
+    }
+
+    for (const user of users) {
+      const lectures = lectureMap.get(user.id) ?? 0
+      if (lectures >= 1) pushIfNew(user, 'first_lecture', `累计获批讲题 ${lectures} 次`)
+      const ontimes = ontimeMap.get(user.id) ?? 0
+      if (ontimes >= 5) pushIfNew(user, 'ontime_5', `累计准时出勤 ${ontimes} 场`)
+      const materials = materialMap.get(user.id) ?? 0
+      if (materials >= 1) pushIfNew(user, 'material_contributor', `已分享资料 ${materials} 份`)
+      const claims = claimMap.get(user.id) ?? 0
+      if (claims >= 3) pushIfNew(user, 'claim_3', `累计通过贡献申报 ${claims} 项`)
+      const contests = contestCountMap.get(user.id) ?? 0
+      if (contests >= 5) pushIfNew(user, 'contest_5', `累计完成平台参赛 ${contests} 场`)
+      const cfMax = maxCfRatingMap.get(user.id) ?? 0
+      if (cfMax >= 1400) pushIfNew(user, 'cf_specialist', `Codeforces 最高 Rating ${cfMax}`)
+      if (cfMax >= 1600) pushIfNew(user, 'cf_expert', `Codeforces 最高 Rating ${cfMax}`)
+    }
+
+    let granted = 0
+    if (!dryRun) {
+      for (const item of candidates) {
+        const def = defMap.get(item.badgeKey)
+        if (!def) continue
+        try {
+          await this.db.badgeAward.create({
+            data: {
+              id: newId(),
+              userId: item.userId,
+              definitionId: def.id,
+              sourceKey: item.sourceKey,
+              evidenceRef: item.reason,
+              grantedBy: actor.principalId,
+            },
+          })
+          granted += 1
+          await this.notifications?.notify({
+            userId: item.userId,
+            kind: 'badge_awarded',
+            title: `自动达成新徽标：${item.badgeName}`,
+            body: `${item.reason}。可前往个人主页置顶展示！`,
+            link: '/app?section=profile',
+          })
+        } catch {
+          // 幂等冲突忽略
+        }
+      }
+    }
+
+    return {
+      dryRun,
+      evaluatedMembers: users.length,
+      matchedCount: candidates.length,
+      grantedCount: granted,
+      items: candidates.slice(0, 100),
+    }
   }
 }

@@ -14,13 +14,17 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeftIcon,
   ArrowRightIcon,
+  BookOpenIcon,
   CalculatorIcon,
   CalendarDaysIcon,
+  CalendarPlusIcon,
   CalendarXIcon,
   CoinsIcon,
+  DoorOpenIcon,
   ExternalLinkIcon,
   FileDownIcon,
   GlobeIcon,
+  ListIcon,
   LoaderCircleIcon,
   MapPinIcon,
   MicIcon,
@@ -39,6 +43,9 @@ import { BindPlatformAccountDialog } from '@/components/club/BindPlatformAccount
 import { useDebouncedValue, LoadMoreButton } from '@/lib/hooks';
 import { ACTIVITY_TYPE_LABELS, activityTypeBadgeClass, activityTypeLabel, formatDateTime, formatStartEnd, formatVenue, platformContestUrl, platformLabel, policyLabel, relativeDeadline, memberName } from '@/lib/format';
 import { ActivityCheckinCard } from '@/components/club/ActivityCheckinCard';
+import { ActivityCalendarView, CalendarSubscribeDialog } from '@/components/club/ActivityCalendarView';
+import { RoomBookingPanel } from '@/components/club/RoomBookingPanel';
+import { MaterialsLibraryView } from '@/components/club/MaterialsLibraryView';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { MemberGate } from '@/components/club/QueryBoundary';
 import { ErrorState } from '@/components/club/ErrorState';
@@ -199,6 +206,7 @@ interface StandingsDto {
   reason?: string;
   note: string | null;
   fetchedAt: string;
+  isTeam?: boolean;
   problems: Array<{
     index: string;
     name: string | null;
@@ -209,6 +217,9 @@ interface StandingsDto {
   clubRanking: Array<{
     clubRank: number;
     userId: string;
+    teamId?: string;
+    teamName?: string;
+    memberUserIds?: string[];
     name: string;
     handle: string;
     displayName?: string | null;
@@ -248,6 +259,7 @@ const PLATFORM_BADGE: Record<string, string> = {
   nowcoder: '牛客',
   codeforces: 'Codeforces',
   atcoder: 'AtCoder',
+  vjudge: 'VJudge',
   hydro: '校内 OJ',
 };
 
@@ -278,10 +290,21 @@ export default function ActivitiesPanel() {
 
 function ActivitiesBody({ principalId }: { principalId: string }) {
   const [searchParams, setSearchParams] = useSearchParams();
-  const tab = searchParams.get('tab') ?? 'all';
+  const rawTab = searchParams.get('tab') ?? 'all';
+  const rawView = searchParams.get('view');
+  const view: 'list' | 'calendar' | 'rooms' | 'materials' =
+    rawView === 'calendar'
+      ? 'calendar'
+      : rawView === 'rooms' || rawTab === 'rooms'
+        ? 'rooms'
+        : rawView === 'materials' || rawTab === 'materials'
+          ? 'materials'
+          : 'list';
+  const tab = rawTab === 'rooms' || rawTab === 'materials' ? 'all' : rawTab;
   const type = searchParams.get('type') ?? 'all';
   const activityId = searchParams.get('activity');
   const [searchInput, setSearchInput] = useState(searchParams.get('q') ?? '');
+  const [subscribeOpen, setSubscribeOpen] = useState(false);
   const debouncedSearch = useDebouncedValue(searchInput, 450);
 
   const setParam = useCallback(
@@ -290,6 +313,12 @@ function ActivitiesBody({ principalId }: { principalId: string }) {
         const next = new URLSearchParams(previous);
         if (value == null || value === '' || value === 'all') next.delete(key);
         else next.set(key, value);
+        if (key === 'view' && value !== 'rooms' && next.get('tab') === 'rooms') {
+          next.delete('tab');
+        }
+        if (key === 'view' && value !== 'materials' && next.get('tab') === 'materials') {
+          next.delete('tab');
+        }
         return next;
       });
     },
@@ -303,10 +332,10 @@ function ActivitiesBody({ principalId }: { principalId: string }) {
     }
   }, [debouncedSearch, searchParams, setParam]);
 
-  // 列表查询保持 Hook 顺序稳定：详情打开时 enabled=false 不发请求
+  // 列表查询保持 Hook 顺序稳定：详情打开或非列表视图时 enabled=false 不发请求
   const listQuery = usePrivateInfiniteQueryConditions({
     principalId,
-    enabled: activityId == null,
+    enabled: activityId == null && view === 'list',
     tab,
     type,
     debouncedSearch,
@@ -326,95 +355,171 @@ function ActivitiesBody({ principalId }: { principalId: string }) {
 
   return (
     <div className="flex flex-col gap-4">
-      <PanelHeader title="活动" description="周赛、训练、讲座与集体活动的报名、签到与成绩。" />
-      <Tabs value={tab} onValueChange={(value) => setParam('tab', value === 'all' ? null : value)}>
-        <TabsList aria-label="活动状态">
-          {TAB_OPTIONS.map((option) => (
-            <TabsTrigger key={option.value} value={option.value}>
-              {option.label}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-      </Tabs>
+      <PanelHeader
+        title="活动"
+        description="周赛、训练、讲座、日历安排与训练室预约。"
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-xl border border-border bg-muted/40 p-0.5" role="group" aria-label="视图切换">
+              <Button
+                type="button"
+                size="sm"
+                variant={view === 'list' ? 'secondary' : 'ghost'}
+                className="h-8 px-2.5"
+                onClick={() => setParam('view', null)}
+              >
+                <ListIcon className="size-3.5" aria-hidden="true" />
+                列表
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={view === 'calendar' ? 'secondary' : 'ghost'}
+                className="h-8 px-2.5"
+                onClick={() => setParam('view', 'calendar')}
+              >
+                <CalendarDaysIcon className="size-3.5" aria-hidden="true" />
+                日历
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={view === 'rooms' ? 'secondary' : 'ghost'}
+                className="h-8 px-2.5"
+                onClick={() => setParam('view', 'rooms')}
+              >
+                <DoorOpenIcon className="size-3.5" aria-hidden="true" />
+                训练室
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={view === 'materials' ? 'secondary' : 'ghost'}
+                className="h-8 px-2.5"
+                onClick={() => setParam('view', 'materials')}
+              >
+                <BookOpenIcon className="size-3.5" aria-hidden="true" />
+                资料库
+              </Button>
+            </div>
+            <Button type="button" size="sm" variant="outline" onClick={() => setSubscribeOpen(true)}>
+              <CalendarPlusIcon className="size-4" aria-hidden="true" />
+              订阅日历
+            </Button>
+          </div>
+        }
+      />
 
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <div className="relative sm:w-64">
-          <SearchIcon
-            className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
-            aria-hidden="true"
-          />
-          <Input
-            value={searchInput}
-            onChange={(event) => setSearchInput(event.target.value)}
-            placeholder="搜索活动标题"
-            className="pl-9"
-            aria-label="搜索活动标题"
-          />
-        </div>
-        <Select value={type} onValueChange={(value) => setParam('type', value)}>
-          <SelectTrigger className="sm:w-44" aria-label="活动类型筛选">
-            <SelectValue placeholder="全部类型" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">全部类型</SelectItem>
-            {Object.entries(ACTIVITY_TYPE_LABELS).map(([value, label]) => (
-              <SelectItem key={value} value={value}>
-                {label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {listQuery.isPending ? (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          {[0, 1, 2, 3].map((index) => (
-            <Skeleton key={index} className="h-44 rounded-2xl" />
-          ))}
-        </div>
-      ) : listQuery.isError ? (
-        <Card>
-          <CardContent className="py-10">
-            <ErrorState
-              description={listQuery.error.message}
-              onRetry={() => {
-                void listQuery.refetch();
-              }}
-              retrying={listQuery.isFetching}
-            />
-          </CardContent>
-        </Card>
-      ) : items.length === 0 ? (
-        <Card>
-          <CardContent className="py-10 text-center text-sm text-muted-foreground">
-            {tab === 'mine'
-              ? '还没有报名记录；切到「可报名」看看近期活动。'
-              : debouncedSearch
-                ? '没有匹配搜索条件的活动。'
-                : '这里还没有活动，稍后再来看看。'}
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-          {items.map((item) => (
-            <ActivityCardView
-              key={item.id}
-              item={item}
-              onOpen={() => setParam('activity', item.id)}
-            />
-          ))}
-        </div>
-      )}
-      {!listQuery.isPending && !listQuery.isError && (
-        <LoadMoreButton
-          onClick={() => {
-            void listQuery.fetchNextPage();
-          }}
-          loading={listQuery.isFetchingNextPage}
-          hasNext={Boolean(listQuery.data?.pages.at(-1)?.nextCursor)}
-          hint="已展示全部活动"
+      {view === 'calendar' ? (
+        <ActivityCalendarView
+          principalId={principalId}
+          onSelectActivity={(id) => setParam('activity', id)}
         />
+      ) : view === 'rooms' ? (
+        <RoomBookingPanel principalId={principalId} />
+      ) : view === 'materials' ? (
+        <MaterialsLibraryView
+          principalId={principalId}
+          onOpenActivity={(id) => setParam('activity', id)}
+        />
+      ) : (
+        <>
+          <Tabs value={tab} onValueChange={(value) => setParam('tab', value === 'all' ? null : value)}>
+            <TabsList aria-label="活动状态">
+              {TAB_OPTIONS.map((option) => (
+                <TabsTrigger key={option.value} value={option.value}>
+                  {option.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <div className="relative sm:w-64">
+              <SearchIcon
+                className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <Input
+                value={searchInput}
+                onChange={(event) => setSearchInput(event.target.value)}
+                placeholder="搜索活动标题"
+                className="pl-9"
+                aria-label="搜索活动标题"
+              />
+            </div>
+            <Select value={type} onValueChange={(value) => setParam('type', value)}>
+              <SelectTrigger className="sm:w-44" aria-label="活动类型筛选">
+                <SelectValue placeholder="全部类型" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部类型</SelectItem>
+                {Object.entries(ACTIVITY_TYPE_LABELS).map(([value, label]) => (
+                  <SelectItem key={value} value={value}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {listQuery.isPending ? (
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              {[0, 1, 2, 3].map((index) => (
+                <Skeleton key={index} className="h-44 rounded-2xl" />
+              ))}
+            </div>
+          ) : listQuery.isError ? (
+            <Card>
+              <CardContent className="py-10">
+                <ErrorState
+                  description={listQuery.error.message}
+                  onRetry={() => {
+                    void listQuery.refetch();
+                  }}
+                  retrying={listQuery.isFetching}
+                />
+              </CardContent>
+            </Card>
+          ) : items.length === 0 ? (
+            <Card>
+              <CardContent className="py-10 text-center text-sm text-muted-foreground">
+                {tab === 'mine'
+                  ? '还没有报名记录；切到「可报名」看看近期活动。'
+                  : debouncedSearch
+                    ? '没有匹配搜索条件的活动。'
+                    : '这里还没有活动，稍后再来看看。'}
+              </CardContent>
+            </Card>
+          ) : (
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              {items.map((item) => (
+                <ActivityCardView
+                  key={item.id}
+                  item={item}
+                  onOpen={() => setParam('activity', item.id)}
+                />
+              ))}
+            </div>
+          )}
+          {!listQuery.isPending && !listQuery.isError && (
+            <LoadMoreButton
+              onClick={() => {
+                void listQuery.fetchNextPage();
+              }}
+              loading={listQuery.isFetchingNextPage}
+              hasNext={Boolean(listQuery.data?.pages.at(-1)?.nextCursor)}
+              hint="已展示全部活动"
+            />
+          )}
+        </>
       )}
+
+      <CalendarSubscribeDialog
+        principalId={principalId}
+        open={subscribeOpen}
+        onOpenChange={setSubscribeOpen}
+      />
     </div>
   );
 }
@@ -2276,7 +2381,7 @@ function StandingsSection({
             <div className="flex flex-col gap-2">
               <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
                 <UsersIcon className="size-4 text-muted-foreground" aria-hidden="true" />
-                社团对题数排名（{query.data.clubRanking.length} 人 · 榜单共 {query.data.totalEntries} 人）
+                社团对题数排名（{query.data.clubRanking.length} {query.data.isTeam ? '队' : '人'} · 榜单共 {query.data.totalEntries} {query.data.isTeam ? '队/人' : '人'}）
               </h3>
               {query.data.clubRanking.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
@@ -2284,33 +2389,38 @@ function StandingsSection({
                 </p>
               ) : (
                 <ol className="flex flex-col divide-y divide-border rounded-xl border border-border">
-                  {query.data.clubRanking.map((row) => (
-                    <li
-                      key={row.userId}
-                      className={`flex items-center gap-3 px-3 py-2.5 text-sm ${row.userId === principal?.userId ? 'bg-info-subtle' : ''}`}
-                    >
-                      <span className="w-8 shrink-0 text-center font-semibold text-foreground tabular-nums">
-                        {row.clubRank}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate text-foreground">
-                        {row.name}
-                        {row.userId === principal?.userId && (
-                          <span className="ml-1.5 rounded-full bg-primary px-1.5 py-0.5 text-[10px] leading-3 font-semibold text-primary-foreground">
-                            我
-                          </span>
-                        )}
-                      </span>
-                      <span className="hidden truncate text-xs text-muted-foreground sm:block">
-                        {row.displayName ?? row.handle}
-                      </span>
-                      <span className="shrink-0 text-muted-foreground tabular-nums">
-                        {row.solvedCount} 题
-                      </span>
-                      <span className="w-14 shrink-0 text-right font-medium text-foreground tabular-nums">
-                        {row.score}
-                      </span>
-                    </li>
-                  ))}
+                  {query.data.clubRanking.map((row) => {
+                    const isMine =
+                      row.userId === principal?.userId ||
+                      Boolean(principal?.userId && row.memberUserIds?.includes(principal.userId));
+                    return (
+                      <li
+                        key={row.teamId ?? row.userId}
+                        className={`flex items-center gap-3 px-3 py-2.5 text-sm ${isMine ? 'bg-info-subtle' : ''}`}
+                      >
+                        <span className="w-8 shrink-0 text-center font-semibold text-foreground tabular-nums">
+                          {row.clubRank}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-foreground">
+                          {row.name}
+                          {isMine && (
+                            <span className="ml-1.5 rounded-full bg-primary px-1.5 py-0.5 text-[10px] leading-3 font-semibold text-primary-foreground">
+                              {query.data.isTeam ? '我的小队' : '我'}
+                            </span>
+                          )}
+                        </span>
+                        <span className="hidden truncate text-xs text-muted-foreground sm:block">
+                          {row.displayName ?? row.handle}
+                        </span>
+                        <span className="shrink-0 text-muted-foreground tabular-nums">
+                          {row.solvedCount} 题
+                        </span>
+                        <span className="w-14 shrink-0 text-right font-medium text-foreground tabular-nums">
+                          {row.score}
+                        </span>
+                      </li>
+                    );
+                  })}
                 </ol>
               )}
             </div>

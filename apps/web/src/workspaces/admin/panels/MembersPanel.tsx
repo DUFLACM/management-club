@@ -38,7 +38,9 @@ import {
 import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Textarea } from '@/components/ui/textarea';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { MemberAvatar } from '@/components/club/MemberAvatar';
+import { AdminBadgesTab } from '@/components/club/AdminBadgesTab';
 
 interface MemberRowDto {
   id: string;
@@ -135,6 +137,7 @@ export default function MembersPanel() {
 
 function MembersBody({ principalId }: { principalId: string }) {
   const queryClient = useQueryClient();
+  const [subTab, setSubTab] = useState<'roster' | 'badges'>('roster');
   const [searchInput, setSearchInput] = useState('');
   const debouncedSearch = useDebouncedValue(searchInput, 450);
   const [status, setStatus] = useState('all');
@@ -207,22 +210,35 @@ function MembersBody({ principalId }: { principalId: string }) {
     <div className="flex flex-col gap-4">
       <PanelHeader
         title="成员"
-        description="社员名册、身份与入社审批。"
+        description="社员名册、身份审批与徽标授予管理。"
         actions={
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => setImportOpen(true)}>
-              <UploadIcon aria-hidden="true" />
-              Excel 导入
-            </Button>
-            <Button variant="outline" onClick={() => setEvaluationOpen(true)}>
-              <CalendarRangeIcon aria-hidden="true" />
-              月评预览
-            </Button>
-          </div>
+          subTab === 'roster' ? (
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => setImportOpen(true)}>
+                <UploadIcon aria-hidden="true" />
+                Excel 导入
+              </Button>
+              <Button variant="outline" onClick={() => setEvaluationOpen(true)}>
+                <CalendarRangeIcon aria-hidden="true" />
+                月评预览
+              </Button>
+            </div>
+          ) : undefined
         }
       />
 
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+      <Tabs value={subTab} onValueChange={(v) => setSubTab(v === 'badges' ? 'badges' : 'roster')}>
+        <TabsList aria-label="成员管理分区">
+          <TabsTrigger value="roster">成员名册</TabsTrigger>
+          <TabsTrigger value="badges">徽标管理</TabsTrigger>
+        </TabsList>
+      </Tabs>
+
+      {subTab === 'badges' ? (
+        <AdminBadgesTab principalId={principalId} />
+      ) : (
+        <>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
         <div className="relative sm:w-64">
           <SearchIcon
             className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
@@ -427,6 +443,8 @@ function MembersBody({ principalId }: { principalId: string }) {
             </div>
           </CardContent>
         </Card>
+      )}
+        </>
       )}
 
       {detailId && (

@@ -21,6 +21,30 @@ async function main(): Promise<void> {
   console.log(`[${WORKER_ID}] Worker 启动；已注册处理器：${handledJobTypes.join(', ')}`)
 
   const running = new Map<string, { jobId: string; leaseToken: string }>()
+  const startedAt = new Date().toISOString()
+  const heartbeatKey = `worker:heartbeat:${WORKER_ID}`
+
+  const reportWorkerHeartbeat = async (state: 'online' | 'stopped' = 'online'): Promise<void> => {
+    try {
+      const value = {
+        workerId: WORKER_ID,
+        state,
+        startedAt,
+        lastSeenAt: new Date().toISOString(),
+        activeJobs: running.size,
+        handledJobTypes,
+      }
+      await db.appMeta.upsert({
+        where: { key: heartbeatKey },
+        create: { key: heartbeatKey, value },
+        update: { value },
+      })
+    } catch {
+      // 心跳写入失败不中断主循环
+    }
+  }
+  void reportWorkerHeartbeat('online')
+  const workerAliveTimer = setInterval(() => void reportWorkerHeartbeat('online'), 25_000)
 
   const heartbeat = setInterval(async () => {
     for (const [key, job] of [...running.entries()]) {
@@ -44,6 +68,9 @@ async function main(): Promise<void> {
         WHERE status = 'running' AND lease_until < now()`
       await db.anonymousBinding.deleteMany({ where: { expiresAt: { lt: new Date(Date.now() - 3600_000) } } })
       await db.hydroNonce.deleteMany({ where: { expiresAt: { lt: new Date() } } })
+      await db.appMeta.deleteMany({
+        where: { key: { startsWith: 'worker:heartbeat:' }, updatedAt: { lt: new Date(Date.now() - 7 * 24 * 3600_000) } },
+      })
     } catch {
       // 忽略
     }
@@ -133,9 +160,11 @@ async function main(): Promise<void> {
     )
   }
 
+  clearInterval(workerAliveTimer)
   clearInterval(heartbeat)
   clearInterval(reclaimer)
   clearInterval(dailyRefresh)
+  await reportWorkerHeartbeat('stopped')
   await db.$disconnect()
   // eslint-disable-next-line no-console
   console.log(`[${WORKER_ID}] Worker 已停止`)

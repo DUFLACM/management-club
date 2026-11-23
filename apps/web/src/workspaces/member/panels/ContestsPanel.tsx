@@ -93,11 +93,12 @@ interface CompetitionResultDto {
   verifiedBinding: boolean;
 }
 
-/** 平台徽标配色：牛客橙 / CF 蓝 / AtCoder 中性 / 校内 OJ 绿 */
+/** 平台徽标配色：牛客橙 / CF 蓝 / AtCoder 中性 / VJudge 紫 / 校内 OJ 绿 */
 const PLATFORM_CHIP: Record<string, string> = {
   nowcoder: 'bg-warning-subtle text-warning-foreground',
   codeforces: 'bg-info-subtle text-info-foreground',
   atcoder: 'bg-muted text-foreground',
+  vjudge: 'bg-primary/10 text-primary',
   hydro: 'bg-success-subtle text-success-foreground',
 };
 
@@ -106,6 +107,7 @@ const PLATFORM_FILTERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'nowcoder', label: '牛客' },
   { value: 'codeforces', label: 'Codeforces' },
   { value: 'atcoder', label: 'AtCoder' },
+  { value: 'vjudge', label: 'VJudge' },
   { value: 'hydro', label: '校内 OJ' },
 ];
 
@@ -121,6 +123,7 @@ const PLATFORM_BADGES: Record<string, string> = {
   nowcoder: '牛客',
   codeforces: 'Codeforces',
   atcoder: 'AtCoder',
+  vjudge: 'VJudge',
   hydro: '校内 OJ',
 };
 

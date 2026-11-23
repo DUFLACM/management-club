@@ -118,7 +118,7 @@ export class PlatformAdminController {
       category: z.enum(['A', 'B', 'C']),
       groupName: z.string().min(1).max(64),
       name: z.string().min(2).max(160),
-      platform: z.enum(['nowcoder', 'codeforces', 'atcoder', 'hydro', 'other']).optional(),
+      platform: z.enum(['nowcoder', 'codeforces', 'atcoder', 'vjudge', 'hydro', 'other']).optional(),
       lambdaKey: z.enum(['A', 'B', 'C']).optional(),
       note: z.string().max(500).optional(),
       evidenceRef: z.string().max(300).optional(),
@@ -142,10 +142,57 @@ export class PlatformAdminController {
   @Get('contests')
   @RequireAction('activity.manage')
   async contestDirectory(@Query('platform') platform?: string, @Query('q') q?: string) {
-    if (!platform || !['nowcoder', 'codeforces', 'atcoder', 'hydro'].includes(platform)) {
+    if (!platform || !['nowcoder', 'codeforces', 'atcoder', 'vjudge', 'hydro'].includes(platform)) {
       return ok([])
     }
     return ok(await this.platforms.adminContestDirectory(platform, q))
+  }
+
+  /** 后台 Worker 心跳与任务积压状态（避免未启动 Worker 时同步任务静默排队） */
+  @Get('worker-status')
+  @RequireAction('sync.manage')
+  async workerStatus() {
+    const now = Date.now()
+    const ONLINE_THRESHOLD_MS = 90_000
+    const [metaRows, queuedJobs, runningJobs] = await Promise.all([
+      this.db.appMeta.findMany({
+        where: { key: { startsWith: 'worker:heartbeat:' } },
+        orderBy: { updatedAt: 'desc' },
+        take: 10,
+      }),
+      this.db.job.count({ where: { status: 'queued' } }),
+      this.db.job.count({ where: { status: 'running' } }),
+    ])
+    const workers = metaRows.map((row) => {
+      const value = (row.value && typeof row.value === 'object' ? row.value : {}) as {
+        workerId?: string
+        state?: string
+        startedAt?: string
+        lastSeenAt?: string
+        activeJobs?: number
+        handledJobTypes?: string[]
+      }
+      const lastSeenMs = value.lastSeenAt ? Date.parse(value.lastSeenAt) : row.updatedAt.getTime()
+      const online = value.state !== 'stopped' && Number.isFinite(lastSeenMs) && now - lastSeenMs <= ONLINE_THRESHOLD_MS
+      return {
+        workerId: value.workerId ?? row.key.replace(/^worker:heartbeat:/, ''),
+        online,
+        state: value.state ?? (online ? 'online' : 'stale'),
+        startedAt: value.startedAt ?? null,
+        lastSeenAt: Number.isFinite(lastSeenMs) ? new Date(lastSeenMs).toISOString() : row.updatedAt.toISOString(),
+        activeJobs: typeof value.activeJobs === 'number' ? value.activeJobs : 0,
+        handledJobTypes: Array.isArray(value.handledJobTypes) ? value.handledJobTypes : [],
+      }
+    })
+    const onlineWorkers = workers.filter((w) => w.online)
+    return ok({
+      online: onlineWorkers.length > 0,
+      onlineCount: onlineWorkers.length,
+      workers,
+      queuedJobs,
+      runningJobs,
+      checkedAt: new Date(now).toISOString(),
+    })
   }
 
   /** 同步任务状态（最近成功/失败/排队）；账号同步任务附带对应平台账号与成员，失败时可直接定位 */

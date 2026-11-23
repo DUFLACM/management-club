@@ -83,6 +83,7 @@ async function main(): Promise<void> {
       { category: 'B', groupName: '平台型公开训练赛事', name: 'AtCoder ARC', platform: 'atcoder', lambdaKey: 'A', note: '须赛前公告指定 + 统一组织核验', evidenceRef: '附录一 第三条（一）3' },
       { category: 'B', groupName: '平台型公开训练赛事', name: 'AtCoder AGC', platform: 'atcoder', note: '附录二 λ 表未给 AGC 档位，须由赛前公告确定', evidenceRef: '附录一 第三条（一）3；04 方案 3.2' },
       { category: 'B', groupName: '平台型公开训练赛事', name: '牛客周赛 / 牛客练习赛', platform: 'nowcoder', lambdaKey: 'B', note: '须赛前公告指定 + 统一组织核验', evidenceRef: '附录一 第三条（一）4' },
+      { category: 'B', groupName: '平台型公开训练赛事', name: 'VJudge 周赛 / 组队训练赛', platform: 'vjudge', lambdaKey: 'B', note: '按正常周赛乙类档（λ=1.0）计分，支持个人赛与组队赛', evidenceRef: '附录一 第三条（一）' },
       { category: 'B', groupName: '平台型公开训练赛事', name: '牛客小白月赛', platform: 'nowcoder', lambdaKey: 'C', note: '须赛前公告指定 + 统一组织核验', evidenceRef: '附录一 第三条（一）4' },
       { category: 'B', groupName: '官方认证与个人实名赛事', name: '蓝桥杯全国软件和信息技术专业人才大赛（软件赛）', note: '个人实名报名；赛后凭证书/官方公示核验计分', evidenceRef: '附录一 第三条（二）1' },
       { category: 'B', groupName: '官方认证与个人实名赛事', name: 'CCF CSP 计算机软件能力认证', note: '个人实名；赛后凭认证成绩核验', evidenceRef: '附录一 第三条（二）2' },

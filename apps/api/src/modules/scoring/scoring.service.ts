@@ -1,6 +1,6 @@
 import { DomainError } from '../../common/domain-error.js'
 import type { Prisma } from '@acm/db'
-import { Inject, Injectable } from '@nestjs/common'
+import { Inject, Injectable, Optional } from '@nestjs/common'
 import {
   buildSourceKey,
   computeEffectiveScore,
@@ -13,6 +13,7 @@ import {
 } from '@acm/scoring-core'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { ActivityService } from '../activities/activity.service.js'
 import { ContestStandingsService } from '../activities/contest-standings.service.js'
 import { initialSummary, rankEligibleMembers } from './effective-ranking.js'
@@ -85,6 +86,7 @@ export class ScoringService {
     @Inject(AuditService) private readonly audit: AuditService,
     @Inject(ActivityService) private readonly activityService: ActivityService,
     @Inject(ContestStandingsService) private readonly standingsService: ContestStandingsService,
+    @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
   private async currentRuleVersion(): Promise<{ id: string; params: RuleParams }> {
@@ -141,21 +143,17 @@ export class ScoringService {
     if (activity.endAt.getTime() + 5 * 60_000 > Date.now()) {
       throw new ScoringError('比赛结束后有 5 分钟数据同步处理窗口，请稍后再试', 'PROCESSING_WINDOW')
     }
-    const { activity: _a, contestUrl, result, clubRows, problems, totalEntries } =
+    const { activity: _a, contestUrl, result, isTeam, clubRows, teamRows, unmatchedTeams, problems, totalEntries } =
       await this.activityService.platformClubRows(activityId, this.standingsService)
     void _a
     if (!result.available) {
       throw new ScoringError(`平台榜单暂不可用：${result.reason}${contestUrl ? `（可稍后重试或前往 ${contestUrl} 核对）` : ''}`, 'STANDINGS_UNAVAILABLE')
     }
 
-    // λ：公告 → 指定目录 → 默认乙类
+    // λ：公告 → 指定目录 → 默认乙类（周赛档 λ=1.0）
     const config = (activity.scoringConfig ?? {}) as { lambdaKey?: string; specialCap?: number }
     const { lambdaKey, lambdaSource } = await this.resolveLambda(activity.platform, activity.title, config.lambdaKey)
     const cap = Math.min(config.specialCap ?? 20, 25)
-
-    // 有效提交（R04 引擎自动判定）与社团内排名
-    const valid = clubRows.filter(hasValidSubmission)
-    const rankOf = new Map(valid.map((row, index) => [row.userId, index + 1]))
     const totalProblems = problems.length
     const fullTotal = problems.reduce((sum, problem) => sum + (problem.fullScore ?? 0), 0)
 
@@ -174,6 +172,67 @@ export class ScoringService {
     const skipped: Array<{ name: string; reason: string }> = []
     let posted = 0
     let deduplicated = 0
+
+    if (isTeam) {
+      // 组队赛：按队伍计算有效提交与社内队伍名次 R，再为队内每位到场/获批远程的成员按同一队成绩入账
+      const validTeams = teamRows.filter(hasValidSubmission)
+      const rankOfTeam = new Map(validTeams.map((row, index) => [row.teamId, index + 1]))
+      for (const teamRow of validTeams) {
+        for (const member of teamRow.members) {
+          const isRemote = remoteSet.has(member.userId) && !onsiteSet.has(member.userId)
+          if (!onsiteSet.has(member.userId) && !isRemote) {
+            skipped.push({ name: member.name, reason: `所在小队「${teamRow.teamName}」榜上有提交，但本人无到场记录（未扫码且未人工复核），转人工窗口` })
+            continue
+          }
+          const formula = computeContestW({
+            solvedCount: teamRow.solvedCount,
+            score: teamRow.score,
+            platformRank: teamRow.platformRank,
+            clubRank: rankOfTeam.get(teamRow.teamId)!,
+            validCount: validTeams.length,
+            totalProblems,
+            fullTotal,
+            totalEntries,
+            lambdaKey,
+            remote: isRemote,
+            cap,
+          })
+          const outcome = await this.postLedgerEntry(actor, {
+            userId: member.userId,
+            sourceKey: `contest:${activity.platform}:${activity.platformContestId}:W:${member.userId}`,
+            category: isRemote ? 'remote_contest' : 'contest',
+            amount: formula.W.toFixed(2),
+            scoreMonth: monthKey(activity.endAt),
+            detail: {
+              activityId,
+              activityTitle: activity.title,
+              teamId: teamRow.teamId,
+              teamName: teamRow.teamName,
+              teamHandle: teamRow.handle,
+              formula: { B: formula.B, lambda: formula.lambda, lambdaKey, S: formula.S, R: formula.R, X: formula.X, W: formula.W },
+              lambdaSource,
+              note: `平台组队赛结算引擎自动入账（小队「${teamRow.teamName}」，有效提交由榜单自动核验）`,
+            },
+          })
+          if (outcome.deduplicated) deduplicated++
+          else posted++
+        }
+      }
+      for (const teamRow of teamRows) {
+        if (!validTeams.includes(teamRow)) {
+          skipped.push({ name: `${teamRow.teamName}（${teamRow.members.map((m) => m.name).join('、')}）`, reason: '榜上无有效提交（仅记出勤，不发竞赛分）' })
+        }
+      }
+      for (const team of unmatchedTeams) {
+        skipped.push({ name: `${team.teamName}（${team.members.map((m) => m.name).join('、')}）`, reason: '队员绑定的平台账号均未出现在榜单上' })
+      }
+      return { posted, deduplicated, skipped, lambda: { key: lambdaKey, source: lambdaSource }, cap, validCount: validTeams.length }
+    }
+
+    // 个人赛：有效提交（R04 引擎自动判定）与社团内排名
+    const valid = clubRows.filter(hasValidSubmission)
+    const rankOf = new Map(valid.map((row, index) => [row.userId, index + 1]))
+
     for (const row of valid) {
       const isRemote = remoteSet.has(row.userId) && !onsiteSet.has(row.userId)
       if (!onsiteSet.has(row.userId) && !isRemote) {
@@ -688,6 +747,70 @@ export class ScoringService {
     return { appealId: id }
   }
 
+  /** 本人提交的申诉列表（含受理与结案回复） */
+  async myAppeals(userId: string) {
+    const rows = await this.db.appeal.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+      select: {
+        id: true,
+        subject: true,
+        materials: true,
+        status: true,
+        resolutionNote: true,
+        createdAt: true,
+        closedAt: true,
+      },
+    })
+    return rows.map((row) => ({
+      ...row,
+      createdAt: row.createdAt.toISOString(),
+      closedAt: row.closedAt?.toISOString() ?? null,
+    }))
+  }
+
+  /** 管理端处理申诉：受理中 / 采纳结案 / 驳回结案（保留审计） */
+  async decideAppeal(
+    actor: SessionActor,
+    appealId: string,
+    decision: 'in_review' | 'resolved' | 'rejected',
+    resolutionNote: string,
+  ): Promise<{ appealId: string; status: string }> {
+    const appeal = await this.db.appeal.findUnique({
+      where: { id: appealId },
+      include: { user: { select: { verifiedRealName: true, studentNo: true } } },
+    })
+    if (!appeal) throw new ScoringError('申诉不存在', 'NOT_FOUND')
+    const closing = decision === 'resolved' || decision === 'rejected'
+    await this.db.appeal.update({
+      where: { id: appealId },
+      data: {
+        status: decision,
+        resolutionNote: resolutionNote.trim() || null,
+        closedAt: closing ? new Date() : null,
+      },
+    })
+    const label = decision === 'in_review' ? '标记受理中' : decision === 'resolved' ? '采纳并结案' : '驳回申诉'
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: `appeal.${decision}`,
+      resourceType: 'appeal',
+      resourceId: appealId,
+      summary: `${label}：${appeal.user.verifiedRealName}（${appeal.subject.slice(0, 80)}）${resolutionNote.trim() ? `；回复：${resolutionNote.trim().slice(0, 200)}` : ''}`,
+    })
+    await this.notifications?.notify({
+      userId: appeal.userId,
+      kind: 'appeal_decision',
+      title: `积分申诉${label}`,
+      body: resolutionNote.trim()
+        ? `事项「${appeal.subject.slice(0, 60)}」处理回复：${resolutionNote.trim()}`
+        : `事项「${appeal.subject.slice(0, 60)}」已更新状态为：${label}。`,
+      link: '/app?section=points',
+    })
+    return { appealId, status: decision }
+  }
+
   /** 贡献/成果申报 */
   async submitClaim(userId: string, input: { category: string; title: string; description: string; activityId?: string; contestKey?: string; evidenceNote?: string; evidenceAssetIds?: string[] }): Promise<{ claimId: string }> {
     const assetIds = input.evidenceAssetIds ?? []
@@ -784,6 +907,13 @@ export class ScoringService {
       resourceType: 'points_claim',
       resourceId: claimId,
       summary: `贡献申报「${claim.title}」${decision === 'approve' ? '通过' : decision === 'reject' ? '驳回' : '要求补充材料'}${amount ? `，入账 ${amount}` : ''}`,
+    })
+    await this.notifications?.notify({
+      userId: claim.userId,
+      kind: 'claim_decision',
+      title: decision === 'approve' ? '贡献申报已通过' : decision === 'reject' ? '贡献申报未通过' : '贡献申报需补充材料',
+      body: `「${claim.title}」${decision === 'approve' ? (amount ? `已入账 +${amount} 分` : '已审核通过') : decision === 'reject' ? '已被驳回' : '请补充佐证材料'}${note ? `（意见：${note}）` : ''}。`,
+      link: '/app?section=contributions',
     })
     return { decided: true }
   }

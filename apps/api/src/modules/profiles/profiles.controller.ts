@@ -158,6 +158,19 @@ export class BadgesAdminController {
     return ok(await this.profiles.defineBadge(actor, parsed))
   }
 
+  @Get('awards')
+  @RequireAction('members.read')
+  async listAwards() {
+    return ok(await this.profiles.listBadgeAwards())
+  }
+
+  @Post('auto-grant')
+  @RequireAction('badges.grant')
+  async autoGrant(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
+    const parsed = z.object({ dryRun: z.boolean().default(false) }).parse(body ?? {})
+    return ok(await this.profiles.autoGrantBadges(actor, parsed.dryRun))
+  }
+
   @Post('awards')
   @RequireAction('badges.grant')
   async grant(@CurrentActor() actor: SessionActor, @Body() body: unknown) {

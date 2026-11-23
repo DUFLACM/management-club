@@ -4,8 +4,8 @@
  * 申诉入口 POST /me/appeals。
  */
 import { useMemo, useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
-import { FileTextIcon, LoaderCircleIcon, ScaleIcon } from 'lucide-react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { FileTextIcon, LoaderCircleIcon, ScaleIcon, TrendingDownIcon } from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
@@ -72,6 +72,23 @@ interface LedgerEntryDto {
   reversalReason: string | null;
   detail: Record<string, unknown> | null;
 }
+
+interface MyAppealDto {
+  id: string;
+  subject: string;
+  materials: string | null;
+  status: string;
+  resolutionNote: string | null;
+  createdAt: string;
+  closedAt: string | null;
+}
+
+const APPEAL_STATUS_LABELS: Record<string, string> = {
+  submitted: '已提交',
+  in_review: '受理中',
+  resolved: '已采纳结案',
+  rejected: '已驳回',
+};
 
 const CATEGORY_LABELS: Record<string, string> = {
   contest: '比赛',
@@ -164,6 +181,7 @@ function PointsBody({ principalId }: { principalId: string }) {
                     <p className="text-xs leading-5 text-muted-foreground">
                       近六个月 M 按当月 ×1、往前 ×0.85 / ×0.7 / ×0.55 / ×0.4 / ×0.25 加权求和{overview.initial ? '（含入社基础分）' : ''}。
                     </p>
+                    <NextMonthDecayHint components={overview.eComponents} currentE={Number(overview.e)} />
                   </CardContent>
                 </Card>
                 {overview.initial && <InitialPointsCard initial={overview.initial} />}
@@ -230,8 +248,109 @@ function PointsBody({ principalId }: { principalId: string }) {
         </CardContent>
       </Card>
 
-      <AppealDrawer open={appealOpen} onOpenChange={setAppealOpen} />
+      <MyAppealsCard principalId={principalId} onNewAppeal={() => setAppealOpen(true)} />
+
+      <AppealDrawer principalId={principalId} open={appealOpen} onOpenChange={setAppealOpen} />
     </div>
+  );
+}
+
+/** 下月衰减预览：按 6 个月权重顺移一格，预估下月基础 E 与自然衰减量 */
+function NextMonthDecayHint({
+  components,
+  currentE,
+}: {
+  components: PointsOverviewDto['eComponents'];
+  currentE: number;
+}) {
+  if (components.length === 0 || Number.isNaN(currentE)) return null;
+  const shiftedWeights = [0.85, 0.7, 0.55, 0.4, 0.25, 0];
+  // components 按月份倒序或正序均可，按 month 降序排列确保最新月对应 0.85
+  const ordered = [...components].sort((a, b) => b.month.localeCompare(a.month));
+  const nextBaseE = ordered.reduce((sum, item, index) => sum + item.m * (shiftedWeights[index] ?? 0), 0);
+  const delta = nextBaseE - currentE;
+  return (
+    <div className="mt-1 flex items-start gap-2 rounded-xl bg-muted/50 px-3 py-2 text-xs leading-5 text-muted-foreground">
+      <TrendingDownIcon className="mt-0.5 size-3.5 shrink-0 text-primary" aria-hidden="true" />
+      <span>
+        下月换月基线约 <strong className="font-semibold text-foreground tabular-nums">{nextBaseE.toFixed(1)}</strong>
+        {delta < -0.05 ? (
+          <>
+            （自然衰减 <span className="tabular-nums">{Math.abs(delta).toFixed(1)}</span> 分，下月新获同等积分即可保持当前排名水位）
+          </>
+        ) : (
+          '（下月暂无明显自然衰减）'
+        )}
+      </span>
+    </div>
+  );
+}
+
+function MyAppealsCard({
+  principalId,
+  onNewAppeal,
+}: {
+  principalId: string;
+  onNewAppeal: () => void;
+}) {
+  const appealsQuery = usePrivateQuery<MyAppealDto[], ApiError>(
+    principalId,
+    ['me', 'appeals'],
+    async () => (await api.get<MyAppealDto[]>('/me/appeals')).data,
+  );
+  const items = appealsQuery.data ?? [];
+  if (appealsQuery.isPending || appealsQuery.isError) return null;
+
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-3 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-foreground">我的申诉记录</h2>
+            <p className="text-xs text-muted-foreground">查看提交过的积分申诉与负责人处理回复。</p>
+          </div>
+          <Button type="button" size="sm" variant="outline" onClick={onNewAppeal}>
+            <ScaleIcon aria-hidden="true" />
+            发起新申诉
+          </Button>
+        </div>
+        {items.length === 0 ? (
+          <p className="py-3 text-center text-xs text-muted-foreground">暂无申诉记录。</p>
+        ) : (
+          <ul className="flex flex-col divide-y divide-border">
+            {items.map((appeal) => (
+              <li key={appeal.id} className="flex flex-col gap-1.5 py-3 text-sm">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium text-foreground">{appeal.subject}</span>
+                  <StatusBadge
+                    kind="disclosure"
+                    value={
+                      appeal.status === 'resolved'
+                        ? '已批准'
+                        : appeal.status === 'rejected'
+                          ? '已驳回'
+                          : appeal.status === 'in_review'
+                            ? '待审核'
+                            : '待审批'
+                    }
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground tabular-nums">
+                  {APPEAL_STATUS_LABELS[appeal.status] ?? appeal.status} · 提交于 {formatDateTime(appeal.createdAt)}
+                  {appeal.closedAt ? ` · 结案于 ${formatDateTime(appeal.closedAt)}` : ''}
+                </p>
+                {appeal.resolutionNote && (
+                  <div className="rounded-xl bg-muted/50 px-3 py-2 text-xs leading-5 text-foreground">
+                    <span className="font-medium text-muted-foreground">处理回复：</span>
+                    {appeal.resolutionNote}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -419,17 +538,23 @@ function LedgerTable({ entries }: { entries: LedgerEntryDto[] }) {
 }
 
 function AppealDrawer({
+  principalId,
   open,
   onOpenChange,
 }: {
+  principalId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const queryClient = useQueryClient();
   const [subject, setSubject] = useState('');
   const [materials, setMaterials] = useState('');
   const mutation = useMutation({
     mutationFn: async (input: { subject: string; materials?: string }) =>
       (await api.post<{ appealId: string }>('/me/appeals', input)).data,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'appeals'] });
+    },
   });
 
   return (

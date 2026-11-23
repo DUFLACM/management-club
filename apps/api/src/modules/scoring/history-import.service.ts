@@ -26,7 +26,7 @@ import type { SessionActor } from '../auth/session.service.js'
 
 export const HISTORY_CATEGORIES = ['contest', 'remote_contest', 'activity', 'contribution', 'service', 'award', 'initial', 'penalty'] as const
 export const HISTORY_ACTIVITY_TYPES = ['weekly_contest', 'monthly_contest', 'custom_contest', 'lecture', 'training', 'meeting', 'gathering', 'camp', 'service'] as const
-export const CONTEST_PLATFORMS = ['nowcoder', 'codeforces', 'atcoder'] as const
+export const CONTEST_PLATFORMS = ['nowcoder', 'codeforces', 'atcoder', 'vjudge'] as const
 
 /**
  * 参加即得的默认参与分（积分办法附录二第五节）：必到活动准时到场 +2；宣讲 / 分享 / 复盘等普通参会 +1.5；
@@ -412,14 +412,21 @@ export class HistoryImportService {
         )
         contestInfos.push({ index, info: summary.info })
 
-        // 按表格里的平台账号查榜单成绩
+        // 按表格里的平台账号查榜单成绩；组队赛多人共用同一平台账号时按同一榜上账号共用社内名次与有效队伍数
         const found = rows.map((row) => ({ row, entry: summary.entries && row.handle ? findEntry(platform, summary.entries, row.handle) : undefined }))
+        const rankKeyOf = (entry: StandingsEntry) => (platform === 'nowcoder' ? entry.handle : entry.handle.toLowerCase())
         const valid = found
           .filter((item): item is { row: Resolved; entry: StandingsEntry } => item.entry != null && hasValidSubmission({ ...item.entry, platformRank: item.entry.rank }))
-          .sort((a, b) => b.entry.solvedCount - a.entry.solvedCount || b.entry.score - a.entry.score)
-        // 同一成员同场多行时，只按第一次出现参与社内排名
+          .sort((a, b) =>
+            b.entry.solvedCount - a.entry.solvedCount
+            || b.entry.score - a.entry.score
+            || (a.entry.rank ?? Number.MAX_SAFE_INTEGER) - (b.entry.rank ?? Number.MAX_SAFE_INTEGER),
+          )
         const rankOf = new Map<string, number>()
-        for (const item of valid) if (!rankOf.has(item.row.studentNo)) rankOf.set(item.row.studentNo, rankOf.size + 1)
+        for (const item of valid) {
+          const key = rankKeyOf(item.entry)
+          if (!rankOf.has(key)) rankOf.set(key, rankOf.size + 1)
+        }
 
         for (const { row, entry } of found) {
           if (!row.activityTitle) row.activityTitle = summary.info.existingActivity?.title ?? summary.info.name ?? undefined
@@ -430,7 +437,7 @@ export class HistoryImportService {
           if (row.error) continue
 
           if (entry) {
-            const clubRank = rankOf.get(row.studentNo)
+            const clubRank = rankOf.get(rankKeyOf(entry))
             const formula = clubRank == null || !summary.info.lambda ? null : computeContestW({
               solvedCount: entry.solvedCount,
               score: entry.score,

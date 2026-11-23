@@ -35,7 +35,7 @@ const GROUP_SCHEMAS: Record<SettingGroup, z.ZodTypeAny> = {
   invite_policy: z.object({ defaultExpiresInDays: z.number().int().min(1).max(365), defaultMaxUses: z.number().int().min(1).max(200) }),
   badges: z.object({ publicDisplayAllowed: z.boolean() }),
   privacy_disclosures: z.object({ publicProfilesEnabled: z.boolean(), retentionNote: z.string().max(300).optional() }),
-  platforms: z.object({ nowcoderEnabled: z.boolean(), codeforcesEnabled: z.boolean(), atcoderEnabled: z.boolean(), atcoderProblemsEnabled: z.boolean() }),
+  platforms: z.object({ nowcoderEnabled: z.boolean(), codeforcesEnabled: z.boolean(), atcoderEnabled: z.boolean(), atcoderProblemsEnabled: z.boolean(), vjudgeEnabled: z.boolean().optional() }),
   worker: z.object({ concurrency: z.number().int().min(1).max(16), jobTimeoutMinutes: z.number().int().min(1).max(60) }),
   review_rules: z.object({ minReviewers: z.number().int().min(2), teacherEscalationEnabled: z.boolean() }),
   cas: z.object({ note: z.string().max(200).optional() }), // CAS 地址为受控部署配置，页面只读

@@ -1,7 +1,8 @@
 import { DomainError } from '../../common/domain-error.js'
-import { Inject, Injectable } from '@nestjs/common'
+import { Inject, Injectable, Optional } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { newInvitationSecret } from '../auth/auth.service.js'
 import { newId, sha256Hex, monthKey, memberName } from '../../common/utils.js'
 import { computeEffectiveScore, formalQuota, graceMonths } from '@acm/scoring-core'
@@ -55,6 +56,7 @@ export class MembersService {
   constructor(
     @Inject(PrismaService) private readonly db: PrismaService,
     private readonly audit: AuditService,
+    @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
   /** /api/v1/me/dashboard：轻量首屏聚合（不加载流水/附件/榜单/第三方） */
@@ -719,14 +721,115 @@ export class MembersService {
         ? { status: 'approved', approvedBy: actor.principalId, approvedAt: new Date() }
         : { status: 'rejected', rejectionReason: reason ?? '' },
     })
+    const recipients = [...new Set([booking.applicantUserId, ...booking.coApplicantUserIds])]
+    for (const uid of recipients) {
+      await this.notifications?.notify({
+        userId: uid,
+        kind: 'room_booking',
+        title: decision === 'approve' ? '训练室预约已批准' : '训练室预约未通过',
+        body: `用途「${booking.purpose}」${decision === 'approve' ? '已批准使用，请遵守训练室规范。' : `已被驳回${reason ? `（原因：${reason}）` : ''}。`}`,
+        link: '/app?section=activities&tab=rooms',
+      })
+    }
   }
 
   async myRoomBookings(userId: string) {
-    return this.db.roomBooking.findMany({
+    const rows = await this.db.roomBooking.findMany({
       where: { OR: [{ applicantUserId: userId }, { coApplicantUserIds: { has: userId } }] },
       orderBy: { startsAt: 'desc' },
-      take: 20,
+      take: 30,
     })
+    return this.enrichRoomBookings(rows)
+  }
+
+  /** 近期 14 天训练室时段占用（已批准 + 待审批），供成员预约前直观查看余量 */
+  async roomBookingSchedule() {
+    const now = new Date()
+    const until = new Date(now.getTime() + 14 * 24 * 3600_000)
+    const rows = await this.db.roomBooking.findMany({
+      where: {
+        status: { in: ['approved', 'pending'] },
+        endsAt: { gte: now },
+        startsAt: { lte: until },
+      },
+      orderBy: { startsAt: 'asc' },
+      take: 100,
+    })
+    return this.enrichRoomBookings(rows)
+  }
+
+  async adminRoomBookings(status?: string) {
+    const rows = await this.db.roomBooking.findMany({
+      where: status && status !== 'all' ? { status } : undefined,
+      orderBy: { startsAt: 'asc' },
+      take: 80,
+    })
+    return this.enrichRoomBookings(rows)
+  }
+
+  async cancelRoomBooking(userId: string, bookingId: string): Promise<void> {
+    const booking = await this.db.roomBooking.findUnique({ where: { id: bookingId } })
+    if (!booking) throw new MembersError('预约不存在', 'NOT_FOUND')
+    if (booking.applicantUserId !== userId) throw new MembersError('仅主申请人可以取消预约', 'FORBIDDEN')
+    if (!['pending', 'approved'].includes(booking.status)) throw new MembersError('当前状态不可取消', 'STATE_INVALID')
+    if (booking.startsAt <= new Date()) throw new MembersError('预约时段已开始，无法取消', 'STATE_INVALID')
+    await this.db.roomBooking.update({
+      where: { id: bookingId },
+      data: { status: 'cancelled' },
+    })
+  }
+
+  /** 共同申请人搜索候选（排除本人与禁用账号） */
+  async roomBookingCandidates(excludeUserId: string, q?: string) {
+    const trimmed = q?.trim()
+    const users = await this.db.user.findMany({
+      where: {
+        id: { not: excludeUserId },
+        accountStatus: 'active',
+        ...(trimmed
+          ? {
+              OR: [
+                { verifiedRealName: { contains: trimmed, mode: 'insensitive' } },
+                { studentNo: { contains: trimmed, mode: 'insensitive' } },
+                { profile: { displayName: { contains: trimmed, mode: 'insensitive' } } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: { verifiedRealName: 'asc' },
+      take: 20,
+      select: {
+        id: true,
+        studentNo: true,
+        verifiedRealName: true,
+        profile: { select: { displayName: true } },
+      },
+    })
+    return users.map((u) => ({
+      userId: u.id,
+      studentNo: u.studentNo,
+      name: memberName(u),
+    }))
+  }
+
+  private async enrichRoomBookings<T extends { applicantUserId: string; coApplicantUserIds: string[]; startsAt: Date; endsAt: Date; approvedAt: Date | null; createdAt: Date }>(rows: T[]) {
+    const ids = [...new Set(rows.flatMap((r) => [r.applicantUserId, ...r.coApplicantUserIds]))]
+    const users = ids.length === 0
+      ? []
+      : await this.db.user.findMany({
+          where: { id: { in: ids } },
+          select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } },
+        })
+    const map = new Map(users.map((u) => [u.id, { userId: u.id, studentNo: u.studentNo, name: memberName(u) }]))
+    return rows.map((row) => ({
+      ...row,
+      startsAt: row.startsAt.toISOString(),
+      endsAt: row.endsAt.toISOString(),
+      approvedAt: row.approvedAt?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+      applicant: map.get(row.applicantUserId) ?? { userId: row.applicantUserId, studentNo: '—', name: '未知成员' },
+      coApplicants: row.coApplicantUserIds.map((id) => map.get(id) ?? { userId: id, studentNo: '—', name: '未知成员' }),
+    }))
   }
 
   /** 审计检索（脱敏：不返回 ticket/token/坐标原文） */

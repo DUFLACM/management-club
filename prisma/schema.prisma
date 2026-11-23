@@ -69,6 +69,7 @@ model User {
   teamInvitesReceived  TeamInvite[]
   teamJoinRequests     TeamJoinRequest[]
   evaluationRows       EvaluationRow[]
+  notifications        UserNotification[]
 
   @@index([studentNo])
   @@map("users")
@@ -1936,4 +1937,22 @@ model AnnouncementRead {
   @@id([announcementId, principalId])
   @@index([principalId])
   @@map("announcement_reads")
+}
+
+/// 个人事件通知：审批结果、申诉回复、徽标授予、训练室预约与平台核验等定向触达
+model UserNotification {
+  id        String    @id @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  kind      String    // leave_decision | remote_decision | appeal_decision | claim_decision | room_booking | badge_awarded | platform_review | general
+  title     String
+  body      String    @db.Text
+  link      String?
+  readAt    DateTime? @db.Timestamptz(3) @map("read_at")
+  createdAt DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+  @@map("user_notifications")
 }

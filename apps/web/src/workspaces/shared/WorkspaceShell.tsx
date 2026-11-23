@@ -35,6 +35,7 @@ import {
 } from '@/components/ui/sheet';
 import { ThemeToggle } from '@/workspaces/shared/ThemeToggle';
 import { AnnouncementCenter } from '@/components/club/AnnouncementCenter';
+import { NotificationCenter } from '@/components/club/NotificationCenter';
 import { MobileNavigation } from '@/workspaces/shared/MobileNavigation';
 import { ChangePasswordDialog } from '@/workspaces/shared/ChangePasswordDialog';
 
@@ -537,6 +538,7 @@ export function WorkspaceShell({
           </div>
 
           <div className="ml-auto flex shrink-0 items-center gap-1">
+            <NotificationCenter />
             <AnnouncementCenter />
             {headerRight ?? <ThemeToggle />}
             {/* 手机端侧栏隐藏，账户菜单（含退出登录）放到顶栏 */}

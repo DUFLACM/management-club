@@ -1,10 +1,11 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
+import { Body, Controller, Get, Inject, Optional, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
 import { z } from 'zod'
 import QRCode from 'qrcode'
 import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, ok, CurrentActor } from '../../common/guards.js'
 import { AttendanceService, AttendanceError } from './attendance.service.js'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { newId } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { enrollRequiredAfterCheckin } from './checkin-registration.js'
@@ -18,6 +19,7 @@ export class AttendanceAdminController {
     private readonly attendance: AttendanceService,
     private readonly db: PrismaService,
     private readonly audit: AuditService,
+    @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
   /** 大屏统计直接读取已接受检查点与报名/必到名单，最近名单有界，人数不受名单长度影响。 */
@@ -297,10 +299,53 @@ export class AttendanceAdminController {
       resourceId: id,
       summary: `${parsed.decision === 'approve' ? '批准' : '驳回'}请假：${leave.user.verifiedRealName}${parsed.note ? `（${parsed.note.slice(0, 200)}）` : ''}`,
     })
+    await this.notifications?.notify({
+      userId: leave.userId,
+      kind: 'leave_decision',
+      title: parsed.decision === 'approve' ? '请假申请已批准' : '请假申请已驳回',
+      body: parsed.note
+        ? `管理员意见：${parsed.note}`
+        : parsed.decision === 'approve'
+          ? '本次活动出勤已记为请假通过，不计缺席。'
+          : '请假申请未获通过，请按要求到场或联系活动负责人。',
+      link: `/app?section=activities&activity=${leave.activityId}`,
+    })
     return ok({ decided: parsed.decision })
   }
 
-  /** 远程参赛审批（月次数由积分认定时校验） */
+  /** 远程参赛申请队列（待审批优先，附带该成员当月已批准次数供限额核对） */
+  @Get('activities/:id/remote-requests')
+  @RequireAction('activity.manage')
+  async remoteRequests(@Param('id', ParseUUIDPipe) id: string) {
+    const rows = await this.db.remotePermission.findMany({
+      where: { activityId: id },
+      orderBy: { createdAt: 'desc' },
+      include: { user: { select: { id: true, verifiedRealName: true, studentNo: true, profile: { select: { displayName: true } } } } },
+    })
+    const monthKeys = [...new Set(rows.map((r) => r.monthKey))]
+    const userIds = [...new Set(rows.map((r) => r.userId))]
+    const approvedInMonth = monthKeys.length === 0 || userIds.length === 0
+      ? []
+      : await this.db.remotePermission.groupBy({
+          by: ['userId', 'monthKey'],
+          where: { userId: { in: userIds }, monthKey: { in: monthKeys }, status: 'approved' },
+          _count: { _all: true },
+        })
+    const approvedCountMap = new Map(approvedInMonth.map((g) => [`${g.userId}:${g.monthKey}`, g._count._all]))
+    const rank = (status: string) => (status === 'pending' ? 0 : 1)
+    return ok(rows.sort((a, b) => rank(a.status) - rank(b.status)).map((row) => ({
+      id: row.id,
+      reason: row.reason,
+      status: row.status,
+      monthKey: row.monthKey,
+      monthApprovedCount: approvedCountMap.get(`${row.userId}:${row.monthKey}`) ?? 0,
+      approvedAt: row.approvedAt?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+      user: row.user,
+    })))
+  }
+
+  /** 远程参赛审批（支持改判；同步出勤参与模式与审计日志） */
   @Post('remote-requests/:id/decision')
   @RequireAction('activity.manage')
   async remoteDecision(
@@ -311,9 +356,54 @@ export class AttendanceAdminController {
     const parsed = z.object({ decision: z.enum(['approve', 'reject']), note: z.string().max(500).optional() }).parse(body)
     const perm = await this.db.remotePermission.findUnique({ where: { id }, include: { user: true } })
     if (!perm) throw new AttendanceError('远程申请不存在', 'NOT_FOUND')
-    await this.db.remotePermission.update({
-      where: { id },
-      data: { status: parsed.decision === 'approve' ? 'approved' : 'rejected', approvedBy: actor.principalId, approvedAt: new Date() },
+    await this.db.$transaction(async (tx) => {
+      await tx.remotePermission.update({
+        where: { id },
+        data: { status: parsed.decision === 'approve' ? 'approved' : 'rejected', approvedBy: actor.principalId, approvedAt: new Date() },
+      })
+      const resultKey = { activityId_userId: { activityId: perm.activityId, userId: perm.userId } }
+      if (parsed.decision === 'approve') {
+        await tx.activityParticipant.updateMany({
+          where: { activityId: perm.activityId, userId: perm.userId },
+          data: { participationMode: 'remote_approved' },
+        })
+        const existingResult = await tx.attendanceAttendanceResult.findUnique({ where: resultKey, select: { status: true } })
+        if (!existingResult || ['pending', 'pending_review', 'absent'].includes(existingResult.status)) {
+          await tx.attendanceAttendanceResult.upsert({
+            where: resultKey,
+            create: { id: newId(), activityId: perm.activityId, userId: perm.userId, status: 'remote_approved', decidedBy: actor.principalId },
+            update: { status: 'remote_approved', decidedBy: actor.principalId, revision: { increment: 1 } },
+          })
+        }
+      } else {
+        await tx.activityParticipant.updateMany({
+          where: { activityId: perm.activityId, userId: perm.userId, participationMode: 'remote_approved' },
+          data: { participationMode: 'onsite' },
+        })
+        const existingResult = await tx.attendanceAttendanceResult.findUnique({ where: resultKey, select: { status: true } })
+        if (existingResult?.status === 'remote_approved') {
+          await tx.attendanceAttendanceResult.update({
+            where: resultKey,
+            data: { status: 'pending_review', decidedBy: actor.principalId, revision: { increment: 1 } },
+          })
+        }
+      }
+    })
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: `remote.${parsed.decision}`,
+      resourceType: 'remote_permission',
+      resourceId: id,
+      summary: `${parsed.decision === 'approve' ? '批准' : '驳回'}远程参赛：${perm.user.verifiedRealName}（${perm.monthKey}）${parsed.note ? `（${parsed.note.slice(0, 200)}）` : ''}`,
+    })
+    await this.notifications?.notify({
+      userId: perm.userId,
+      kind: 'remote_decision',
+      title: parsed.decision === 'approve' ? '远程参赛申请已批准' : '远程参赛申请已驳回',
+      body: parsed.decision === 'approve'
+        ? `${perm.monthKey} 远程参赛权限已通过，按时完成有效提交即可参与远程计分。`
+        : '本次活动的远程参赛申请未通过，请按要求现场参加或联系活动负责人。',
+      link: `/app?section=activities&activity=${perm.activityId}`,
     })
     return ok({ decided: parsed.decision })
   }

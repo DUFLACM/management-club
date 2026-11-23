@@ -1,4 +1,6 @@
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { DomainError } from '../../common/domain-error.js'
+import { loadEnv } from '../../config/env.js'
 import { Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
@@ -84,8 +86,8 @@ export type ActivityUpdate = z.infer<typeof activityUpdateSchema>
 const CONTEST_TYPES = new Set(['weekly_contest', 'monthly_contest', 'custom_contest'])
 
 /** 需要成员先绑定平台账号才能报名的平台（榜单按绑定账号计分） */
-const BINDABLE_PLATFORMS = new Set(['nowcoder', 'codeforces', 'atcoder'])
-const PLATFORM_NAMES: Record<string, string> = { nowcoder: '牛客', codeforces: 'Codeforces', atcoder: 'AtCoder' }
+const BINDABLE_PLATFORMS = new Set(['nowcoder', 'codeforces', 'atcoder', 'vjudge'])
+const PLATFORM_NAMES: Record<string, string> = { nowcoder: '牛客', codeforces: 'Codeforces', atcoder: 'AtCoder', vjudge: 'VJudge' }
 
 export const lectureRatingSchema = z.object({
   score: z.number().int().min(1).max(5),
@@ -278,7 +280,7 @@ export class ActivityService {
   /** 导入平台赛事：只建未发布草稿 + 后台 job 拉取元数据（202） */
   async importContest(
     actor: SessionActor,
-    input: { platform: 'nowcoder' | 'codeforces' | 'atcoder' | 'hydro'; contestId?: string; officialUrl?: string; hydroInstanceId?: string; hydroDomainId?: string },
+    input: { platform: 'nowcoder' | 'codeforces' | 'atcoder' | 'vjudge' | 'hydro'; contestId?: string; officialUrl?: string; hydroInstanceId?: string; hydroDomainId?: string },
   ): Promise<{ draftActivityId: string; jobId: string }> {
     let contestId = input.contestId
     if (!contestId && input.officialUrl) {
@@ -326,8 +328,13 @@ export class ActivityService {
         platform === 'nowcoder' ? u.hostname === 'ac.nowcoder.com'
         : platform === 'codeforces' ? u.hostname === 'codeforces.com'
         : platform === 'atcoder' ? u.hostname === 'atcoder.jp'
+        : platform === 'vjudge' ? u.hostname === 'vjudge.net'
         : true
       if (!hostOk) throw new ActivityError('链接主机不符', 'HOST_MISMATCH')
+      if (platform === 'atcoder') {
+        const m = u.pathname.match(/\/contests\/([A-Za-z0-9_-]+)/)
+        return m ? m[1] : null
+      }
       const m = u.pathname.match(/(\d{4,})/)
       return m ? m[1] : null
     } catch {
@@ -573,9 +580,16 @@ export class ActivityService {
       }
       if (activity.platform && BINDABLE_PLATFORMS.has(activity.platform)) {
         const bound = await tx.platformAccount.findMany({ where: { userId: { in: memberIds }, platform: activity.platform, status: { not: 'revoked' } }, select: { userId: true } })
-        const boundSet = new Set(bound.map((b) => b.userId))
-        const missing = team.members.filter((m) => !boundSet.has(m.userId)).map((m) => memberName(m.user))
-        if (missing.length) throw new ActivityError(`以下队员尚未绑定${PLATFORM_NAMES[activity.platform]}账号：${missing.join('、')}`, 'NEEDS_PLATFORM_BIND')
+        if (activity.platform === 'vjudge') {
+          // VJudge 组队赛常由小队共用一个 VJudge 账号参赛，至少需有一名队员（建议队长）绑定即可
+          if (bound.length === 0) {
+            throw new ActivityError('本场是 VJudge 组队比赛，请至少由一名队员（建议队长）先在「我的 → 平台账号」绑定 VJudge 账号后再报名', 'NEEDS_PLATFORM_BIND')
+          }
+        } else {
+          const boundSet = new Set(bound.map((b) => b.userId))
+          const missing = team.members.filter((m) => !boundSet.has(m.userId)).map((m) => memberName(m.user))
+          if (missing.length) throw new ActivityError(`以下队员尚未绑定${PLATFORM_NAMES[activity.platform]}账号：${missing.join('、')}`, 'NEEDS_PLATFORM_BIND')
+        }
       }
 
       const { enrolled: enrolledTeams, waitlisted: waitlistedTeams } = await this.countTeams(tx, activityId)
@@ -1261,25 +1275,53 @@ export class ActivityService {
   }
 
   /**
-   * 平台榜社团映射（成员/管理端共用）：抓取平台榜 + 按绑定账号映射成员，
+   * 平台榜社团映射（成员/管理端共用）：抓取平台榜 + 按绑定账号映射成员（支持个人赛与组队赛），
    * 返回题目、社团排行（含逐题明细）与有效参赛集合。
    */
   async platformClubRows(activityId: string, standings: ContestStandingsService) {
     const activity = await this.db.activity.findUnique({
       where: { id: activityId },
-      select: { id: true, title: true, platform: true, platformContestId: true, endAt: true },
+      select: { id: true, title: true, platform: true, platformContestId: true, endAt: true, teamSize: true },
     })
     if (!activity) throw new ActivityError('活动不存在', 'NOT_FOUND')
     if (!activity.platform || !activity.platformContestId) throw new ActivityError('本活动未关联平台赛事', 'NOT_CONTEST')
     const contestUrl = contestExternalUrl(activity.platform, activity.platformContestId)
     const ended = activity.endAt.getTime() <= Date.now()
     const result = await standings.fetch(activity.platform, activity.platformContestId)
-    if (!result.available) return { activity, contestUrl, ended, result, clubRows: [], clubRanking: [], problems: [], totalEntries: 0 }
+    if (!result.available) {
+      return {
+        activity,
+        contestUrl,
+        ended,
+        result,
+        isTeam: Boolean(activity.teamSize),
+        clubRows: [],
+        teamRows: [],
+        unmatchedTeams: [],
+        clubRanking: [],
+        problems: [],
+        totalEntries: 0,
+      }
+    }
+    if (activity.teamSize) {
+      const { teamRows, unmatchedTeams, clubRanking, problems, totalEntries } = await this.matchTeamClubRows(activityId, activity.platform, result)
+      return { activity, contestUrl, ended, result, isTeam: true, clubRows: [], teamRows, unmatchedTeams, clubRanking, problems, totalEntries }
+    }
     const { clubRows, clubRanking, problems, totalEntries } = await this.matchClubRows(activity.platform, result)
-    return { activity, contestUrl, ended, result, clubRows, clubRanking, problems, totalEntries }
+    return { activity, contestUrl, ended, result, isTeam: false, clubRows, teamRows: [], unmatchedTeams: [], clubRanking, problems, totalEntries }
   }
 
-  /** 平台榜单 → 社团成员行：按平台账号绑定（externalId / displayHandle）映射，按对题数、得分排序 */
+  private buildHandleLookup(platform: string, entries: StandingsSnapshot['entries']) {
+    const exact = new Map(entries.map((entry) => [entry.handle, entry]))
+    const lowered = platform === 'nowcoder' ? null : new Map(entries.map((entry) => [entry.handle.toLowerCase(), entry]))
+    return (externalId: string, displayHandle?: string | null) => {
+      const direct = exact.get(externalId) ?? (displayHandle ? exact.get(displayHandle) : undefined)
+      if (direct || !lowered) return direct
+      return lowered.get(externalId.toLowerCase()) ?? (displayHandle ? lowered.get(displayHandle.toLowerCase()) : undefined)
+    }
+  }
+
+  /** 平台榜单 → 社团成员行（个人赛）：按平台账号绑定映射，按对题数、得分排序 */
   async matchClubRows(platform: string, result: StandingsSnapshot) {
     const accounts = await this.db.platformAccount.findMany({
       where: { platform, status: { not: 'revoked' } },
@@ -1288,10 +1330,10 @@ export class ActivityService {
         user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
       },
     })
-    const entryByHandle = new Map(result.entries.map((entry) => [entry.handle, entry]))
+    const lookup = this.buildHandleLookup(platform, result.entries)
     const clubRows = accounts
       .map((account) => {
-        const entry = entryByHandle.get(account.externalId) ?? (account.displayHandle ? entryByHandle.get(account.displayHandle) : undefined)
+        const entry = lookup(account.externalId, account.displayHandle)
         if (!entry) return null
         return {
           userId: account.userId,
@@ -1306,7 +1348,12 @@ export class ActivityService {
         }
       })
       .filter((row): row is NonNullable<typeof row> => row !== null)
-      .sort((a, b) => b.solvedCount - a.solvedCount || b.score - a.score || a.name.localeCompare(b.name))
+      .sort((a, b) =>
+        b.solvedCount - a.solvedCount
+        || b.score - a.score
+        || (a.platformRank ?? Number.MAX_SAFE_INTEGER) - (b.platformRank ?? Number.MAX_SAFE_INTEGER)
+        || a.name.localeCompare(b.name),
+      )
     let clubRank = 0
     // 社团排名会下发给成员端：不带学号
     const clubRanking = clubRows.map((row) => ({ ...row, cells: undefined, studentNo: undefined, clubRank: (clubRank += 1) }))
@@ -1314,29 +1361,367 @@ export class ActivityService {
       ...problem,
       clubSolved: clubRows.filter((row) => row.cells.some((cell) => cell.index === problem.index && cell.solved)).length,
     }))
-    return { clubRows, clubRanking, problems, totalEntries: result.entries.length }
+    return { clubRows, clubRanking, problems, totalEntries: result.totalEntries ?? result.entries.length }
   }
 
   /**
-   * 平台榜单（社团视角）：抓取平台榜 + 按平台账号绑定映射成员，
+   * 平台榜单 → 社团小队行（组队赛）：按本活动已报名小队归组，
+   * 匹配任意队员（队长优先、已核验优先）绑定的平台账号，全队共享同场成绩与社内队伍名次。
+   */
+  async matchTeamClubRows(activityId: string, platform: string, result: StandingsSnapshot) {
+    const registrations = await this.db.activityRegistration.findMany({
+      where: { activityId, status: 'enrolled', teamId: { not: null } },
+      include: {
+        team: { select: { id: true, name: true, captainUserId: true } },
+        user: {
+          select: {
+            id: true,
+            studentNo: true,
+            verifiedRealName: true,
+            profile: { select: { displayName: true } },
+            platformAccounts: {
+              where: { platform, status: { not: 'revoked' } },
+              select: { externalId: true, displayHandle: true, status: true },
+            },
+          },
+        },
+      },
+    })
+    const lookup = this.buildHandleLookup(platform, result.entries)
+    type TeamBucket = {
+      teamId: string
+      teamName: string
+      captainUserId: string
+      members: Array<{
+        userId: string
+        studentNo: string
+        name: string
+        accounts: Array<{ externalId: string; displayHandle: string | null; status: string }>
+      }>
+    }
+    const teamsById = new Map<string, TeamBucket>()
+    for (const reg of registrations) {
+      if (!reg.teamId || !reg.team) continue
+      const bucket = teamsById.get(reg.teamId) ?? {
+        teamId: reg.team.id,
+        teamName: reg.team.name,
+        captainUserId: reg.team.captainUserId,
+        members: [],
+      }
+      bucket.members.push({
+        userId: reg.user.id,
+        studentNo: reg.user.studentNo,
+        name: memberName(reg.user),
+        accounts: reg.user.platformAccounts,
+      })
+      teamsById.set(reg.teamId, bucket)
+    }
+
+    const unmatchedTeams: Array<{ teamId: string; teamName: string; members: Array<{ userId: string; name: string }> }> = []
+    const teamRows: Array<{
+      teamId: string
+      teamName: string
+      captainUserId: string
+      members: Array<{ userId: string; studentNo: string; name: string }>
+      memberUserIds: string[]
+      handle: string
+      displayName: string | null
+      platformRank: number | null
+      score: number
+      solvedCount: number
+      cells: StandingsSnapshot['entries'][number]['cells']
+    }> = []
+
+    for (const bucket of teamsById.values()) {
+      // 队长排前，已核验账号优先；若多名队员都在榜上，取成绩更优的一条
+      const orderedMembers = [...bucket.members].sort((a, b) => Number(b.userId === bucket.captainUserId) - Number(a.userId === bucket.captainUserId))
+      const matchedEntries = orderedMembers
+        .flatMap((m) =>
+          [...m.accounts]
+            .sort((a, b) => Number(b.status === 'verified') - Number(a.status === 'verified'))
+            .map((acc) => lookup(acc.externalId, acc.displayHandle)),
+        )
+        .filter((entry): entry is NonNullable<typeof entry> => entry != null)
+        .sort((a, b) =>
+          b.solvedCount - a.solvedCount
+          || b.score - a.score
+          || (a.rank ?? Number.MAX_SAFE_INTEGER) - (b.rank ?? Number.MAX_SAFE_INTEGER),
+        )
+      const best = matchedEntries[0]
+      if (!best) {
+        unmatchedTeams.push({
+          teamId: bucket.teamId,
+          teamName: bucket.teamName,
+          members: orderedMembers.map((m) => ({ userId: m.userId, name: m.name })),
+        })
+        continue
+      }
+      teamRows.push({
+        teamId: bucket.teamId,
+        teamName: bucket.teamName,
+        captainUserId: bucket.captainUserId,
+        members: orderedMembers.map(({ userId, studentNo, name }) => ({ userId, studentNo, name })),
+        memberUserIds: orderedMembers.map((m) => m.userId),
+        handle: best.handle,
+        displayName: best.displayName,
+        platformRank: best.rank,
+        score: best.score,
+        solvedCount: best.solvedCount,
+        cells: best.cells,
+      })
+    }
+
+    teamRows.sort((a, b) =>
+      b.solvedCount - a.solvedCount
+      || b.score - a.score
+      || (a.platformRank ?? Number.MAX_SAFE_INTEGER) - (b.platformRank ?? Number.MAX_SAFE_INTEGER)
+      || a.teamName.localeCompare(b.teamName),
+    )
+
+    let clubRank = 0
+    const clubRanking = teamRows.map((row) => ({
+      clubRank: (clubRank += 1),
+      userId: row.captainUserId,
+      teamId: row.teamId,
+      teamName: row.teamName,
+      memberUserIds: row.memberUserIds,
+      name: `${row.teamName}（${row.members.map((m) => m.name).join('、')}）`,
+      handle: row.handle,
+      displayName: row.displayName,
+      platformRank: row.platformRank,
+      score: row.score,
+      solvedCount: row.solvedCount,
+    }))
+    const problems = result.problems.map((problem) => ({
+      ...problem,
+      clubSolved: teamRows.filter((row) => row.cells.some((cell) => cell.index === problem.index && cell.solved)).length,
+    }))
+    return { teamRows, unmatchedTeams, clubRanking, problems, totalEntries: result.totalEntries ?? result.entries.length }
+  }
+
+  /**
+   * 平台榜单（社团视角）：抓取平台榜 + 按平台账号绑定映射成员/小队，
    * 输出题目（含外链与社团通过数）、我的成绩、社团对题数排名。
    */
-  async activityStandings(userId: string, activityId: string, standings: ContestStandingsService) {
-    const { activity, contestUrl, ended, result, clubRows, clubRanking, problems, totalEntries } = await this.platformClubRows(activityId, standings)
+  async activityStandings(userId: string | null, activityId: string, standings: ContestStandingsService) {
+    const { contestUrl, ended, result, isTeam, clubRows, teamRows, clubRanking, problems, totalEntries } = await this.platformClubRows(activityId, standings)
     if (!result.available) {
-      return { ...result, contestUrl, ended }
+      return { ...result, contestUrl, ended, isTeam }
     }
-    const mine = clubRanking.find((row) => row.userId === userId)
+    let me: (Omit<typeof clubRanking[number], 'cells'> & { cells: StandingsSnapshot['entries'][number]['cells'] }) | null = null
+    if (userId) {
+      if (isTeam) {
+        const index = teamRows.findIndex((row) => row.memberUserIds.includes(userId))
+        if (index >= 0) me = { ...clubRanking[index], cells: teamRows[index].cells }
+      } else {
+        const index = clubRows.findIndex((row) => row.userId === userId)
+        if (index >= 0) me = { ...clubRanking[index], cells: clubRows[index].cells }
+      }
+    }
     return {
       ...result,
       contestUrl,
       ended,
+      isTeam,
       problems,
       clubRanking,
       totalEntries,
-      me: mine ? { ...mine, cells: mine.cells } : null,
+      me,
       // entries 不外发（含非成员个人信息），只保留社团映射与统计
       entries: undefined,
+    }
+  }
+
+  /** 月度日历视图：返回与该自然月有交集的全部已发布活动 */
+  async calendarForMonth(userId: string, month: string) {
+    const match = /^(\d{4})-(\d{2})$/.exec(month)
+    const now = new Date(Date.now() + 8 * 3600_000)
+    const year = match ? Number(match[1]) : now.getUTCFullYear()
+    const mon = match ? Number(match[2]) : now.getUTCMonth() + 1
+    // 按 Asia/Shanghai 自然月边界（含前后各 1 天冗余避免时区跨天遗漏）
+    const rangeStart = new Date(Date.UTC(year, mon - 1, 1, -8) - 24 * 3600_000)
+    const rangeEnd = new Date(Date.UTC(year, mon, 1, -8) + 24 * 3600_000)
+    const rows = await this.db.activity.findMany({
+      where: {
+        status: 'published',
+        startAt: { lt: rangeEnd },
+        endAt: { gte: rangeStart },
+      },
+      orderBy: { startAt: 'asc' },
+      take: 200,
+      include: {
+        venueVersion: { select: { name: true, building: true, room: true } },
+        registrations: { where: { userId }, select: { status: true } },
+        participants: { where: { userId }, select: { required: true } },
+      },
+    })
+    return {
+      month: `${year}-${String(mon).padStart(2, '0')}`,
+      items: rows.map((row) => ({
+        id: row.id,
+        title: row.title,
+        type: row.type,
+        platform: row.platform,
+        startAt: row.startAt.toISOString(),
+        endAt: row.endAt.toISOString(),
+        venue: row.venueVersion,
+        myRegistration: row.registrations[0]?.status ?? null,
+        required: row.participants[0]?.required ?? false,
+      })),
+    }
+  }
+
+  private async calendarHmacSecret(): Promise<string> {
+    const key = 'calendar:hmac_secret'
+    const existing = await this.db.appMeta.findUnique({ where: { key } })
+    const saved = existing && typeof existing.value === 'object' && existing.value !== null
+      ? (existing.value as { secret?: unknown }).secret
+      : null
+    if (typeof saved === 'string' && saved.length >= 32) return saved
+    const generated = randomBytes(32).toString('hex')
+    await this.db.appMeta.upsert({
+      where: { key },
+      create: { key, value: { secret: generated } },
+      update: {},
+    })
+    const reread = await this.db.appMeta.findUnique({ where: { key } })
+    const finalSecret = (reread?.value as { secret?: string } | null)?.secret
+    return finalSecret ?? generated
+  }
+
+  private signCalendarFeed(secret: string, userId: string, scope: 'all' | 'mine'): string {
+    return createHmac('sha256', secret).update(`${userId}:${scope}`).digest('hex').slice(0, 32)
+  }
+
+  async calendarSubscriptionLinks(userId: string) {
+    const secret = await this.calendarHmacSecret()
+    const base = loadEnv().PUBLIC_BASE_URL.replace(/\/$/, '')
+    const sigAll = this.signCalendarFeed(secret, userId, 'all')
+    const sigMine = this.signCalendarFeed(secret, userId, 'mine')
+    return {
+      allUrl: `${base}/api/v1/public/calendar.ics?uid=${encodeURIComponent(userId)}&scope=all&sig=${sigAll}`,
+      mineUrl: `${base}/api/v1/public/calendar.ics?uid=${encodeURIComponent(userId)}&scope=mine&sig=${sigMine}`,
+    }
+  }
+
+  async verifyCalendarSignature(userId: string, scope: 'all' | 'mine', sig: string): Promise<boolean> {
+    if (!/^[0-9a-f-]{36}$/i.test(userId) || !/^[0-9a-f]{32}$/i.test(sig)) return false
+    const secret = await this.calendarHmacSecret()
+    const expected = this.signCalendarFeed(secret, userId, scope)
+    const a = Buffer.from(expected, 'utf8')
+    const b = Buffer.from(sig.toLowerCase(), 'utf8')
+    return a.length === b.length && timingSafeEqual(a, b)
+  }
+
+  /** 生成 RFC 5545 iCalendar 文本（过去 30 天至未来 180 天已发布活动） */
+  async buildCalendarIcs(userId: string, scope: 'all' | 'mine'): Promise<string> {
+    const now = Date.now()
+    const from = new Date(now - 30 * 24 * 3600_000)
+    const to = new Date(now + 180 * 24 * 3600_000)
+    const rows = await this.db.activity.findMany({
+      where: {
+        status: 'published',
+        endAt: { gte: from },
+        startAt: { lte: to },
+        ...(scope === 'mine'
+          ? {
+              OR: [
+                { registrations: { some: { userId, status: { in: ['enrolled', 'waitlisted'] } } } },
+                { participants: { some: { userId, required: true } } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: { startAt: 'asc' },
+      take: 300,
+      include: {
+        venueVersion: { select: { name: true, building: true, room: true } },
+      },
+    })
+
+    const escapeIcs = (input: string) =>
+      input.replace(/\\/g, '\\\\').replace(/\r\n|\r|\n/g, '\\n').replace(/;/g, '\\;').replace(/,/g, '\\,')
+    const formatUtc = (date: Date) =>
+      date.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
+
+    const base = loadEnv().PUBLIC_BASE_URL.replace(/\/$/, '')
+    const calName = scope === 'mine' ? '大外 ACM 协会 · 我的活动' : '大外 ACM 协会 · 全部活动'
+    const lines = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//DLUFL ACM Club//Activities Calendar//ZH',
+      'CALSCALE:GREGORIAN',
+      'METHOD:PUBLISH',
+      `X-WR-CALNAME:${escapeIcs(calName)}`,
+      'X-WR-TIMEZONE:Asia/Shanghai',
+    ]
+    const stamp = formatUtc(new Date())
+    for (const row of rows) {
+      const locationParts = row.venueVersion
+        ? [row.venueVersion.name, row.venueVersion.building, row.venueVersion.room].filter(Boolean)
+        : []
+      const location = locationParts.join(' ')
+      const desc = `${row.announcement.slice(0, 600)}\n\n活动详情：${base}/app?section=activities&activity=${row.id}`
+      lines.push(
+        'BEGIN:VEVENT',
+        `UID:activity-${row.id}@acm.dlufl.edu.cn`,
+        `DTSTAMP:${stamp}`,
+        `DTSTART:${formatUtc(row.startAt)}`,
+        `DTEND:${formatUtc(row.endAt)}`,
+        `SUMMARY:${escapeIcs(row.title)}`,
+        ...(location ? [`LOCATION:${escapeIcs(location)}`] : []),
+        `DESCRIPTION:${escapeIcs(desc)}`,
+        `URL:${base}/app?section=activities&activity=${row.id}`,
+        'END:VEVENT',
+      )
+    }
+    lines.push('END:VCALENDAR', '')
+    return lines.join('\r\n')
+  }
+
+  /** 跨活动资料与题解中心：检索全部已发布/归档活动下的讲题幻灯片、题解与数据材料 */
+  async listMaterialsLibrary(filters: { q?: string; kind?: string; cursor?: string }) {
+    const trimmed = filters.q?.trim()
+    const validKind = filters.kind && ['slides', 'solution', 'data', 'other'].includes(filters.kind) ? filters.kind : undefined
+    const rows = await this.db.activityMaterial.findMany({
+      where: {
+        activity: { status: { in: ['published', 'archived'] } },
+        ...(validKind ? { kind: validKind } : {}),
+        ...(trimmed
+          ? {
+              OR: [
+                { title: { contains: trimmed, mode: 'insensitive' } },
+                { fileName: { contains: trimmed, mode: 'insensitive' } },
+                { activity: { title: { contains: trimmed, mode: 'insensitive' } } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: 31,
+      ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
+      include: {
+        activity: { select: { id: true, title: true, type: true, startAt: true } },
+        user: { select: { id: true, verifiedRealName: true, profile: { select: { displayName: true } } } },
+      },
+    })
+    const nextCursor = rows.length > 30 ? rows.pop()!.id : null
+    return {
+      items: rows.map((row) => ({
+        id: row.id,
+        activityId: row.activity.id,
+        activityTitle: row.activity.title,
+        activityType: row.activity.type,
+        activityStartAt: row.activity.startAt.toISOString(),
+        title: row.title,
+        kind: row.kind,
+        fileName: row.fileName,
+        mimeType: row.mimeType,
+        sizeBytes: row.sizeBytes,
+        uploaderName: memberName(row.user),
+        createdAt: row.createdAt.toISOString(),
+      })),
+      nextCursor,
     }
   }
 }

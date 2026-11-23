@@ -46,7 +46,7 @@ export const competitionEventInputSchema = z.object({
   category: z.enum(['A', 'B']),
   teamSize: z.number().int().min(2).max(10).nullable().optional(),
   scoringMode: z.enum(['platform_auto', 'manual_review']),
-  platform: z.enum(['nowcoder', 'codeforces', 'atcoder', 'hydro']).optional(),
+  platform: z.enum(['nowcoder', 'codeforces', 'atcoder', 'vjudge', 'hydro']).optional(),
   platformContestId: z.string().max(64).optional(),
   contestTier: z
     .enum(['school_select', 'provincial', 'icpc_invite', 'icpc_regional', 'top_final', 'network_qualifier', 'ladder', 'lanqiao', 'baidu_star'])
@@ -523,6 +523,13 @@ export class CompetitionEventService {
     const result = await this.standings.fetch(event.platform, event.platformContestId)
     if (!result.available) throw new CompetitionError(`平台榜单暂不可用：${result.reason}`, 'STANDINGS_UNAVAILABLE')
     const entryByHandle = new Map(result.entries.map((e) => [e.handle, e]))
+    const entryByLower = event.platform === 'nowcoder' ? null : new Map(result.entries.map((e) => [e.handle.toLowerCase(), e]))
+    const findEntry = (externalId: string, displayHandle?: string | null) => {
+      const direct = entryByHandle.get(externalId) ?? (displayHandle ? entryByHandle.get(displayHandle) : undefined)
+      if (direct || !entryByLower) return direct
+      return entryByLower.get(externalId.toLowerCase()) ?? (displayHandle ? entryByLower.get(displayHandle.toLowerCase()) : undefined)
+    }
+    const totalEntries = result.totalEntries ?? result.entries.length
     const totalProblems = result.problems.length || 1
     const fullTotal = result.problems.reduce((sum, p) => sum + (p.fullScore ?? 0), 0)
     const lambdaValue = event.lambdaKey === 'A' ? 1.2 : event.lambdaKey === 'C' ? 0.8 : 1.0
@@ -542,7 +549,7 @@ export class CompetitionEventService {
       for (const entry of entries) {
         const matched = entry.team.members
           .map((m) => m.user.platformAccounts.find((a) => a.platform === event.platform && a.status === 'verified'))
-          .map((acc) => (acc ? entryByHandle.get(acc.externalId) : undefined))
+          .map((acc) => (acc ? findEntry(acc.externalId, acc.displayHandle) : undefined))
           .find((e) => e != null)
         if (!matched) { skipped.push({ name: entry.team.name, reason: '队员均未在榜单上匹配到已核验平台账号' }); continue }
         rows.push({
@@ -566,7 +573,7 @@ export class CompetitionEventService {
         include: { platformAccount: true, user: { select: { verifiedRealName: true, profile: { select: { displayName: true } } } } },
       })
       for (const reg of regs) {
-        const entry = reg.platformAccount ? entryByHandle.get(reg.platformAccount.externalId) : undefined
+        const entry = reg.platformAccount ? findEntry(reg.platformAccount.externalId, reg.platformAccount.displayHandle) : undefined
         const name = memberName(reg.user)
         if (!entry) { skipped.push({ name, reason: '榜上未匹配到已核验平台账号' }); continue }
         rows.push({
@@ -592,8 +599,8 @@ export class CompetitionEventService {
       const rank = rankOf.get(row.handle)!
       const r = n <= 1 ? 0.5 : (1 - (rank - 1) / (n - 1)) * (n < 3 ? 0.5 : 1)
       let x = 0
-      if (row.platformRank != null && result.entries.length > 0) {
-        const pct = row.platformRank / result.entries.length
+      if (row.platformRank != null && totalEntries > 0) {
+        const pct = row.platformRank / totalEntries
         x = pct <= 0.05 ? 3 : pct <= 0.1 ? 2 : pct <= 0.3 ? 1 : 0
       }
       const w = Math.min(20, lambdaValue * (4 * s + 6 * r) + x)

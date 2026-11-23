@@ -1,0 +1,18 @@
+{
+  "name": "大连外国语大学 ACM 算法协会",
+  "short_name": "大外 ACM",
+  "description": "活动日历、现场签到、竞赛积分、训练室预约与资料题解库",
+  "start_url": "/app",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1d4ed8",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/brand/nav-logo-dark.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

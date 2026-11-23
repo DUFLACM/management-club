@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import { parseNowcoderHistoryPage, parseNowcoderRatingHistory, normalizeAtCoderContestId } from '@acm/integrations'
+import { parseNowcoderHistoryPage, parseNowcoderRatingHistory, normalizeAtCoderContestId, parseVjudgeContestDataJson, parseVjudgeRankSingle, vjudgeCookieHeader } from '@acm/integrations'
 import { parseCasResponse } from '../../modules/auth/cas.client.js'
 import { evaluateGeoFence } from '../../modules/attendance/attendance.service.js'
 import { safeFetch } from '../../infrastructure/http/safe-fetch.js'
@@ -163,5 +163,50 @@ describe('牛客 rating 历史契约（真实响应摘录）', () => {
       { contestId: 2, time: 1760698800000 },
       { rating: 200, time: 1760698800000 },
     ] })).toHaveLength(1)
+  })
+})
+
+describe('VJudge 契约解析', () => {
+  it('vjudgeCookieHeader 兼容裸 JSESSIONID 与完整 Cookie 串', () => {
+    expect(vjudgeCookieHeader('')).toBeUndefined()
+    expect(vjudgeCookieHeader('abc123')).toBe('JSESSIONID=abc123')
+    expect(vjudgeCookieHeader('JSESSIONID=abc123; cf_clearance=xyz')).toBe('JSESSIONID=abc123; cf_clearance=xyz')
+  })
+
+  it('parseVjudgeContestDataJson 提取比赛元数据与题单', () => {
+    const html = `<textarea name="dataJson">{&quot;id&quot;:700001,&quot;title&quot;:&quot;VJ Team Training&quot;,&quot;begin&quot;:1730000000000,&quot;end&quot;:1730018000000,&quot;problems&quot;:[{&quot;num&quot;:&quot;A&quot;,&quot;title&quot;:&quot;Hello&quot;},{&quot;num&quot;:&quot;B&quot;,&quot;oj&quot;:&quot;Gym&quot;,&quot;probNum&quot;:&quot;1001B&quot;}]}</textarea>`
+    const meta = parseVjudgeContestDataJson(html)
+    expect(meta).toEqual({
+      contestId: '700001',
+      title: 'VJ Team Training',
+      startTime: new Date(1730000000000),
+      endTime: new Date(1730018000000),
+      durationSeconds: 18000,
+      problems: [
+        { index: 'A', name: 'Hello' },
+        { index: 'B', name: 'Gym-1001B' },
+      ],
+    })
+  })
+
+  it('parseVjudgeRankSingle 处理同分同罚时并列排名，且忽略 AC 后的重复提交', () => {
+    const parsed = parseVjudgeRankSingle({
+      id: 700001,
+      title: 'VJ Tie Test',
+      begin: 1730000000000,
+      length: 7200000,
+      participants: { 1: ['u1', '队1'], 2: ['u2', '队2'], 3: ['u3', '队3'] },
+      submissions: [
+        [1, 0, 1, 600],
+        [1, 0, 0, 900], // AC 后重复提交不计罚时
+        [2, 0, 1, 600],
+        [3, 0, 1, 1200],
+      ],
+    }, '700001')
+    expect(parsed.entries.map((e) => [e.handle, e.rank, e.penaltySeconds])).toEqual([
+      ['u1', 1, 600],
+      ['u2', 1, 600],
+      ['u3', 3, 1200],
+    ])
   })
 })

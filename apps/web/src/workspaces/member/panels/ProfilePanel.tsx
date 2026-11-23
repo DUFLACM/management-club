@@ -348,6 +348,7 @@ function ratingEmptyReason(platform: string): string {
   if (platform === 'codeforces') return '尚未参加 Codeforces rated 比赛；参加后点「申请刷新」同步即出现。';
   if (platform === 'nowcoder') return '尚未参加牛客 rated 场次；参加 rated 比赛并同步后这里会出现曲线（单场 rating 也可在「比赛成绩」中查看）。';
   if (platform === 'hydro') return '校内 OJ 暂无 rating 序列；比赛成绩见「比赛成绩」列表。';
+  if (platform === 'vjudge') return 'VJudge 无全局 rating 曲线；各场个人/组队比赛成绩会在对应活动详情与积分流水中展示。';
   return '暂无 rated 记录；参加 rated 比赛并同步后即出现。';
 }
 

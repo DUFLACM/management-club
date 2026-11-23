@@ -251,6 +251,7 @@ export const PLATFORM_LABELS: Record<string, string> = {
   nowcoder: '牛客',
   codeforces: 'Codeforces',
   atcoder: 'AtCoder',
+  vjudge: 'VJudge',
   hydro: 'Hydro',
 };
 
@@ -270,6 +271,7 @@ export function platformContestUrl(
   if (platform === 'atcoder') return `https://atcoder.jp/contests/${contestId}`;
   if (platform === 'nowcoder')
     return `https://ac.nowcoder.com/acm/contest/${contestId}`;
+  if (platform === 'vjudge') return `https://vjudge.net/contest/${contestId}`;
   return null;
 }
 

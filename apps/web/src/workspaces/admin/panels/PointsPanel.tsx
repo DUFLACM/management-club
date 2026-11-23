@@ -77,6 +77,7 @@ interface ReviewQueueDto {
   cases: ReviewCaseDto[];
   claims: ClaimDto[];
   appeals: AppealDto[];
+  processedAppeals?: AppealDto[];
   processedClaims: ProcessedClaimDto[];
 }
 
@@ -90,6 +91,8 @@ interface AppealDto {
   subject: string;
   materials: string | null;
   status: string;
+  resolutionNote?: string | null;
+  closedAt?: string | null;
   createdAt: string;
   user: { verifiedRealName: string | null; studentNo: string | null } | null;
 }
@@ -261,7 +264,13 @@ function PointsBody({ principalId }: { principalId: string }) {
               />
             </TabsContent>
             <TabsContent value="appeals" className="mt-4">
-              <AppealsQueue appeals={queue.appeals} />
+              <AppealsQueue
+                appeals={queue.appeals}
+                processedAppeals={queue.processedAppeals ?? []}
+                onNotice={setQueueNotice}
+                onHandled={invalidateQueue}
+                onOpenLedgerEntry={() => setEntryOpen(true)}
+              />
             </TabsContent>
             <TabsContent value="cases" className="mt-4">
               <CasesQueue cases={queue.cases} onNotice={setQueueNotice} onHandled={invalidateQueue} />
@@ -666,49 +675,219 @@ function ProcessedClaimsQueue({
   );
 }
 
-function AppealsQueue({ appeals }: { appeals: AppealDto[] }) {
+const APPEAL_STATUS_LABELS: Record<string, string> = {
+  submitted: '已提交',
+  in_review: '受理中',
+  resolved: '已采纳结案',
+  rejected: '已驳回',
+};
+
+function AppealsQueue({
+  appeals,
+  processedAppeals,
+  onNotice,
+  onHandled,
+  onOpenLedgerEntry,
+}: {
+  appeals: AppealDto[];
+  processedAppeals: AppealDto[];
+  onNotice: (notice: { tone: 'info' | 'error'; text: string } | null) => void;
+  onHandled: () => void;
+  onOpenLedgerEntry: () => void;
+}) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  if (appeals.length === 0) {
-    return <EmptyState kind="empty" description="没有待处理的申诉。" />;
-  }
+  const [resolutionNote, setResolutionNote] = useState('');
+
   const selected = appeals.find((appeal) => appeal.id === selectedId) ?? appeals[0] ?? null;
 
+  const mutation = useMutation({
+    mutationFn: async (input: { appealId: string; decision: 'in_review' | 'resolved' | 'rejected'; resolutionNote: string }) => {
+      await api.post(`/admin/appeals/${input.appealId}/decision`, {
+        decision: input.decision,
+        resolutionNote: input.resolutionNote || undefined,
+      });
+      return input.decision;
+    },
+    onSuccess: (decision) => {
+      onNotice({
+        tone: 'info',
+        text:
+          decision === 'in_review'
+            ? '已标记申诉为「受理中」，成员端同步可见。'
+            : decision === 'resolved'
+              ? '申诉已采纳并结案，结论已同步至成员端。'
+              : '申诉已驳回并结案，说明已同步至成员端。',
+      });
+      setResolutionNote('');
+      onHandled();
+    },
+    onError: (error: ApiError) => onNotice({ tone: 'error', text: error.message }),
+  });
+
+  const noteTrimmed = resolutionNote.trim();
+
   return (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-      <Card>
-        <CardContent className="p-0">
-          <ul className="flex flex-col divide-y divide-border">
-            {appeals.map((appeal) => (
-              <li key={appeal.id}>
-                <button
-                  type="button"
-                  onClick={() => setSelectedId(appeal.id)}
-                  className={`flex w-full flex-col gap-1 p-4 text-left hover:bg-muted/40 ${
-                    appeal.id === selected?.id ? 'bg-info-subtle' : ''
-                  }`}
-                >
-                  <span className="text-sm font-medium text-foreground">{appeal.subject}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {appeal.user?.verifiedRealName ?? '—'} · {appeal.user?.studentNo ?? '—'} ·{' '}
-                    {formatDateTime(appeal.createdAt)}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </CardContent>
-      </Card>
-      {selected && (
+    <div className="flex flex-col gap-5">
+      {appeals.length === 0 ? (
+        <EmptyState kind="empty" description="没有待处理的申诉。" />
+      ) : (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <Card>
+            <CardContent className="p-0">
+              <ul className="flex flex-col divide-y divide-border">
+                {appeals.map((appeal) => (
+                  <li key={appeal.id}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedId(appeal.id);
+                        setResolutionNote(appeal.resolutionNote ?? '');
+                      }}
+                      className={`flex w-full flex-col gap-1 p-4 text-left hover:bg-muted/40 ${
+                        appeal.id === selected?.id ? 'bg-info-subtle' : ''
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-sm font-medium text-foreground">{appeal.subject}</span>
+                        <StatusBadge
+                          kind="disclosure"
+                          value={appeal.status === 'in_review' ? '待审核' : '待审批'}
+                        />
+                      </div>
+                      <span className="text-xs text-muted-foreground">
+                        {appeal.user?.verifiedRealName ?? '—'} · {appeal.user?.studentNo ?? '—'} ·{' '}
+                        {formatDateTime(appeal.createdAt)}
+                        {' · '}
+                        {APPEAL_STATUS_LABELS[appeal.status] ?? appeal.status}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+          {selected && (
+            <Card>
+              <CardContent className="flex flex-col gap-3 p-5">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold text-foreground">{selected.subject}</h3>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      申诉人：{selected.user?.verifiedRealName ?? '—'}（{selected.user?.studentNo ?? '—'}）·{' '}
+                      {formatDateTime(selected.createdAt)} · 当前状态：{APPEAL_STATUS_LABELS[selected.status] ?? selected.status}
+                    </p>
+                  </div>
+                  <Button type="button" size="sm" variant="outline" onClick={onOpenLedgerEntry}>
+                    <CoinsIcon aria-hidden="true" />
+                    去补分 / 冲正
+                  </Button>
+                </div>
+                <div className="rounded-xl bg-muted/40 p-3 text-sm leading-[22px] whitespace-pre-wrap text-foreground/90">
+                  {selected.materials ?? '（未附材料说明）'}
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="appeal-resolution-note">处理说明 / 结案回复（结案或驳回至少 3 字，将展示给申诉人）</Label>
+                  <Textarea
+                    id="appeal-resolution-note"
+                    rows={3}
+                    maxLength={2000}
+                    value={resolutionNote}
+                    onChange={(event) => setResolutionNote(event.target.value)}
+                    placeholder="写明核查结果、是否已补录或冲正、依据条款等"
+                  />
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {selected.status !== 'in_review' && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={mutation.isPending}
+                      onClick={() =>
+                        mutation.mutate({
+                          appealId: selected.id,
+                          decision: 'in_review',
+                          resolutionNote: noteTrimmed,
+                        })
+                      }
+                    >
+                      标记受理中
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={mutation.isPending || noteTrimmed.length < 3}
+                    onClick={() =>
+                      mutation.mutate({
+                        appealId: selected.id,
+                        decision: 'resolved',
+                        resolutionNote: noteTrimmed,
+                      })
+                    }
+                  >
+                    {mutation.isPending && mutation.variables?.decision === 'resolved' && (
+                      <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                    )}
+                    采纳并结案
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="destructive"
+                    disabled={mutation.isPending || noteTrimmed.length < 3}
+                    onClick={() =>
+                      mutation.mutate({
+                        appealId: selected.id,
+                        decision: 'rejected',
+                        resolutionNote: noteTrimmed,
+                      })
+                    }
+                  >
+                    {mutation.isPending && mutation.variables?.decision === 'rejected' && (
+                      <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                    )}
+                    驳回申诉
+                  </Button>
+                </div>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  如需调账，请先点击右上角「去补分 / 冲正」完成账本操作，再填写结论结案。
+                </p>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      )}
+
+      {processedAppeals.length > 0 && (
         <Card>
           <CardContent className="flex flex-col gap-3 p-5">
-            <h3 className="text-sm font-semibold text-foreground">{selected.subject}</h3>
-            <p className="text-sm leading-[22px] whitespace-pre-wrap text-foreground/90">
-              {selected.materials ?? '（未附材料说明）'}
-            </p>
-            <p className="text-xs leading-5 text-muted-foreground">
-              申诉处理流程：核对流水与出勤记录 → 需要更正时通过「入账 / 冲正」落账（保留审计
-              痕迹）→ 结论在公示期结束前告知申诉人。
-            </p>
+            <h3 className="text-sm font-semibold text-foreground">
+              近期已结案申诉（{processedAppeals.length}）
+            </h3>
+            <ul className="flex flex-col divide-y divide-border">
+              {processedAppeals.map((appeal) => (
+                <li key={appeal.id} className="flex flex-col gap-1 py-2.5 text-sm">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium text-foreground">{appeal.subject}</span>
+                    <StatusBadge
+                      kind="disclosure"
+                      value={appeal.status === 'resolved' ? '已批准' : '已驳回'}
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      {appeal.user?.verifiedRealName ?? '—'}（{appeal.user?.studentNo ?? '—'}）
+                    </span>
+                  </div>
+                  {appeal.resolutionNote && (
+                    <p className="text-xs leading-5 text-muted-foreground">结论：{appeal.resolutionNote}</p>
+                  )}
+                  <p className="text-xs text-muted-foreground tabular-nums">
+                    提交于 {formatDateTime(appeal.createdAt)}
+                    {appeal.closedAt ? ` · 结案于 ${formatDateTime(appeal.closedAt)}` : ''}
+                  </p>
+                </li>
+              ))}
+            </ul>
           </CardContent>
         </Card>
       )}

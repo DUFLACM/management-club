@@ -35,6 +35,16 @@ export class MeController {
     return ok(await this.members.myRoomBookings(user.userId))
   }
 
+  @Get('room-bookings/schedule')
+  async roomBookingSchedule() {
+    return ok(await this.members.roomBookingSchedule())
+  }
+
+  @Get('room-bookings/candidates')
+  async roomBookingCandidates(@CurrentUser() user: { userId: string }, @Query('q') q?: string) {
+    return ok(await this.members.roomBookingCandidates(user.userId, q))
+  }
+
   @Post('room-bookings')
   async createRoomBooking(@CurrentUser() user: { userId: string }, @Body() body: unknown) {
     const parsed = z.object({
@@ -45,6 +55,12 @@ export class MeController {
       contestLink: z.string().max(300).optional(),
     }).parse(body)
     return ok(await this.members.createRoomBooking(user.userId, parsed))
+  }
+
+  @Post('room-bookings/:id/cancel')
+  async cancelRoomBooking(@CurrentUser() user: { userId: string }, @Param('id', ParseUUIDPipe) id: string) {
+    await this.members.cancelRoomBooking(user.userId, id)
+    return ok({ cancelled: true })
   }
 }
 
@@ -225,12 +241,7 @@ export class MembersAdminController {
   @Get('room-bookings')
   @RequireAction('rooms.approve')
   async roomBookings(@Query('status') status?: string) {
-    const rows = await this.db.roomBooking.findMany({
-      where: status ? { status } : { status: 'pending' },
-      orderBy: { startsAt: 'asc' },
-      take: 50,
-    })
-    return ok(rows)
+    return ok(await this.members.adminRoomBookings(status ?? 'pending'))
   }
 
   @Post('room-bookings/:id/decision')

@@ -1,11 +1,14 @@
 import { Injectable } from '@nestjs/common'
+import { parseVjudgeContestDataJson, parseVjudgeRankSingle, vjudgeCookieHeader } from '@acm/integrations'
 
 /**
  * 平台榜单抓取（参与者活动详情「比赛成绩」区）：
  * - 牛客：real-time-rank-data 公开接口（无需 token；每页固定 50 行，按 pageCount 翻完全部页）；
  * - Codeforces：官方 API contest.standings（匿名 GET，不加 UA 与额外参数，否则 400）；
  * - AtCoder：standings/json 需登录态——尝试匿名，失败时优雅降级为外链
- *   （可用 ATCODER_SESSION 环境变量注入会话 Cookie 恢复抓取）。
+ *   （可用 ATCODER_SESSION 环境变量注入会话 Cookie 恢复抓取）；
+ * - VJudge：/contest/rank/single/{id} 单次返回全榜 JSON，并尽力抓取比赛页 dataJson 补全准确题数与题名
+ *   （密码赛/校内 Group 赛可在服务端配置 VJUDGE_COOKIE）。
  * - 结果按 (platform, contestId) 内存缓存 60 秒；并发去重，避免同一榜单重复外呼。
  */
 
@@ -68,6 +71,7 @@ export function contestExternalUrl(platform: string, contestId: string): string 
   if (platform === 'nowcoder') return `https://ac.nowcoder.com/acm/contest/${contestId}`
   if (platform === 'codeforces') return `https://codeforces.com/contest/${contestId}`
   if (platform === 'atcoder') return `https://atcoder.jp/contests/${contestId}`
+  if (platform === 'vjudge') return `https://vjudge.net/contest/${contestId}`
   return null
 }
 
@@ -132,6 +136,7 @@ export class ContestStandingsService {
         if (platform === 'nowcoder') result = await this.fetchNowcoder(contestId, maxPages ?? NOWCODER_MAX_PAGES, controller.signal)
         else if (platform === 'codeforces') result = await this.fetchCodeforces(contestId, controller.signal)
         else if (platform === 'atcoder') result = await this.fetchAtcoder(contestId, controller.signal)
+        else if (platform === 'vjudge') result = await this.fetchVjudge(contestId, controller.signal)
         else result = { platform, contestId, available: false, reason: '该平台暂不支持榜单抓取，请通过外链前往查看' }
       } catch {
         result = {
@@ -323,5 +328,83 @@ export class ContestStandingsService {
       }
     }).filter((e) => e.handle !== '')
     return { platform: 'atcoder', contestId, available: true, problems, entries, fetchedAt: new Date().toISOString(), note: '数据来自 AtCoder 官方榜单。' }
+  }
+
+  /**
+   * VJudge：/contest/rank/single/{id} 返回整场参赛者与提交记录，自动过滤赛后补题并按 ICPC 规则排定名次；
+   * 同步尽力抓取比赛页 HTML 的 dataJson 获取完整题目列表（避免 0 提交题导致 S 分母偏小）。
+   * 密码赛 / 校内 Group 赛可在服务端环境变量配置 VJUDGE_COOKIE。
+   */
+  private async fetchVjudge(contestId: string, signal: AbortSignal): Promise<StandingsResult> {
+    const cookie = vjudgeCookieHeader()
+    const baseHeaders: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) club-activities/1.0',
+      ...(cookie ? { Cookie: cookie } : {}),
+    }
+    const rankUrl = `https://vjudge.net/contest/rank/single/${encodeURIComponent(contestId)}`
+    const pageUrl = `https://vjudge.net/contest/${encodeURIComponent(contestId)}`
+
+    const [rankResponse, meta] = await Promise.all([
+      fetch(rankUrl, { headers: { ...baseHeaders, Accept: 'application/json' }, redirect: 'manual', signal }),
+      fetch(pageUrl, { headers: { ...baseHeaders, Accept: 'text/html' }, redirect: 'manual', signal })
+        .then(async (res) => (res.ok ? parseVjudgeContestDataJson(await res.text(), contestId) : null))
+        .catch(() => null),
+    ])
+
+    if (rankResponse.status >= 300 && rankResponse.status < 400) {
+      return {
+        platform: 'vjudge',
+        contestId,
+        available: false,
+        reason: 'VJudge 榜单需要登录态或密码权限（可在服务端配置 VJUDGE_COOKIE），暂无法抓取；请通过外链前往查看',
+      }
+    }
+    if (rankResponse.status === 401 || rankResponse.status === 403) {
+      return {
+        platform: 'vjudge',
+        contestId,
+        available: false,
+        reason: 'VJudge 拒绝访问（可能为密码赛/校内 Group 赛或触发站点防护，请核对服务端 VJUDGE_COOKIE）；请通过外链前往查看',
+      }
+    }
+    if (rankResponse.status === 404) {
+      return { platform: 'vjudge', contestId, available: false, reason: '未找到该 VJudge 比赛（请确认比赛 ID）' }
+    }
+    if (!rankResponse.ok) throw new Error(`vjudge ${rankResponse.status}`)
+    const contentType = rankResponse.headers.get('content-type') ?? ''
+    if (!contentType.includes('json')) {
+      return {
+        platform: 'vjudge',
+        contestId,
+        available: false,
+        reason: 'VJudge 返回非 JSON 响应（可能需要登录态/密码或触发站点防护），暂无法抓取；请通过外链前往查看',
+      }
+    }
+
+    const body = (await rankResponse.json()) as unknown
+    const parsed = parseVjudgeRankSingle(body, contestId, meta?.problems)
+    if (parsed.problems.length === 0 && parsed.entries.length === 0) {
+      return { platform: 'vjudge', contestId, available: false, reason: '该 VJudge 比赛暂无榜单或比赛尚未开始' }
+    }
+
+    const notes: string[] = [`数据来自 VJudge 单场榜单接口（赛内有效参赛 ${parsed.entries.length} 人/队）。`]
+    if (parsed.upsolvingSkipped > 0) notes.push(`已自动过滤 ${parsed.upsolvingSkipped} 条赛外/补题提交。`)
+    if (parsed.problemCountFromSubmissions) notes.push('未能读取比赛页完整题单，总题数按榜上最大题号推断。')
+
+    return {
+      platform: 'vjudge',
+      contestId,
+      available: true,
+      problems: parsed.problems,
+      entries: parsed.entries.map(({ penaltySeconds: _p, ...entry }) => entry),
+      totalEntries: parsed.entries.length,
+      fetchedAt: new Date().toISOString(),
+      contest: {
+        name: meta?.title ?? parsed.title,
+        startAt: (meta?.startTime ?? parsed.startTime)?.toISOString() ?? null,
+        endAt: (meta?.endTime ?? parsed.endTime)?.toISOString() ?? null,
+      },
+      note: notes.join(''),
+    }
   }
 }

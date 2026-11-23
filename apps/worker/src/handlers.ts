@@ -4,6 +4,7 @@ import {
   fetchNowcoderHistory,
   fetchNowcoderRatingHistory,
   fetchNowcoderContestMeta,
+  fetchVjudgeContestMeta,
   fetchCfUserInfo,
   fetchCfRatingHistory,
   fetchCfSubmissions,
@@ -246,6 +247,10 @@ const handlers: Record<string, JobHandler> = {
         })
       }
       note = `AtCoder 历史 ${synced} 条`
+    } else if (account.platform === 'vjudge') {
+      // VJudge 无个人 Rating 曲线，成绩按单场活动/赛事榜单实时抓取结算
+      synced = 0
+      note = 'VJudge 账号已就绪（无全局 Rating 曲线，比赛成绩按场次榜单自动结算）'
     } else {
       throw new AdapterError(`未知平台 ${account.platform}`, 'UNKNOWN_PLATFORM', false)
     }
@@ -336,6 +341,35 @@ const handlers: Record<string, JobHandler> = {
         return { found: true, note: 'AtCoder 目录匹配；起止时间需按详情核对补全' }
       }
       return { found: false, note: 'AtCoder 目录未匹配；请人工补全' }
+    }
+    if (platform === 'vjudge') {
+      const { found, contest } = await fetchVjudgeContestMeta(ctx.db, contestId)
+      if (found && contest) {
+        await ctx.db.activity.update({
+          where: { id: activityId },
+          data: {
+            title: contest.name,
+            startAt: contest.startTime,
+            endAt: contest.endTime ?? new Date(contest.startTime.getTime() + 7200_000),
+            contestMeta: { source: 'vjudge', contestId, problemCount: contest.problemCount, fullScore: null, needsManualCompletion: contest.problemCount == null } as never,
+          },
+        })
+        await ctx.db.platformContest.upsert({
+          where: { platform_externalContestId: { platform: 'vjudge', externalContestId: contestId } },
+          create: {
+            id: randomUUID(), platform: 'vjudge', externalContestId: contestId, name: contest.name,
+            startTime: contest.startTime, endTime: contest.endTime, durationSeconds: contest.durationSeconds,
+            problemCount: contest.problemCount, syncStatus: 'ok', lastSyncedAt: new Date(),
+          },
+          update: { name: contest.name, problemCount: contest.problemCount, lastSyncedAt: new Date() },
+        })
+        return { found: true, note: 'VJudge 元数据已写入草稿（含起止时间与题数）' }
+      }
+      await ctx.db.activity.update({
+        where: { id: activityId },
+        data: { contestMeta: { source: 'vjudge', contestId, error: 'meta_not_found', needsManualCompletion: true } as never },
+      })
+      return { found: false, note: '未获取到 VJudge 元数据（可能为密码赛/Group 赛需配置 VJUDGE_COOKIE）；请人工补全草稿' }
     }
     if (platform === 'hydro') {
       // 未联调实例：connector 未启用时直接标记需人工（不虚构拉取）

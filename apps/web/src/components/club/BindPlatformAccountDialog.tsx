@@ -143,6 +143,7 @@ export function BindForm({
             <SelectItem value="nowcoder">牛客</SelectItem>
             <SelectItem value="codeforces">Codeforces</SelectItem>
             <SelectItem value="atcoder">AtCoder</SelectItem>
+            <SelectItem value="vjudge">VJudge</SelectItem>
           </SelectContent>
         </Select>
       </div>
