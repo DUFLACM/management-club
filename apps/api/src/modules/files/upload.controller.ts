@@ -220,10 +220,13 @@ export class UploadController {
     return ok({ assetId: asset.id, status: asset.status, variants: asset.variants })
   }
 
-  /** 头像变体读取：本人可直接读；他人头像仅当其主页可见性非「仅自己」时开放（社内成员登录态） */
+  /**
+   * 头像变体读取：任何已登录身份（学生 / 教职工 / 本地管理员）都可读取，不再要求请求者必须是学生。
+   * 「仅自己」可见的头像仍对普通成员隐藏；具备 members.read 的管理角色可查看，便于审核与成员管理。
+   */
   @Get('avatar/:assetId')
   async avatar(
-    @CurrentUser() user: { userId: string },
+    @CurrentActor() actor: SessionActor,
     @Param('assetId', ParseUUIDPipe) assetId: string,
     @Res({ passthrough: true }) res: Response,
     @Query('size') size?: string,
@@ -231,7 +234,7 @@ export class UploadController {
     const variantSize = ['64', '128', '256', '512'].includes(size ?? '') ? size! : '256'
     const asset = await this.db.mediaAsset.findUnique({ where: { id: assetId } })
     if (!asset || asset.status !== 'ready' || asset.purpose !== 'avatar') throw new BadRequestException('头像不存在')
-    if (asset.ownerUserId !== user.userId) {
+    if (actor.userId !== asset.ownerUserId && !actorCan(actor, 'members.read')) {
       const profile = await this.db.userProfile.findUnique({ where: { userId: asset.ownerUserId } })
       if (profile?.visibility === 'self_only') throw new BadRequestException('该成员头像不对外展示')
     }

@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { newInvitationSecret } from '../auth/auth.service.js'
-import { newId, sha256Hex, monthKey, memberName, visibleAvatar } from '../../common/utils.js'
+import { newId, sha256Hex, monthKey, memberName } from '../../common/utils.js'
 import { computeEffectiveScore, formalQuota, graceMonths } from '@acm/scoring-core'
 import {
   RANKED_MEMBERSHIPS,
@@ -251,7 +251,8 @@ export class MembersService {
         return {
           id: u.id,
           displayName: memberName(u),
-          avatarAssetId: visibleAvatar(u.profile),
+          // 管理端成员列表：members.read 角色可见全部头像（含主页设为「仅自己」的头像）
+          avatarAssetId: u.profile?.avatarAssetId ?? null,
           studentNo: u.studentNo,
           grade: u.grade,
           membership: u.membershipTerms[0]?.membershipStatus ?? 'applicant',
