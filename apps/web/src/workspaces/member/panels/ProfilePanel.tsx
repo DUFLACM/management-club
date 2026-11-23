@@ -7,7 +7,8 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ChevronRightIcon, LoaderCircleIcon, UploadIcon } from 'lucide-react';
+import { ChevronRightIcon, ExternalLinkIcon, LoaderCircleIcon, RefreshCwIcon, UploadIcon } from 'lucide-react';
+import { platformContestUrl } from '@/lib/format';
 
 import { api, ApiError, fetchCsrfToken, CSRF_HEADER, API_BASE } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
@@ -348,7 +349,7 @@ function ratingEmptyReason(platform: string): string {
   if (platform === 'codeforces') return '尚未参加 Codeforces rated 比赛；参加后点「申请刷新」同步即出现。';
   if (platform === 'nowcoder') return '尚未参加牛客 rated 场次；参加 rated 比赛并同步后这里会出现曲线（单场 rating 也可在「比赛成绩」中查看）。';
   if (platform === 'hydro') return '校内 OJ 暂无 rating 序列；比赛成绩见「比赛成绩」列表。';
-  if (platform === 'vjudge') return 'VJudge 无全局 rating 曲线；各场个人/组队比赛成绩会在对应活动详情与积分流水中展示。';
+  if (platform === 'vjudge') return 'VJudge 无全局 rating 曲线；各场个人/组队比赛成绩已汇总到「比赛成绩」与积分流水中。';
   return '暂无 rated 记录；参加 rated 比赛并同步后即出现。';
 }
 
@@ -403,10 +404,12 @@ function LazyRatingCard({ platform, series }: { platform: string; series: Rating
 }
 
 function ResultsSection({ principalId, targetId }: { principalId: string; targetId: string }) {
+  const [platformFilter, setPlatformFilter] = useState('all');
   const query = usePrivateInfiniteQuery<
     {
       items: Array<{
         platform: string;
+        contestId: string;
         contestName: string;
         startTime: string;
         participationType: string;
@@ -421,12 +424,14 @@ function ResultsSection({ principalId, targetId }: { principalId: string; target
       nextCursor?: string | null;
     },
     ApiError
-  >(principalId, ['profiles', 'competition-results', targetId], async (cursor) => {
+  >(principalId, ['profiles', 'competition-results', targetId, platformFilter], async (cursor) => {
     const params = new URLSearchParams();
+    if (platformFilter !== 'all') params.set('platform', platformFilter);
     if (cursor) params.set('cursor', cursor);
     const { data } = await api.get<{
       items: Array<{
         platform: string;
+        contestId: string;
         contestName: string;
         startTime: string;
         participationType: string;
@@ -446,11 +451,37 @@ function ResultsSection({ principalId, targetId }: { principalId: string; target
   const items = query.data?.pages.flatMap((page) => page.items) ?? [];
   return (
     <Card>
-      <CardContent className="p-5">
+      <CardContent className="flex flex-col gap-3 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Select value={platformFilter} onValueChange={setPlatformFilter}>
+            <SelectTrigger className="w-40" aria-label="按平台筛选成绩">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部平台</SelectItem>
+              <SelectItem value="nowcoder">牛客</SelectItem>
+              <SelectItem value="codeforces">Codeforces</SelectItem>
+              <SelectItem value="atcoder">AtCoder</SelectItem>
+              <SelectItem value="vjudge">VJudge</SelectItem>
+              <SelectItem value="hydro">校内 OJ</SelectItem>
+            </SelectContent>
+          </Select>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={query.isFetching}
+            onClick={() => void query.refetch()}
+          >
+            <RefreshCwIcon className={query.isFetching ? 'size-3.5 animate-spin' : 'size-3.5'} aria-hidden="true" />
+            刷新成绩
+          </Button>
+        </div>
+
         {query.isPending ? (
           <div className="flex flex-col gap-2">
-            {[0, 1, 2].map((index) => (
-              <Skeleton key={index} className="h-10" />
+            {[0, 1, 2, 3].map((index) => (
+              <Skeleton key={index} className="h-12 rounded-xl" />
             ))}
           </div>
         ) : query.isError ? (
@@ -464,9 +495,16 @@ function ResultsSection({ principalId, targetId }: { principalId: string; target
             }
           />
         ) : items.length === 0 ? (
-          <EmptyState kind="empty" description="暂无同步到的比赛成绩。" />
+          <EmptyState
+            kind="empty"
+            description={
+              platformFilter === 'all'
+                ? '暂无同步或已结算的比赛成绩。'
+                : `暂无 ${platformLabel(platformFilter)} 的比赛成绩。`
+            }
+          />
         ) : (
-          <>
+          <div className={`club-fade-in transition-opacity duration-200 ${query.isFetching && !query.isFetchingNextPage ? 'opacity-80' : ''}`}>
             <div className="overflow-x-auto">
               <Table>
                 <TableHeader>
@@ -479,29 +517,51 @@ function ResultsSection({ principalId, targetId }: { principalId: string; target
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {items.map((row, index) => (
-                    <TableRow key={`${row.platform}-${index}`}>
-                      <TableCell>
-                        <span className="block">{row.contestName}</span>
-                        <span className="text-xs text-muted-foreground">
-                          {platformLabel(row.platform)} · {row.participationType}
-                        </span>
-                      </TableCell>
-                      <TableCell className="text-muted-foreground tabular-nums">
-                        {formatDateTime(row.startTime)}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {row.score ?? '—'}
-                        {row.fullScore != null && (
-                          <span className="text-muted-foreground"> / {row.fullScore}</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">
-                        {row.acceptedCount ?? '—'}/{row.problemCount ?? '—'}
-                      </TableCell>
-                      <TableCell className="text-right tabular-nums">{row.rank ?? '—'}</TableCell>
-                    </TableRow>
-                  ))}
+                  {items.map((row, index) => {
+                    const url = platformContestUrl(row.platform, row.contestId);
+                    return (
+                      <TableRow key={`${row.platform}-${row.contestId}-${index}`}>
+                        <TableCell>
+                          <span className="flex items-center gap-1.5 font-medium text-foreground">
+                            <span>{row.contestName}</span>
+                            {url && (
+                              <a
+                                href={url}
+                                target="_blank"
+                                rel="noreferrer"
+                                aria-label={`打开 ${row.contestName}`}
+                                className="text-muted-foreground hover:text-primary"
+                              >
+                                <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
+                              </a>
+                            )}
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {platformLabel(row.platform)} · {row.participationType === 'TEAM' ? '组队赛' : row.participationType}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-muted-foreground tabular-nums">
+                          {formatDateTime(row.startTime)}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {row.score ?? '—'}
+                          {row.fullScore != null && (
+                            <span className="text-muted-foreground"> / {row.fullScore}</span>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {row.acceptedCount != null
+                            ? `${row.acceptedCount}${row.problemCount != null ? `/${row.problemCount}` : ''}`
+                            : '—'}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {row.rank != null
+                            ? `#${row.rank}${row.rankTotal != null ? ` / ${row.rankTotal}` : ''}`
+                            : '—'}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  })}
                 </TableBody>
               </Table>
             </div>
@@ -513,7 +573,7 @@ function ResultsSection({ principalId, targetId }: { principalId: string; target
               hasNext={Boolean(query.data?.pages.at(-1)?.nextCursor)}
               hint="已展示全部成绩"
             />
-          </>
+          </div>
         )}
       </CardContent>
     </Card>

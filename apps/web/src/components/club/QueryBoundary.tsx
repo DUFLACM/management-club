@@ -57,9 +57,21 @@ export function QueryBoundary<T>({
   }
   const data = query.data;
   if (isEmpty?.(data)) {
-    return <div className={className}>{emptyNode ?? <EmptyState kind="empty" />}</div>;
+    return <div className={cn('club-fade-in', className)}>{emptyNode ?? <EmptyState kind="empty" />}</div>;
   }
-  return <div className={cn('min-w-0', className)}>{children(data)}</div>;
+  const refreshing = query.isFetching && !query.isPending;
+  return (
+    <div
+      className={cn(
+        'club-fade-in relative min-w-0 transition-opacity duration-200',
+        refreshing && 'opacity-85',
+        className,
+      )}
+      aria-busy={refreshing || undefined}
+    >
+      {children(data)}
+    </div>
+  );
 }
 
 /**

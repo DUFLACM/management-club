@@ -136,7 +136,7 @@ export class ScoringService {
   }> {
     const activity = await this.db.activity.findUnique({
       where: { id: activityId },
-      select: { id: true, title: true, platform: true, platformContestId: true, endAt: true, scoringConfig: true },
+      select: { id: true, title: true, platform: true, platformContestId: true, startAt: true, endAt: true, scoringConfig: true },
     })
     if (!activity) throw new ScoringError('活动不存在', 'NOT_FOUND')
     if (!activity.platform || !activity.platformContestId) throw new ScoringError('本活动未关联平台赛事', 'NOT_CONTEST')
@@ -226,6 +226,19 @@ export class ScoringService {
       for (const team of unmatchedTeams) {
         skipped.push({ name: `${team.teamName}（${team.members.map((m) => m.name).join('、')}）`, reason: '队员绑定的平台账号均未出现在榜单上' })
       }
+      await this.persistPlatformResultsForActivity(activity, {
+        totalProblems,
+        totalEntries,
+        participationType: 'TEAM',
+        rows: validTeams.flatMap((teamRow) =>
+          teamRow.members.map((member) => ({
+            userId: member.userId,
+            solvedCount: teamRow.solvedCount,
+            score: teamRow.score,
+            platformRank: teamRow.platformRank,
+          })),
+        ),
+      })
       return { posted, deduplicated, skipped, lambda: { key: lambdaKey, source: lambdaSource }, cap, validCount: validTeams.length }
     }
 
@@ -273,7 +286,110 @@ export class ScoringService {
     for (const row of clubRows) {
       if (!valid.includes(row)) skipped.push({ name: row.name, reason: '榜上无有效提交（仅记出勤，不发竞赛分）' })
     }
+    await this.persistPlatformResultsForActivity(activity, {
+      totalProblems,
+      totalEntries,
+      participationType: 'OFFICIAL',
+      rows: valid.map((row) => ({
+        userId: row.userId,
+        solvedCount: row.solvedCount,
+        score: row.score,
+        platformRank: row.platformRank,
+      })),
+    })
     return { posted, deduplicated, skipped, lambda: { key: lambdaKey, source: lambdaSource }, cap, validCount: valid.length }
+  }
+
+  /**
+   * 结算平台赛时同步落库 platform_contests + platform_results（尤其补齐 VJudge 个人/组队成绩，
+   * 使其在「我的资料 → 比赛成绩」「竞赛 → 平台记录」与自动徽标统计中完整可见）。
+   */
+  private async persistPlatformResultsForActivity(
+    activity: { title: string; platform: string | null; platformContestId: string | null; startAt?: Date | null; endAt: Date },
+    input: {
+      totalProblems: number
+      totalEntries: number
+      participationType: 'OFFICIAL' | 'TEAM'
+      rows: Array<{ userId: string; solvedCount: number; score: number; platformRank: number | null }>
+    },
+  ): Promise<void> {
+    if (!activity.platform || !activity.platformContestId || input.rows.length === 0) return
+    if (!this.db.platformContest?.upsert || !this.db.platformResult?.upsert || !this.db.platformAccount?.findMany) return
+    try {
+      const userIds = [...new Set(input.rows.map((r) => r.userId))]
+      const accounts = await this.db.platformAccount.findMany({
+        where: { platform: activity.platform, userId: { in: userIds }, status: { in: ['verified', 'pending_review', 'unverified'] } },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, userId: true, status: true },
+      })
+      const accountByUser = new Map<string, string>()
+      for (const acc of accounts) {
+        if (!accountByUser.has(acc.userId) || acc.status === 'verified') {
+          accountByUser.set(acc.userId, acc.id)
+        }
+      }
+      if (accountByUser.size === 0) return
+
+      const contest = await this.db.platformContest.upsert({
+        where: { platform_externalContestId: { platform: activity.platform, externalContestId: activity.platformContestId } },
+        create: {
+          id: newId(),
+          platform: activity.platform,
+          externalContestId: activity.platformContestId,
+          name: activity.title,
+          startTime: activity.startAt ?? activity.endAt,
+          endTime: activity.endAt,
+          problemCount: input.totalProblems > 0 ? input.totalProblems : null,
+          syncStatus: 'ok',
+          lastSyncedAt: new Date(),
+        },
+        update: {
+          name: activity.title,
+          ...(input.totalProblems > 0 ? { problemCount: input.totalProblems } : {}),
+          syncStatus: 'ok',
+          lastSyncedAt: new Date(),
+        },
+      })
+
+      for (const row of input.rows) {
+        const accountId = accountByUser.get(row.userId)
+        if (!accountId) continue
+        await this.db.platformResult.upsert({
+          where: {
+            platformContestId_platformAccountId_participationType: {
+              platformContestId: contest.id,
+              platformAccountId: accountId,
+              participationType: input.participationType,
+            },
+          },
+          create: {
+            id: newId(),
+            platformContestId: contest.id,
+            platformAccountId: accountId,
+            participationType: input.participationType,
+            score: row.score,
+            acceptedCount: row.solvedCount,
+            problemCount: input.totalProblems > 0 ? input.totalProblems : null,
+            rank: row.platformRank,
+            rankTotal: input.totalEntries > 0 ? input.totalEntries : null,
+            status: 'complete',
+            syncedAt: new Date(),
+          },
+          update: {
+            score: row.score,
+            acceptedCount: row.solvedCount,
+            problemCount: input.totalProblems > 0 ? input.totalProblems : null,
+            rank: row.platformRank,
+            rankTotal: input.totalEntries > 0 ? input.totalEntries : null,
+            status: 'complete',
+            syncedAt: new Date(),
+            factsVersion: { increment: 1 },
+          },
+        })
+      }
+    } catch {
+      // 平台结果镜像写失败不回滚已完成的积分结算
+    }
   }
 
   /**
@@ -469,6 +585,13 @@ export class ScoringService {
     let replacementId: string | null = null
     if (replacementAmount != null) {
       replacementId = newId()
+      let replacementDetail: Record<string, unknown> = { reason, replacesEntryId: entryId }
+      if (original.detail && typeof original.detail === 'object' && !Array.isArray(original.detail)) {
+        const origDetail = original.detail as Record<string, unknown>
+        for (const key of ['activityId', 'activityTitle', 'eventId', 'eventTitle', 'claimId', 'title', 'bonusLabel', 'teamId', 'teamName']) {
+          if (origDetail[key] != null) replacementDetail[key] = origDetail[key]
+        }
+      }
       await tx.pointsLedgerEntry.create({
         data: {
           id: replacementId,
@@ -480,7 +603,7 @@ export class ScoringService {
           recordedAt: new Date(),
           status: 'approved',
           ruleVersionId: original.ruleVersionId,
-          detail: { reason, replacesEntryId: entryId } as never,
+          detail: replacementDetail as never,
           approvedBy: actor.principalId,
           idempotencyKey: `replacement:${entryId}:${replacementAmount}`,
         },
@@ -503,7 +626,7 @@ export class ScoringService {
     return { reversalId, replacementId }
   }
 
-  /** 本人流水（含冲正历史） */
+  /** 本人流水（含冲正历史；自动解析关联的活动/赛事/贡献事件名称与跳转链接） */
   async myLedger(userId: string, filters: { month?: string; cursor?: string }) {
     const rows = await this.db.pointsLedgerEntry.findMany({
       where: {
@@ -515,7 +638,237 @@ export class ScoringService {
       ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
     })
     const nextCursor = rows.length > 25 ? rows.pop()!.id : undefined
-    return { items: rows, nextCursor }
+    const enriched = await this.enrichLedgerEntries(rows)
+    return { items: enriched, nextCursor }
+  }
+
+  /** 将账本原记录批量解析为可读事件名称、发生时间与关联内容摘要（避免直接向成员暴露内部 sourceKey） */
+  private async enrichLedgerEntries<
+    T extends {
+      id: string
+      sourceKey: string
+      category: string
+      scoreMonth: string
+      recordedAt: Date
+      detail: unknown
+      reversesEntryId: string | null
+      reversalReason: string | null
+    },
+  >(rows: T[]) {
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    const asObj = (v: unknown): Record<string, unknown> =>
+      v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+    const asStr = (v: unknown): string | null =>
+      typeof v === 'string' && v.trim().length > 0 ? v.trim() : null
+
+    const activityIds = new Set<string>()
+    const contestKeys = new Map<string, { platform: string; platformContestId: string }>()
+    const eventIds = new Set<string>()
+    const claimIds = new Set<string>()
+    const reversedIds = new Set<string>()
+
+    const extractRefs = (row: { sourceKey: string; detail: unknown; reversesEntryId: string | null }) => {
+      const d = asObj(row.detail)
+      let actId = asStr(d.activityId)
+      let evtId = asStr(d.eventId)
+      let clmId = asStr(d.claimId)
+      let contestRef: { platform: string; platformContestId: string } | null = null
+
+      const parts = row.sourceKey.split(':')
+      if (!actId && (parts[0] === 'history' || parts[0] === 'activity') && parts[1] && UUID_RE.test(parts[1])) {
+        actId = parts[1]
+      }
+      if (!evtId && (parts[0] === 'competition' || parts[0] === 'team-competition') && parts[1] && UUID_RE.test(parts[1])) {
+        evtId = parts[1]
+      }
+      if (!clmId && parts[0] === 'contribution' && parts[2] && UUID_RE.test(parts[2])) {
+        clmId = parts[2]
+      }
+      if (parts[0] === 'contest' && parts[1] && parts[2] && !actId) {
+        contestRef = { platform: parts[1], platformContestId: parts[2] }
+      }
+      const origId = row.reversesEntryId ?? asStr(d.originalEntryId)
+      return {
+        activityId: actId && UUID_RE.test(actId) ? actId : null,
+        eventId: evtId && UUID_RE.test(evtId) ? evtId : null,
+        claimId: clmId && UUID_RE.test(clmId) ? clmId : null,
+        contestRef,
+        originalEntryId: origId && UUID_RE.test(origId) ? origId : null,
+      }
+    }
+
+    const rowRefs = rows.map((row) => {
+      const refs = extractRefs(row)
+      if (refs.activityId) activityIds.add(refs.activityId)
+      if (refs.eventId) eventIds.add(refs.eventId)
+      if (refs.claimId) claimIds.add(refs.claimId)
+      if (refs.contestRef) contestKeys.set(`${refs.contestRef.platform}:${refs.contestRef.platformContestId}`, refs.contestRef)
+      if (refs.originalEntryId) reversedIds.add(refs.originalEntryId)
+      return refs
+    })
+
+    const [activitiesById, activitiesByContest, events, claims, originals] = await Promise.all([
+      activityIds.size > 0
+        ? this.db.activity.findMany({
+            where: { id: { in: [...activityIds] } },
+            select: { id: true, title: true, type: true, startAt: true, endAt: true, platform: true, platformContestId: true, venueVersion: { select: { name: true, building: true, room: true } } },
+          })
+        : Promise.resolve([]),
+      contestKeys.size > 0
+        ? this.db.activity.findMany({
+            where: { OR: [...contestKeys.values()].map((c) => ({ platform: c.platform, platformContestId: c.platformContestId })) },
+            select: { id: true, title: true, type: true, startAt: true, endAt: true, platform: true, platformContestId: true, venueVersion: { select: { name: true, building: true, room: true } } },
+          })
+        : Promise.resolve([]),
+      eventIds.size > 0
+        ? this.db.competitionEvent.findMany({
+            where: { id: { in: [...eventIds] } },
+            select: { id: true, title: true, category: true, startAt: true, endAt: true, platform: true },
+          })
+        : Promise.resolve([]),
+      claimIds.size > 0
+        ? this.db.pointsClaim.findMany({
+            where: { id: { in: [...claimIds] } },
+            select: { id: true, title: true, category: true, description: true, reviewNote: true, createdAt: true },
+          })
+        : Promise.resolve([]),
+      reversedIds.size > 0
+        ? this.db.pointsLedgerEntry.findMany({
+            where: { id: { in: [...reversedIds] } },
+            select: { id: true, sourceKey: true, category: true, scoreMonth: true, amount: true, detail: true },
+          })
+        : Promise.resolve([]),
+    ])
+
+    const actByIdMap = new Map(activitiesById.map((a) => [a.id, a]))
+    const actByContestMap = new Map<string, (typeof activitiesByContest)[number]>()
+    for (const a of [...activitiesById, ...activitiesByContest]) {
+      if (a.platform && a.platformContestId) {
+        actByContestMap.set(`${a.platform}:${a.platformContestId}`, a)
+      }
+    }
+    const eventByIdMap = new Map(events.map((e) => [e.id, e]))
+    const claimByIdMap = new Map(claims.map((c) => [c.id, c]))
+    const origByIdMap = new Map(originals.map((o) => [o.id, o]))
+
+    const CATEGORY_NAMES: Record<string, string> = {
+      contest: '比赛积分',
+      remote_contest: '远程比赛积分',
+      activity: '活动参与积分',
+      contribution: '贡献积分',
+      service: '服务积分',
+      award: '赛事获奖积分',
+      initial: '入社基础分',
+      penalty: '纪律扣分',
+      reversal: '积分冲正',
+    }
+
+    const resolveFallbackTitle = (category: string, scoreMonth: string, detail: Record<string, unknown>): string => {
+      const explicit =
+        asStr(detail.activityTitle) ??
+        asStr(detail.eventTitle) ??
+        asStr(detail.title) ??
+        asStr(detail.note) ??
+        asStr(detail.reason)
+      if (explicit) return explicit
+      if (category === 'initial') return `入社基础分（${scoreMonth}）`
+      return `${CATEGORY_NAMES[category] ?? '积分记录'}（${scoreMonth}）`
+    }
+
+    return rows.map((row, idx) => {
+      const refs = rowRefs[idx]!
+      const d = asObj(row.detail)
+      const bonusLabel = asStr(d.bonusLabel)
+      const activity =
+        (refs.activityId ? actByIdMap.get(refs.activityId) : undefined) ??
+        (refs.contestRef ? actByContestMap.get(`${refs.contestRef.platform}:${refs.contestRef.platformContestId}`) : undefined)
+      const compEvent = refs.eventId ? eventByIdMap.get(refs.eventId) : undefined
+      const claim = refs.claimId ? claimByIdMap.get(refs.claimId) : undefined
+      const orig = refs.originalEntryId ? origByIdMap.get(refs.originalEntryId) : undefined
+
+      let eventName: string
+      let eventTime: string | null = null
+      let eventKind: 'activity' | 'competition' | 'claim' | 'reversal' | 'initial' | 'manual' = 'manual'
+      let eventLink: string | null = null
+      let eventMeta: Record<string, unknown> | null = null
+
+      if (row.category === 'reversal') {
+        eventKind = 'reversal'
+        const origDetail = orig ? asObj(orig.detail) : {}
+        const origTitle = orig ? resolveFallbackTitle(orig.category, orig.scoreMonth, origDetail) : null
+        eventName = origTitle ? `冲正：${origTitle}` : `积分冲正（${row.scoreMonth}）`
+        eventTime = row.recordedAt.toISOString()
+        eventMeta = {
+          reversalReason: row.reversalReason ?? asStr(d.reason),
+          originalAmount: orig ? orig.amount.toString() : null,
+          originalTitle: origTitle,
+        }
+      } else if (activity) {
+        eventKind = 'activity'
+        eventName = bonusLabel ? `${activity.title} · ${bonusLabel}` : activity.title
+        eventTime = activity.startAt.toISOString()
+        eventLink = `/app?section=activities&activity=${activity.id}`
+        const venueParts = activity.venueVersion
+          ? [activity.venueVersion.name, activity.venueVersion.building, activity.venueVersion.room].filter(Boolean)
+          : []
+        eventMeta = {
+          activityId: activity.id,
+          activityType: activity.type,
+          startAt: activity.startAt.toISOString(),
+          endAt: activity.endAt.toISOString(),
+          venue: venueParts.length > 0 ? venueParts.join(' ') : null,
+          platform: activity.platform,
+        }
+      } else if (compEvent) {
+        eventKind = 'competition'
+        eventName = compEvent.title
+        eventTime = compEvent.startAt.toISOString()
+        eventLink = '/app?section=contests&tab=events'
+        eventMeta = {
+          eventId: compEvent.id,
+          category: compEvent.category,
+          startAt: compEvent.startAt.toISOString(),
+          endAt: compEvent.endAt.toISOString(),
+          teamName: asStr(d.teamName),
+        }
+      } else if (claim) {
+        eventKind = 'claim'
+        eventName = claim.title
+        eventTime = claim.createdAt.toISOString()
+        eventLink = '/app?section=contributions'
+        eventMeta = {
+          claimId: claim.id,
+          claimCategory: claim.category,
+          description: claim.description,
+          reviewNote: claim.reviewNote,
+        }
+      } else if (row.category === 'initial') {
+        eventKind = 'initial'
+        eventName = `入社基础分（${row.scoreMonth}）`
+        eventTime = row.recordedAt.toISOString()
+      } else {
+        const baseName = resolveFallbackTitle(row.category, row.scoreMonth, d)
+        eventName = bonusLabel && !baseName.includes(bonusLabel) ? `${baseName} · ${bonusLabel}` : baseName
+        const actDate = asStr(d.activityDate)
+        eventTime = actDate && !Number.isNaN(Date.parse(actDate)) ? new Date(actDate).toISOString() : row.recordedAt.toISOString()
+        if (asStr(d.eventTitle)) {
+          eventKind = 'competition'
+          eventLink = '/app?section=contests&tab=events'
+        } else if (asStr(d.title) && row.category === 'contribution') {
+          eventKind = 'claim'
+          eventLink = '/app?section=contributions'
+        }
+      }
+
+      return {
+        ...row,
+        eventName,
+        eventTime,
+        eventKind,
+        eventLink,
+        eventMeta,
+      }
+    })
   }
 
   /** 月度汇总 + E（预览；按当前规则版本） */
@@ -732,12 +1085,186 @@ export class ScoringService {
     throw new ScoringError('缺少榜单引用', 'REF_MISSING')
   }
 
-  /** 申诉（公示版本引用固定 revision） */
-  async submitAppeal(userId: string, input: { disclosureId?: string; ledgerEntryId?: string; subject: string; materials?: string }): Promise<{ appealId: string }> {
+  /** 管理端积分流水查询（支持筛选批量手动加分 / 全部手动入账 / 全部流水） */
+  async listAdminLedgerEntries(filters: {
+    scope?: 'manual_batch' | 'manual' | 'all'
+    month?: string
+    status?: string
+    q?: string
+    cursor?: string
+  }) {
+    const scope = filters.scope ?? 'manual_batch'
+    const andClauses: Prisma.PointsLedgerEntryWhereInput[] = []
+    if (scope === 'manual_batch') {
+      andClauses.push({ sourceKey: { startsWith: 'manual:' } })
+    } else if (scope === 'manual') {
+      andClauses.push({
+        NOT: {
+          OR: [
+            { sourceKey: { startsWith: 'contest:' } },
+            { sourceKey: { startsWith: 'competition:' } },
+            { sourceKey: { startsWith: 'team-competition:' } },
+            { sourceKey: { startsWith: 'contribution:' } },
+            { sourceKey: { startsWith: 'initial:' } },
+            { sourceKey: { startsWith: 'history:' } },
+          ],
+        },
+      })
+    }
+    if (filters.month && /^\d{4}-\d{2}$/.test(filters.month)) {
+      andClauses.push({ scoreMonth: filters.month })
+    }
+    if (filters.status && ['approved', 'reversed', 'superseded'].includes(filters.status)) {
+      andClauses.push({ status: filters.status })
+    }
+    const q = filters.q?.trim()
+    if (q) {
+      andClauses.push({
+        OR: [
+          { user: { studentNo: { contains: q, mode: 'insensitive' } } },
+          { user: { verifiedRealName: { contains: q, mode: 'insensitive' } } },
+          { sourceKey: { contains: q, mode: 'insensitive' } },
+          { reversalReason: { contains: q, mode: 'insensitive' } },
+        ],
+      })
+    }
+
+    const rows = await this.db.pointsLedgerEntry.findMany({
+      where: andClauses.length > 0 ? { AND: andClauses } : undefined,
+      orderBy: { recordedAt: 'desc' },
+      take: 51,
+      ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
+      include: {
+        user: { select: { id: true, verifiedRealName: true, studentNo: true } },
+      },
+    })
+    const nextCursor = rows.length > 50 ? rows.pop()!.id : undefined
+    const enriched = await this.enrichLedgerEntries(rows)
+    return {
+      items: enriched.map((row) => {
+        const d = row.detail && typeof row.detail === 'object' && !Array.isArray(row.detail)
+          ? (row.detail as Record<string, unknown>)
+          : {}
+        const batchId =
+          (typeof d.batchId === 'string' && d.batchId) ||
+          (row.sourceKey.startsWith('manual:') ? row.sourceKey.split(':')[1] ?? null : null)
+        const note =
+          (typeof d.note === 'string' && d.note.trim()) ||
+          (typeof d.reason === 'string' && d.reason.trim()) ||
+          null
+        return {
+          id: row.id,
+          userId: row.userId,
+          user: row.user,
+          sourceKey: row.sourceKey,
+          category: row.category,
+          amount: row.amount.toString(),
+          scoreMonth: row.scoreMonth,
+          recordedAt: row.recordedAt.toISOString(),
+          status: row.status,
+          reversesEntryId: row.reversesEntryId,
+          replacedByEntryId: row.replacedByEntryId,
+          reversalReason: row.reversalReason,
+          batchId,
+          note,
+          eventName: row.eventName,
+          eventKind: row.eventKind,
+          eventMeta: row.eventMeta,
+        }
+      }),
+      nextCursor,
+    }
+  }
+
+  /** 为申诉列表批量补全关联的积分流水摘要（成员端与管理端共用） */
+  async attachLedgerToAppeals<T extends { ledgerEntryId: string | null }>(appeals: T[]) {
+    const entryIds = [...new Set(appeals.map((a) => a.ledgerEntryId).filter((id): id is string => Boolean(id)))]
+    if (entryIds.length === 0) {
+      return appeals.map((appeal) => ({ ...appeal, ledgerEntry: null }))
+    }
+    const rawEntries = await this.db.pointsLedgerEntry.findMany({
+      where: { id: { in: entryIds } },
+      select: {
+        id: true,
+        sourceKey: true,
+        category: true,
+        amount: true,
+        scoreMonth: true,
+        recordedAt: true,
+        status: true,
+        detail: true,
+        reversesEntryId: true,
+        replacedByEntryId: true,
+        reversalReason: true,
+      },
+    })
+    const enriched = await this.enrichLedgerEntries(rawEntries)
+    const replacementIds = [...new Set(enriched.map((e) => e.replacedByEntryId).filter((id): id is string => Boolean(id)))]
+    const replacements = replacementIds.length > 0
+      ? await this.db.pointsLedgerEntry.findMany({
+          where: { id: { in: replacementIds } },
+          select: { id: true, amount: true, scoreMonth: true, recordedAt: true },
+        })
+      : []
+    const replacementMap = new Map(replacements.map((r) => [r.id, r]))
+    const byId = new Map(
+      enriched.map((entry) => {
+        const rep = entry.replacedByEntryId ? replacementMap.get(entry.replacedByEntryId) : undefined
+        return [
+          entry.id,
+          {
+            id: entry.id,
+            sourceKey: entry.sourceKey,
+            category: entry.category,
+            amount: entry.amount.toString(),
+            scoreMonth: entry.scoreMonth,
+            recordedAt: entry.recordedAt.toISOString(),
+            status: entry.status,
+            reversesEntryId: entry.reversesEntryId,
+            replacedByEntryId: entry.replacedByEntryId,
+            replacementAmount: rep ? rep.amount.toString() : null,
+            reversalReason: entry.reversalReason,
+            eventName: entry.eventName,
+            eventTime: entry.eventTime,
+            eventKind: entry.eventKind,
+          },
+        ]
+      }),
+    )
+    return appeals.map((appeal) => ({
+      ...appeal,
+      ledgerEntry: appeal.ledgerEntryId ? byId.get(appeal.ledgerEntryId) ?? null : null,
+    }))
+  }
+
+  /** 申诉（必须关联本人对应的积分流水记录） */
+  async submitAppeal(
+    userId: string,
+    input: { disclosureId?: string; ledgerEntryId: string; subject: string; materials?: string },
+  ): Promise<{ appealId: string }> {
+    const entry = await this.db.pointsLedgerEntry.findFirst({
+      where: { id: input.ledgerEntryId, userId },
+      select: { id: true },
+    })
+    if (!entry) {
+      throw new ScoringError('所选积分流水不存在或不属于当前账号', 'NOT_FOUND')
+    }
+    const existingOpen = await this.db.appeal.findFirst({
+      where: {
+        userId,
+        ledgerEntryId: input.ledgerEntryId,
+        status: { in: ['submitted', 'in_review'] },
+      },
+      select: { id: true },
+    })
+    if (existingOpen) {
+      throw new ScoringError('该笔积分流水已有进行中的申诉，请等待负责人处理后再操作', 'CONFLICT')
+    }
     const id = newId()
     await this.db.appeal.create({
       data: {
-        id, userId,
+        id,
+        userId,
         disclosureId: input.disclosureId,
         ledgerEntryId: input.ledgerEntryId,
         subject: input.subject,
@@ -747,7 +1274,7 @@ export class ScoringService {
     return { appealId: id }
   }
 
-  /** 本人提交的申诉列表（含受理与结案回复） */
+  /** 本人提交的申诉列表（含关联积分流水摘要与受理/结案回复） */
   async myAppeals(userId: string) {
     const rows = await this.db.appeal.findMany({
       where: { userId },
@@ -755,6 +1282,7 @@ export class ScoringService {
       take: 30,
       select: {
         id: true,
+        ledgerEntryId: true,
         subject: true,
         materials: true,
         status: true,
@@ -763,52 +1291,176 @@ export class ScoringService {
         closedAt: true,
       },
     })
-    return rows.map((row) => ({
+    const enriched = await this.attachLedgerToAppeals(rows)
+    return enriched.map((row) => ({
       ...row,
       createdAt: row.createdAt.toISOString(),
       closedAt: row.closedAt?.toISOString() ?? null,
     }))
   }
 
-  /** 管理端处理申诉：受理中 / 采纳结案 / 驳回结案（保留审计） */
+  /** 管理端处理申诉：受理中 / 采纳结案（可选同步冲正/替换/补录积分）/ 驳回结案（保留审计与通知） */
   async decideAppeal(
     actor: SessionActor,
     appealId: string,
     decision: 'in_review' | 'resolved' | 'rejected',
     resolutionNote: string,
-  ): Promise<{ appealId: string; status: string }> {
+    adjustment?: {
+      ledgerAction?: 'none' | 'reverse' | 'replace' | 'supplement'
+      replacementAmount?: string
+      adjustmentAmount?: string
+      scoreMonth?: string
+    },
+  ): Promise<{
+    appealId: string
+    status: string
+    ledgerAction?: string
+    reversalId?: string
+    replacementId?: string | null
+    supplementEntryId?: string
+  }> {
     const appeal = await this.db.appeal.findUnique({
       where: { id: appealId },
       include: { user: { select: { verifiedRealName: true, studentNo: true } } },
     })
     if (!appeal) throw new ScoringError('申诉不存在', 'NOT_FOUND')
+    if (appeal.status === 'resolved' || appeal.status === 'rejected') {
+      throw new ScoringError('该申诉已结案，请勿重复处理', 'STATE_INVALID')
+    }
+
+    const ledgerAction = adjustment?.ledgerAction ?? 'none'
+    if (ledgerAction !== 'none' && decision !== 'resolved') {
+      throw new ScoringError('仅「采纳并结案」时可执行积分账本调整', 'INVALID_INPUT')
+    }
+
     const closing = decision === 'resolved' || decision === 'rejected'
-    await this.db.appeal.update({
-      where: { id: appealId },
-      data: {
-        status: decision,
-        resolutionNote: resolutionNote.trim() || null,
-        closedAt: closing ? new Date() : null,
-      },
-    })
+    const trimmedNote = resolutionNote.trim()
+    let reversalId: string | undefined
+    let replacementId: string | null | undefined
+    let supplementEntryId: string | undefined
+    let ledgerSummary = ''
+
+    if (ledgerAction === 'reverse' || ledgerAction === 'replace') {
+      if (!appeal.ledgerEntryId) {
+        throw new ScoringError('该申诉未关联积分流水，无法直接冲正或替换', 'INVALID_INPUT')
+      }
+      const replacementAmount = ledgerAction === 'replace' ? adjustment?.replacementAmount?.trim() ?? null : null
+      if (ledgerAction === 'replace' && (!replacementAmount || !/^-?\d+(\.\d+)?$/.test(replacementAmount))) {
+        throw new ScoringError('请填写合法的替换分值（十进制数字）', 'INVALID_INPUT')
+      }
+      const reverseReason = `申诉采纳处理：${trimmedNote}`.slice(0, 500)
+      const outcome = await this.db.$transaction(async (tx) => {
+        const rev = await this.reverseEntryTx(tx, actor, appeal.ledgerEntryId!, reverseReason, replacementAmount)
+        await tx.appeal.update({
+          where: { id: appealId },
+          data: {
+            status: decision,
+            resolutionNote: trimmedNote || null,
+            closedAt: new Date(),
+          },
+        })
+        return rev
+      })
+      reversalId = outcome.reversalId
+      replacementId = outcome.replacementId
+      ledgerSummary =
+        ledgerAction === 'replace'
+          ? `（已冲正原流水并替换为 ${Number(replacementAmount) > 0 ? `+${replacementAmount}` : replacementAmount} 分）`
+          : '（已冲正撤销原流水）'
+    } else if (ledgerAction === 'supplement') {
+      const adjAmount = adjustment?.adjustmentAmount?.trim() ?? ''
+      if (!/^-?\d+(\.\d+)?$/.test(adjAmount) || Number(adjAmount) === 0) {
+        throw new ScoringError('请填写非零的补录/扣减分值', 'INVALID_INPUT')
+      }
+      const rule = await this.currentRuleVersion()
+      supplementEntryId = newId()
+      const created = await this.db.$transaction(async (tx) => {
+        const original = appeal.ledgerEntryId
+          ? await tx.pointsLedgerEntry.findUnique({ where: { id: appeal.ledgerEntryId } })
+          : null
+        const targetMonth = adjustment?.scoreMonth && /^\d{4}-\d{2}$/.test(adjustment.scoreMonth)
+          ? adjustment.scoreMonth
+          : original?.scoreMonth ?? monthKey(new Date())
+        const category = original && original.category !== 'reversal' ? original.category : 'activity'
+        const inheritedDetail: Record<string, unknown> = {
+          appealId,
+          relatedEntryId: appeal.ledgerEntryId ?? null,
+          note: `申诉补录调账：${trimmedNote}`,
+        }
+        if (original?.detail && typeof original.detail === 'object' && !Array.isArray(original.detail)) {
+          const origDetail = original.detail as Record<string, unknown>
+          for (const key of ['activityId', 'activityTitle', 'eventId', 'eventTitle', 'claimId', 'title']) {
+            if (origDetail[key] != null) inheritedDetail[key] = origDetail[key]
+          }
+        }
+        await tx.pointsLedgerEntry.create({
+          data: {
+            id: supplementEntryId!,
+            userId: appeal.userId,
+            sourceKey: `appeal:${appealId}`,
+            category,
+            amount: adjAmount,
+            scoreMonth: targetMonth,
+            recordedAt: new Date(),
+            status: 'approved',
+            ruleVersionId: rule.id === 'default' ? undefined : rule.id,
+            detail: inheritedDetail as never,
+            evidenceRef: `appeal:${appealId}`,
+            approvedBy: actor.principalId,
+            idempotencyKey: `appeal:${appealId}`,
+          },
+        })
+        await tx.appeal.update({
+          where: { id: appealId },
+          data: {
+            status: decision,
+            resolutionNote: trimmedNote || null,
+            closedAt: new Date(),
+          },
+        })
+        return { targetMonth }
+      })
+      const signed = Number(adjAmount) > 0 ? `+${adjAmount}` : adjAmount
+      ledgerSummary = `（已另行记入 ${signed} 分至 ${created.targetMonth}）`
+    } else {
+      await this.db.appeal.update({
+        where: { id: appealId },
+        data: {
+          status: decision,
+          resolutionNote: trimmedNote || null,
+          closedAt: closing ? new Date() : null,
+        },
+      })
+    }
+
     const label = decision === 'in_review' ? '标记受理中' : decision === 'resolved' ? '采纳并结案' : '驳回申诉'
     await this.audit.log({
       actorPrincipalId: actor.principalId,
       action: `appeal.${decision}`,
       resourceType: 'appeal',
       resourceId: appealId,
-      summary: `${label}：${appeal.user.verifiedRealName}（${appeal.subject.slice(0, 80)}）${resolutionNote.trim() ? `；回复：${resolutionNote.trim().slice(0, 200)}` : ''}`,
+      summary: `${label}：${appeal.user.verifiedRealName}（${appeal.subject.slice(0, 80)}）${ledgerSummary}${trimmedNote ? `；回复：${trimmedNote.slice(0, 200)}` : ''}`,
     })
     await this.notifications?.notify({
       userId: appeal.userId,
       kind: 'appeal_decision',
       title: `积分申诉${label}`,
-      body: resolutionNote.trim()
-        ? `事项「${appeal.subject.slice(0, 60)}」处理回复：${resolutionNote.trim()}`
+      body: trimmedNote
+        ? `事项「${appeal.subject.slice(0, 60)}」处理回复：${trimmedNote}${ledgerSummary}`
         : `事项「${appeal.subject.slice(0, 60)}」已更新状态为：${label}。`,
       link: '/app?section=points',
     })
-    return { appealId, status: decision }
+    if (ledgerAction === 'none') {
+      return { appealId, status: decision }
+    }
+    return {
+      appealId,
+      status: decision,
+      ledgerAction,
+      ...(reversalId ? { reversalId } : {}),
+      ...(replacementId !== undefined ? { replacementId } : {}),
+      ...(supplementEntryId ? { supplementEntryId } : {}),
+    }
   }
 
   /** 贡献/成果申报 */

@@ -36,6 +36,7 @@ import {
 import { ThemeToggle } from '@/workspaces/shared/ThemeToggle';
 import { AnnouncementCenter } from '@/components/club/AnnouncementCenter';
 import { NotificationCenter } from '@/components/club/NotificationCenter';
+import { GlobalFetchingBar, GlobalRefreshButton } from '@/components/club/GlobalFetchingBar';
 import { MobileNavigation } from '@/workspaces/shared/MobileNavigation';
 import { ChangePasswordDialog } from '@/workspaces/shared/ChangePasswordDialog';
 
@@ -498,8 +499,9 @@ export function WorkspaceShell({
         {/* 顶栏：桌面 64px / 手机 56px */}
         <header
           data-slot="workspace-topbar"
-          className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-border bg-card/95 px-4 md:h-16 md:px-6"
+          className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b border-border bg-card/95 px-4 backdrop-blur-xs md:h-16 md:px-6"
         >
+          <GlobalFetchingBar />
           {/* 管理端手机导航入口（成员端使用底栏） */}
           {variant === 'admin' && (
             <Button
@@ -538,6 +540,7 @@ export function WorkspaceShell({
           </div>
 
           <div className="ml-auto flex shrink-0 items-center gap-1">
+            <GlobalRefreshButton />
             <NotificationCenter />
             <AnnouncementCenter />
             {headerRight ?? <ThemeToggle />}

@@ -5,6 +5,7 @@ const { NotificationsService } = require('../../../dist/modules/notifications/no
 const { ActivityService } = require('../../../dist/modules/activities/activity.service.js')
 const { ScoringService } = require('../../../dist/modules/scoring/scoring.service.js')
 const { ProfilesService } = require('../../../dist/modules/profiles/profiles.service.js')
+const { ProfilesController } = require('../../../dist/modules/profiles/profiles.controller.js')
 
 const ACTOR: SessionActor = {
   sessionId: 'sess-1',
@@ -122,6 +123,456 @@ describe('ScoringService.decideAppeal', () => {
     expect(notifications.notify).toHaveBeenCalledWith(
       expect.objectContaining({ userId: USER_ID, kind: 'appeal_decision' }),
     )
+  })
+
+  it('myLedger 自动把内部 sourceKey 解析为事件名称与活动跳转链接', async () => {
+    const activityId = '55555555-5555-4555-8555-555555555555'
+    const claimId = '66666666-6666-4666-8666-666666666666'
+    const now = new Date('2026-11-20T10:00:00.000Z')
+    const db = {
+      pointsLedgerEntry: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'e1',
+            sourceKey: `contest:codeforces:2000:W:${USER_ID}`,
+            category: 'contest',
+            amount: '10.50',
+            scoreMonth: '2026-11',
+            recordedAt: now,
+            status: 'approved',
+            ruleVersionId: null,
+            reversesEntryId: null,
+            replacedByEntryId: null,
+            reversalReason: null,
+            detail: { activityId, formula: { B: 2, lambda: 1, S: 2, R: 4.5, X: 2, W: 10.5 } },
+          },
+          {
+            id: 'e2',
+            sourceKey: `contribution:${USER_ID}:${claimId}`,
+            category: 'contribution',
+            amount: '3.00',
+            scoreMonth: '2026-11',
+            recordedAt: now,
+            status: 'approved',
+            ruleVersionId: null,
+            reversesEntryId: null,
+            replacedByEntryId: null,
+            reversalReason: null,
+            detail: { claimId, title: '最短路专题讲题' },
+          },
+        ]),
+      },
+      activity: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: activityId,
+            title: '第 10 场算法周赛',
+            type: 'weekly_contest',
+            startAt: now,
+            endAt: now,
+            platform: 'codeforces',
+            platformContestId: '2000',
+            venueVersion: { name: '综合楼', building: '10B', room: '405' },
+          },
+        ]),
+      },
+      competitionEvent: { findMany: vi.fn().mockResolvedValue([]) },
+      pointsClaim: {
+        findMany: vi.fn().mockResolvedValue([
+          { id: claimId, title: '最短路专题讲题', category: 'contribution_lecture', description: '讲解 Dijkstra 与 SPFA', reviewNote: '通过', createdAt: now },
+        ]),
+      },
+    }
+    const svc = new ScoringService(db, { log: vi.fn() }, {}, {})
+    const res = await svc.myLedger(USER_ID, {})
+    expect(res.items[0]).toMatchObject({
+      eventName: '第 10 场算法周赛',
+      eventKind: 'activity',
+      eventLink: `/app?section=activities&activity=${activityId}`,
+    })
+    expect(res.items[1]).toMatchObject({
+      eventName: '最短路专题讲题',
+      eventKind: 'claim',
+      eventLink: '/app?section=contributions',
+    })
+  })
+
+  it('submitAppeal 校验流水归属并阻止同流水重复申诉', async () => {
+    const ledgerEntryId = '77777777-7777-4777-8777-777777777777'
+    const dbMissing = {
+      pointsLedgerEntry: { findFirst: vi.fn().mockResolvedValue(null) },
+      appeal: { findFirst: vi.fn(), create: vi.fn() },
+    }
+    const svcMissing = new ScoringService(dbMissing, { log: vi.fn() }, {}, {})
+    await expect(
+      svcMissing.submitAppeal(USER_ID, { ledgerEntryId, subject: '积分统计与榜单不符' }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' })
+
+    const dbConflict = {
+      pointsLedgerEntry: { findFirst: vi.fn().mockResolvedValue({ id: ledgerEntryId }) },
+      appeal: { findFirst: vi.fn().mockResolvedValue({ id: 'open-appeal' }), create: vi.fn() },
+    }
+    const svcConflict = new ScoringService(dbConflict, { log: vi.fn() }, {}, {})
+    await expect(
+      svcConflict.submitAppeal(USER_ID, { ledgerEntryId, subject: '积分统计与榜单不符' }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' })
+
+    const dbOk = {
+      pointsLedgerEntry: { findFirst: vi.fn().mockResolvedValue({ id: ledgerEntryId }) },
+      appeal: { findFirst: vi.fn().mockResolvedValue(null), create: vi.fn().mockResolvedValue({}) },
+    }
+    const svcOk = new ScoringService(dbOk, { log: vi.fn() }, {}, {})
+    const created = await svcOk.submitAppeal(USER_ID, {
+      ledgerEntryId,
+      subject: '积分统计与榜单不符',
+      materials: '附赛后截图说明',
+    })
+    expect(created.appealId).toBeTruthy()
+    expect(dbOk.appeal.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ userId: USER_ID, ledgerEntryId, subject: '积分统计与榜单不符' }),
+      }),
+    )
+  })
+
+  it('decideAppeal 采纳并冲正替换时在事务中冲正原流水、生成替代条目并通知成员', async () => {
+    const appealId = '88888888-8888-4888-8888-888888888888'
+    const entryId = '99999999-9999-4999-8999-999999999999'
+    const activityId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const tx = {
+      $executeRaw: vi.fn().mockResolvedValue(1),
+      pointsLedgerEntry: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: entryId,
+          userId: USER_ID,
+          sourceKey: `activity:${activityId}:${USER_ID}`,
+          category: 'activity',
+          amount: { neg: () => ({ toFixed: (d: number) => (-2).toFixed(d) }), toString: () => '2' },
+          scoreMonth: '2026-11',
+          status: 'approved',
+          ruleVersionId: null,
+          detail: { activityId, activityTitle: '第 11 场算法周赛' },
+        }),
+        create: vi.fn().mockResolvedValue({}),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      auditLog: { create: vi.fn().mockResolvedValue({}) },
+      appeal: { update: vi.fn().mockResolvedValue({}) },
+    }
+    const db = {
+      appeal: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: appealId,
+          userId: USER_ID,
+          ledgerEntryId: entryId,
+          status: 'submitted',
+          subject: '漏算组队加分',
+          user: { verifiedRealName: '张三', studentNo: '202600002' },
+        }),
+      },
+      $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)),
+    }
+    const audit = { log: vi.fn().mockResolvedValue(undefined) }
+    const notifications = { notify: vi.fn().mockResolvedValue(undefined) }
+    const svc = new ScoringService(db, audit, {}, {}, notifications)
+
+    const res = await svc.decideAppeal(ACTOR, appealId, 'resolved', '核实无误，更正为 4 分', {
+      ledgerAction: 'replace',
+      replacementAmount: '4',
+    })
+    expect(res).toMatchObject({
+      appealId,
+      status: 'resolved',
+      ledgerAction: 'replace',
+    })
+    expect(res.reversalId).toBeTruthy()
+    expect(res.replacementId).toBeTruthy()
+    expect(tx.pointsLedgerEntry.create).toHaveBeenCalledTimes(2)
+    expect(tx.pointsLedgerEntry.create).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: USER_ID,
+          amount: '4',
+          scoreMonth: '2026-11',
+          detail: expect.objectContaining({ activityId, replacesEntryId: entryId }),
+        }),
+      }),
+    )
+    expect(tx.appeal.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: appealId },
+        data: expect.objectContaining({ status: 'resolved', resolutionNote: '核实无误，更正为 4 分' }),
+      }),
+    )
+    expect(audit.log).toHaveBeenCalledTimes(1)
+    expect(notifications.notify).toHaveBeenCalledWith(
+      expect.objectContaining({
+        userId: USER_ID,
+        kind: 'appeal_decision',
+        body: expect.stringContaining('+4 分'),
+      }),
+    )
+  })
+
+  it('decideAppeal 采纳并补录调账时写入 appeal:<id> 流水并拒绝已结案或非采纳态调账', async () => {
+    const appealId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const entryId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const tx = {
+      pointsLedgerEntry: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: entryId,
+          category: 'contest',
+          scoreMonth: '2026-10',
+          detail: { activityTitle: '国庆专题赛' },
+        }),
+        create: vi.fn().mockResolvedValue({}),
+      },
+      appeal: { update: vi.fn().mockResolvedValue({}) },
+    }
+    const db = {
+      appeal: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: appealId,
+          userId: USER_ID,
+          ledgerEntryId: entryId,
+          status: 'in_review',
+          subject: '补发题解加分',
+          user: { verifiedRealName: '张三', studentNo: '202600002' },
+        }),
+      },
+      ruleVersion: { findFirst: vi.fn().mockResolvedValue(null) },
+      $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)),
+    }
+    const audit = { log: vi.fn().mockResolvedValue(undefined) }
+    const notifications = { notify: vi.fn().mockResolvedValue(undefined) }
+    const svc = new ScoringService(db, audit, {}, {}, notifications)
+
+    await expect(
+      svc.decideAppeal(ACTOR, appealId, 'rejected', '不符合加分条件', { ledgerAction: 'supplement', adjustmentAmount: '2' }),
+    ).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+
+    const res = await svc.decideAppeal(ACTOR, appealId, 'resolved', '补录 1.5 分', {
+      ledgerAction: 'supplement',
+      adjustmentAmount: '1.5',
+    })
+    expect(res).toMatchObject({
+      appealId,
+      status: 'resolved',
+      ledgerAction: 'supplement',
+    })
+    expect(res.supplementEntryId).toBeTruthy()
+    expect(tx.pointsLedgerEntry.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: USER_ID,
+          sourceKey: `appeal:${appealId}`,
+          category: 'contest',
+          amount: '1.5',
+          scoreMonth: '2026-10',
+          detail: expect.objectContaining({ appealId, activityTitle: '国庆专题赛' }),
+        }),
+      }),
+    )
+
+    db.appeal.findUnique.mockResolvedValueOnce({
+      id: appealId,
+      userId: USER_ID,
+      status: 'resolved',
+      subject: '已结案申诉',
+      user: { verifiedRealName: '张三', studentNo: '202600002' },
+    })
+    await expect(svc.decideAppeal(ACTOR, appealId, 'resolved', '重复操作')).rejects.toMatchObject({
+      code: 'STATE_INVALID',
+    })
+  })
+
+  it('myAppeals 附带关联流水事件名称与替代分值', async () => {
+    const entryId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    const repId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    const now = new Date('2026-11-22T08:00:00.000Z')
+    const db = {
+      appeal: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'a1',
+            ledgerEntryId: entryId,
+            subject: '分数偏低请核查',
+            materials: '详见榜单截图',
+            status: 'resolved',
+            resolutionNote: '已更正为 5 分',
+            createdAt: now,
+            closedAt: now,
+          },
+        ]),
+      },
+      pointsLedgerEntry: {
+        findMany: vi
+          .fn()
+          .mockResolvedValueOnce([
+            {
+              id: entryId,
+              sourceKey: `manual:batch-01:${USER_ID}`,
+              category: 'activity',
+              amount: '2.00',
+              scoreMonth: '2026-11',
+              recordedAt: now,
+              status: 'reversed',
+              detail: { note: '周赛到场加分' },
+              reversesEntryId: null,
+              replacedByEntryId: repId,
+              reversalReason: '申诉采纳处理：已更正为 5 分',
+            },
+          ])
+          .mockResolvedValueOnce([
+            { id: repId, amount: '5.00', scoreMonth: '2026-11', recordedAt: now },
+          ]),
+      },
+    }
+    const svc = new ScoringService(db, { log: vi.fn() }, {}, {})
+    const res = await svc.myAppeals(USER_ID)
+    expect(res).toHaveLength(1)
+    expect(res[0]).toMatchObject({
+      id: 'a1',
+      status: 'resolved',
+      ledgerEntry: {
+        id: entryId,
+        eventName: '周赛到场加分',
+        amount: '2.00',
+        replacementAmount: '5.00',
+      },
+    })
+  })
+
+  it('listAdminLedgerEntries 筛选批量手动加分并解析 batchId 与分页游标', async () => {
+    const now = new Date('2026-11-23T09:00:00.000Z')
+    const batchId = '12345678-1234-4123-8123-123456789abc'
+    const db = {
+      pointsLedgerEntry: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'le-1',
+            userId: USER_ID,
+            user: { id: USER_ID, verifiedRealName: '张三', studentNo: '202600002' },
+            sourceKey: `manual:${batchId}:${USER_ID}`,
+            category: 'activity',
+            amount: '3.50',
+            scoreMonth: '2026-11',
+            recordedAt: now,
+            status: 'approved',
+            reversesEntryId: null,
+            replacedByEntryId: null,
+            reversalReason: null,
+            detail: { batchId, note: '周赛志愿服务' },
+          },
+        ]),
+      },
+    }
+    const svc = new ScoringService(db, { log: vi.fn() }, {}, {})
+    const res = await svc.listAdminLedgerEntries({
+      scope: 'manual_batch',
+      month: '2026-11',
+      status: 'approved',
+      q: '张三',
+    })
+    expect(db.pointsLedgerEntry.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          AND: expect.arrayContaining([
+            { sourceKey: { startsWith: 'manual:' } },
+            { scoreMonth: '2026-11' },
+            { status: 'approved' },
+          ]),
+        },
+        take: 51,
+      }),
+    )
+    expect(res.nextCursor).toBeUndefined()
+    expect(res.items[0]).toMatchObject({
+      id: 'le-1',
+      batchId,
+      note: '周赛志愿服务',
+      eventName: '周赛志愿服务',
+      amount: '3.50',
+    })
+  })
+})
+
+describe('ProfilesController.competitionResults', () => {
+  it('合并平台同步结果与已结算平台赛流水并按 platform:contestId 去重', async () => {
+    const activityId = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+    const t1 = new Date('2026-11-20T12:00:00.000Z')
+    const t2 = new Date('2026-11-22T12:00:00.000Z')
+    const db = {
+      platformAccount: {
+        findMany: vi.fn().mockResolvedValue([
+          { id: 'acc-cf', platform: 'codeforces', status: 'verified' },
+          { id: 'acc-vj', platform: 'vjudge', status: 'verified' },
+        ]),
+      },
+      platformResult: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'pr-1',
+            participationType: 'OFFICIAL',
+            score: '1200',
+            fullScore: '2000',
+            acceptedCount: 4,
+            problemCount: 6,
+            rank: 300,
+            rankTotal: 5000,
+            status: 'complete',
+            platformAccount: { status: 'verified' },
+            platformContest: {
+              platform: 'codeforces',
+              externalContestId: '2000',
+              name: 'Codeforces Round 2000',
+              startTime: t1,
+            },
+          },
+        ]),
+      },
+      pointsLedgerEntry: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'le-dup',
+            sourceKey: `contest:codeforces:2000:W:${USER_ID}`,
+            amount: '10',
+            recordedAt: t1,
+            detail: {},
+          },
+          {
+            id: 'le-vj',
+            sourceKey: `contest:vjudge:654321:W:${USER_ID}`,
+            amount: '8.5',
+            recordedAt: t2,
+            detail: { activityId, teamName: '三人小队' },
+          },
+        ]),
+      },
+      activity: {
+        findMany: vi.fn().mockResolvedValue([
+          { id: activityId, title: 'VJudge 组队训练赛 #3', startAt: t2, teamSize: 3 },
+        ]),
+      },
+    }
+    const profiles = { assertMemberVisible: vi.fn().mockResolvedValue(undefined) }
+    const ctrl = new ProfilesController(profiles, db, {}, {})
+    const response = await ctrl.competitionResults(ACTOR, USER_ID)
+    expect(response.data.items).toHaveLength(2)
+    expect(response.data.items[0]).toMatchObject({
+      platform: 'vjudge',
+      contestId: '654321',
+      contestName: 'VJudge 组队训练赛 #3',
+      participationType: 'TEAM',
+      score: 8.5,
+      verifiedBinding: true,
+    })
+    expect(response.data.items[1]).toMatchObject({
+      platform: 'codeforces',
+      contestId: '2000',
+      contestName: 'Codeforces Round 2000',
+    })
   })
 })
 

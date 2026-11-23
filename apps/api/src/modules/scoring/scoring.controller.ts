@@ -67,11 +67,12 @@ export class ScoringMeController {
   async appeal(@CurrentUser() user: { userId: string }, @Body() body: unknown) {
     const parsed = z.object({
       disclosureId: z.string().uuid().optional(),
-      ledgerEntryId: z.string().uuid().optional(),
-      subject: z.string().min(5).max(500),
-      materials: z.string().max(4000).optional(),
-    }).parse(body)
-    return ok(await this.scoring.submitAppeal(user.userId, parsed))
+      ledgerEntryId: z.string().uuid('请选择对应的积分流水记录'),
+      subject: z.string().trim().min(5, '申诉事项至少 5 个字').max(500),
+      materials: z.string().trim().max(4000).optional(),
+    }).safeParse(body)
+    if (!parsed.success) throw new ScoringError(parsed.error.issues[0]?.message ?? '请检查申诉内容', 'INVALID_INPUT')
+    return ok(await this.scoring.submitAppeal(user.userId, parsed.data))
   }
 }
 
@@ -95,6 +96,19 @@ export class ScoringAdminController {
   async buildBatch(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
     const { month } = z.object({ month: z.string().regex(/^\d{4}-\d{2}$/) }).parse(body)
     return ok(await this.scoring.buildMonthlyBatch(actor, month))
+  }
+
+  @Get('ledger-entries')
+  @RequireAction('points.review')
+  async listLedgerEntries(
+    @Query('scope') scope?: string,
+    @Query('month') month?: string,
+    @Query('status') status?: string,
+    @Query('q') q?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    const validScope = scope === 'all' || scope === 'manual' || scope === 'manual_batch' ? scope : 'manual_batch'
+    return ok(await this.scoring.listAdminLedgerEntries({ scope: validScope, month, status, q, cursor }))
   }
 
   @Post('ledger-entries')
@@ -194,18 +208,21 @@ export class ScoringAdminController {
         assets: { orderBy: { sortOrder: 'asc' }, select: { assetId: true } },
       },
     })
-    const appeals = await this.db.appeal.findMany({
+    const rawAppeals = await this.db.appeal.findMany({
       where: { status: { in: ['submitted', 'in_review'] } },
       orderBy: { createdAt: 'asc' },
       take: 50,
-      include: { user: { select: { verifiedRealName: true, studentNo: true } } },
+      include: { user: { select: { id: true, verifiedRealName: true, studentNo: true } } },
     })
-    const processedAppeals = await this.db.appeal.findMany({
+    const rawProcessedAppeals = await this.db.appeal.findMany({
       where: { status: { in: ['resolved', 'rejected'] } },
       orderBy: { closedAt: 'desc' },
       take: 30,
-      include: { user: { select: { verifiedRealName: true, studentNo: true } } },
+      include: { user: { select: { id: true, verifiedRealName: true, studentNo: true } } },
     })
+    const enrichedAllAppeals = await this.scoring.attachLedgerToAppeals([...rawAppeals, ...rawProcessedAppeals])
+    const appeals = enrichedAllAppeals.slice(0, rawAppeals.length)
+    const processedAppeals = enrichedAllAppeals.slice(rawAppeals.length)
     // 已处理申报：保留最近 50 条，供撤回审核 / 查看当时的入账记录
     const processed = await this.db.pointsClaim.findMany({
       where: { status: { in: ['approved', 'rejected'] } },
@@ -229,20 +246,31 @@ export class ScoringAdminController {
     return ok({ cases, claims, appeals, processedAppeals, processedClaims })
   }
 
-  /** 处理申诉：标记受理中 / 采纳结案 / 驳回结案（带处理结论并写审计） */
+  /** 处理申诉：标记受理中 / 采纳结案（支持联动冲正/替换/补录积分）/ 驳回结案（带处理结论并写审计） */
   @Post('appeals/:id/decision')
   @RequireAction('points.review')
   async appealDecision(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
     const parsed = z.object({
       decision: z.enum(['in_review', 'resolved', 'rejected']),
       resolutionNote: z.string().trim().max(2000).optional(),
+      ledgerAction: z.enum(['none', 'reverse', 'replace', 'supplement']).optional(),
+      replacementAmount: z.string().trim().regex(/^-?\d+(\.\d+)?$/, '替换分值需为十进制数字').optional(),
+      adjustmentAmount: z.string().trim().regex(/^-?\d+(\.\d+)?$/, '补录分值需为十进制数字').optional(),
+      scoreMonth: z.string().regex(/^\d{4}-\d{2}$/, '月份格式应为 YYYY-MM').optional(),
     }).safeParse(body)
-    if (!parsed.success) throw new ScoringError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    if (!parsed.success) throw new ScoringError(parsed.error.issues[0]?.message ?? '参数有误', 'INVALID_INPUT')
     const note = parsed.data.resolutionNote ?? ''
     if ((parsed.data.decision === 'resolved' || parsed.data.decision === 'rejected') && note.length < 3) {
       throw new ScoringError('结案或驳回时请填写至少 3 个字的处理说明', 'INVALID_INPUT')
     }
-    return ok(await this.scoring.decideAppeal(actor, id, parsed.data.decision, note))
+    return ok(
+      await this.scoring.decideAppeal(actor, id, parsed.data.decision, note, {
+        ledgerAction: parsed.data.ledgerAction,
+        replacementAmount: parsed.data.replacementAmount,
+        adjustmentAmount: parsed.data.adjustmentAmount,
+        scoreMonth: parsed.data.scoreMonth,
+      }),
+    )
   }
 
   @Post('reviews/:id/votes')

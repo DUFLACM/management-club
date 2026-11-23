@@ -201,17 +201,18 @@ export class MembersService {
     const todayStart = new Date(now)
     todayStart.setHours(0, 0, 0, 0)
     const todayEnd = new Date(todayStart.getTime() + 24 * 3600_000)
-    const [pendingApplications, pendingVenueReviews, attendanceAnomalies, pendingClaims, openDisclosures, syncFailures, todayActivities] = await Promise.all([
+    const [pendingApplications, pendingVenueReviews, attendanceAnomalies, pendingClaims, pendingAppeals, openDisclosures, syncFailures, todayActivities] = await Promise.all([
       this.db.membershipTerm.count({ where: { membershipStatus: 'applicant' } }),
       this.db.venueVersion.count({ where: { status: 'pending_review' } }),
       this.db.attendanceAttendanceResult.count({ where: { status: 'pending_review' } }),
       this.db.pointsClaim.count({ where: { status: 'pending' } }),
+      this.db.appeal.count({ where: { status: { in: ['submitted', 'in_review'] } } }),
       this.db.disclosure.count({ where: { status: 'published', endsAt: { gt: now } } }),
       this.db.job.count({ where: { type: { startsWith: 'platform.' }, status: { in: ['dead', 'failed'] } } }),
       this.db.activity.findMany({ where: { startAt: { gte: todayStart, lt: todayEnd } }, orderBy: { startAt: 'asc' }, take: 10, include: { venueVersion: { include: { venue: true } } } }),
     ])
     return {
-      counts: { pendingApplications, pendingVenueReviews, attendanceAnomalies, pendingClaims, openDisclosures, syncFailures },
+      counts: { pendingApplications, pendingVenueReviews, attendanceAnomalies, pendingClaims, pendingAppeals, openDisclosures, syncFailures },
       todayActivities: todayActivities.map((a) => ({ id: a.id, title: a.title, startAt: a.startAt.toISOString(), venue: a.venueVersion ? `${a.venueVersion.venue.name} ${a.venueVersion.room ?? ''}`.trim() : null })),
     }
   }

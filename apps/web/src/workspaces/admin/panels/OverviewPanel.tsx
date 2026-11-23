@@ -11,6 +11,7 @@ import {
   CoinsIcon,
   FileClockIcon,
   MapPinnedIcon,
+  ScaleIcon,
   UserPlusIcon,
 } from 'lucide-react';
 
@@ -29,6 +30,7 @@ interface AdminDashboardDto {
     pendingVenueReviews: number;
     attendanceAnomalies: number;
     pendingClaims: number;
+    pendingAppeals?: number;
     openDisclosures: number;
     syncFailures: number;
   };
@@ -89,6 +91,13 @@ function OverviewBody({ principalId }: { principalId: string }) {
               value: data.counts.pendingClaims,
               icon: ClipboardListIcon,
               href: '/admin?section=points&tab=claims',
+            },
+            {
+              key: 'pendingAppeals',
+              label: '待处理积分申诉',
+              value: data.counts.pendingAppeals ?? 0,
+              icon: ScaleIcon,
+              href: '/admin?section=points&tab=appeals',
             },
             {
               key: 'syncFailures',

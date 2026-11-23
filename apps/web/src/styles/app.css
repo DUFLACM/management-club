@@ -184,8 +184,84 @@
   }
 }
 
+/* 细腻流光骨架屏（适配浅色/深色主题，平滑无闪烁） */
+@keyframes club-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.club-skeleton {
+  position: relative;
+  overflow: hidden;
+  background-color: var(--muted);
+}
+
+.club-skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(255 255 255 / 55%) 50%,
+    transparent 100%
+  );
+  animation: club-shimmer 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.dark .club-skeleton::after {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(255 255 255 / 8%) 50%,
+    transparent 100%
+  );
+}
+
+/* 面板与数据加载完成后的轻柔渐入 */
+@keyframes club-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.club-fade-in {
+  animation: club-fade-in 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* 顶栏全局请求进度条（平滑无感滑行） */
+@keyframes club-indeterminate {
+  0% {
+    transform: translateX(-100%) scaleX(0.35);
+  }
+  50% {
+    transform: translateX(35%) scaleX(0.65);
+  }
+  100% {
+    transform: translateX(120%) scaleX(0.35);
+  }
+}
+
+.club-progress-bar {
+  transform-origin: left center;
+  animation: club-indeterminate 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
 /* 减少动态效果：关闭非必要过渡/动画，保留静态状态提示 */
 @media (prefers-reduced-motion: reduce) {
+  .club-skeleton::after {
+    display: none;
+  }
   *,
   *::before,
   *::after {

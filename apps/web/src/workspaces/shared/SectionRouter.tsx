@@ -51,7 +51,7 @@ class PanelErrorBoundary extends Component<PanelErrorBoundaryProps, PanelErrorBo
       );
     }
     return (
-      <div key={this.state.retryCount} className="min-w-0">
+      <div key={this.state.retryCount} className="club-fade-in min-w-0">
         {this.props.children}
       </div>
     );

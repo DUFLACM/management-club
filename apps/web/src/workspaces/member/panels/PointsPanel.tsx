@@ -3,9 +3,17 @@
  * 上半 E 主卡 + 六个月构成（SVG 柱图 + 等价数据表）；下半流水表（含冲正标记）；
  * 申诉入口 POST /me/appeals。
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { FileTextIcon, LoaderCircleIcon, ScaleIcon, TrendingDownIcon } from 'lucide-react';
+import {
+  ChevronRightIcon,
+  ExternalLinkIcon,
+  FileTextIcon,
+  LoaderCircleIcon,
+  ScaleIcon,
+  TrendingDownIcon,
+} from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
@@ -13,11 +21,13 @@ import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
 import { usePrincipal } from '@/lib/session';
 import { LoadMoreButton } from '@/lib/hooks';
 import {
+  activityTypeLabel,
   currentMonthKey,
   formatDateTime,
   formatSignedAmount,
   ledgerStatusBadge,
   monthLabel,
+  platformLabel,
 } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { MemberGate, QueryBoundary } from '@/components/club/QueryBoundary';
@@ -71,10 +81,34 @@ interface LedgerEntryDto {
   replacedByEntryId: string | null;
   reversalReason: string | null;
   detail: Record<string, unknown> | null;
+  eventName?: string;
+  eventTime?: string | null;
+  eventKind?: 'activity' | 'competition' | 'claim' | 'reversal' | 'initial' | 'manual';
+  eventLink?: string | null;
+  eventMeta?: Record<string, unknown> | null;
+}
+
+interface AppealLedgerSummaryDto {
+  id: string;
+  sourceKey: string;
+  category: string;
+  amount: string;
+  scoreMonth: string;
+  recordedAt: string;
+  status: string;
+  reversesEntryId: string | null;
+  replacedByEntryId: string | null;
+  replacementAmount: string | null;
+  reversalReason: string | null;
+  eventName: string;
+  eventTime: string | null;
+  eventKind: string;
 }
 
 interface MyAppealDto {
   id: string;
+  ledgerEntryId: string | null;
+  ledgerEntry: AppealLedgerSummaryDto | null;
   subject: string;
   materials: string | null;
   status: string;
@@ -114,6 +148,8 @@ export default function PointsPanel() {
 function PointsBody({ principalId }: { principalId: string }) {
   const [monthFilter, setMonthFilter] = useState<string>('all');
   const [appealOpen, setAppealOpen] = useState(false);
+  const [appealPreset, setAppealPreset] = useState<{ entry?: LedgerEntryDto; ledgerEntryId?: string; subject?: string } | null>(null);
+  const [selectedEntry, setSelectedEntry] = useState<LedgerEntryDto | null>(null);
 
   const overviewQuery = usePrivateQuery<PointsOverviewDto, ApiError>(
     principalId,
@@ -152,7 +188,13 @@ function PointsBody({ principalId }: { principalId: string }) {
         title="积分"
         description="有效积分 E、月度构成与逐笔流水；对认定结果有疑问可发起申诉。"
         actions={
-          <Button variant="outline" onClick={() => setAppealOpen(true)}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              setAppealPreset(null);
+              setAppealOpen(true);
+            }}
+          >
             <ScaleIcon aria-hidden="true" />
             发起申诉
           </Button>
@@ -234,7 +276,7 @@ function PointsBody({ principalId }: { principalId: string }) {
             </p>
           ) : (
             <>
-              <LedgerTable entries={entries} />
+              <LedgerTable entries={entries} onSelect={setSelectedEntry} />
               <LoadMoreButton
                 onClick={() => {
                   void ledgerQuery.fetchNextPage();
@@ -248,9 +290,40 @@ function PointsBody({ principalId }: { principalId: string }) {
         </CardContent>
       </Card>
 
-      <MyAppealsCard principalId={principalId} onNewAppeal={() => setAppealOpen(true)} />
+      <MyAppealsCard
+        principalId={principalId}
+        onNewAppeal={() => {
+          setAppealPreset(null);
+          setAppealOpen(true);
+        }}
+      />
 
-      <AppealDrawer principalId={principalId} open={appealOpen} onOpenChange={setAppealOpen} />
+      <LedgerDetailDrawer
+        entry={selectedEntry}
+        onOpenChange={(open) => {
+          if (!open) setSelectedEntry(null);
+        }}
+        onAppeal={(entry) => {
+          const name = displayEventName(entry);
+          setSelectedEntry(null);
+          setAppealPreset({
+            entry,
+            ledgerEntryId: entry.id,
+            subject: `对「${name}」（${entry.scoreMonth}，${formatSignedAmount(entry.amount)} 分）积分有疑问`,
+          });
+          setAppealOpen(true);
+        }}
+      />
+
+      <AppealDrawer
+        principalId={principalId}
+        open={appealOpen}
+        preset={appealPreset}
+        onOpenChange={(next) => {
+          setAppealOpen(next);
+          if (!next) setAppealPreset(null);
+        }}
+      />
     </div>
   );
 }
@@ -339,6 +412,26 @@ function MyAppealsCard({
                   {APPEAL_STATUS_LABELS[appeal.status] ?? appeal.status} · 提交于 {formatDateTime(appeal.createdAt)}
                   {appeal.closedAt ? ` · 结案于 ${formatDateTime(appeal.closedAt)}` : ''}
                 </p>
+                {appeal.ledgerEntry && (
+                  <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-2.5 py-1.5 text-xs">
+                    <span className="text-muted-foreground">关联流水：</span>
+                    <span className="font-medium text-foreground">{appeal.ledgerEntry.eventName}</span>
+                    <span className="text-muted-foreground tabular-nums">{appeal.ledgerEntry.scoreMonth}</span>
+                    <span
+                      className={`font-semibold tabular-nums ${
+                        Number(appeal.ledgerEntry.amount) < 0 ? 'text-destructive' : 'text-foreground'
+                      }`}
+                    >
+                      {formatSignedAmount(appeal.ledgerEntry.amount)}
+                    </span>
+                    <StatusBadge kind="points" value={ledgerStatusBadge(appeal.ledgerEntry.status)} />
+                    {appeal.ledgerEntry.replacementAmount != null && (
+                      <span className="text-primary tabular-nums">
+                        已替换为 {formatSignedAmount(appeal.ledgerEntry.replacementAmount)}
+                      </span>
+                    )}
+                  </div>
+                )}
                 {appeal.resolutionNote && (
                   <div className="rounded-xl bg-muted/50 px-3 py-2 text-xs leading-5 text-foreground">
                     <span className="font-medium text-muted-foreground">处理回复：</span>
@@ -448,7 +541,33 @@ function CompositionCard({
   );
 }
 
-function LedgerTable({ entries }: { entries: LedgerEntryDto[] }) {
+function displayEventName(entry: LedgerEntryDto): string {
+  if (entry.eventName && entry.eventName.trim().length > 0) return entry.eventName;
+  const d = entry.detail;
+  const fromDetail =
+    (typeof d?.activityTitle === 'string' && d.activityTitle.trim()) ||
+    (typeof d?.eventTitle === 'string' && d.eventTitle.trim()) ||
+    (typeof d?.title === 'string' && d.title.trim()) ||
+    (typeof d?.note === 'string' && d.note.trim());
+  if (fromDetail) return fromDetail;
+  if (entry.category === 'initial') return `入社基础分（${entry.scoreMonth}）`;
+  return `${CATEGORY_LABELS[entry.category] ?? entry.category}（${entry.scoreMonth}）`;
+}
+
+function eventLinkLabel(kind: LedgerEntryDto['eventKind']): string {
+  if (kind === 'activity') return '查看对应活动';
+  if (kind === 'competition') return '查看对应赛事';
+  if (kind === 'claim') return '查看贡献申报';
+  return '查看对应内容';
+}
+
+function LedgerTable({
+  entries,
+  onSelect,
+}: {
+  entries: LedgerEntryDto[];
+  onSelect: (entry: LedgerEntryDto) => void;
+}) {
   return (
     <>
       <div className="hidden md:block">
@@ -456,106 +575,406 @@ function LedgerTable({ entries }: { entries: LedgerEntryDto[] }) {
           <TableHeader>
             <TableRow>
               <TableHead>月份</TableHead>
-              <TableHead>来源</TableHead>
+              <TableHead>事件名称</TableHead>
               <TableHead>类别</TableHead>
               <TableHead className="text-right">分值</TableHead>
-              <TableHead>规则版本</TableHead>
               <TableHead>记录时间</TableHead>
               <TableHead>状态</TableHead>
+              <TableHead className="w-20 text-right">详情</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {entries.map((entry) => (
-              <TableRow key={entry.id}>
-                <TableCell className="tabular-nums">{entry.scoreMonth}</TableCell>
-                <TableCell className="max-w-64 truncate text-muted-foreground" title={entry.sourceKey}>
-                  <span className="flex items-center gap-1.5">
-                    <FileTextIcon className="size-3.5 shrink-0 text-input" aria-hidden="true" />
-                    {entry.sourceKey}
-                  </span>
-                </TableCell>
-                <TableCell className="text-muted-foreground">
-                  {CATEGORY_LABELS[entry.category] ?? entry.category}
-                </TableCell>
-                <TableCell
-                  className={`text-right font-medium tabular-nums ${
-                    Number(entry.amount) < 0 ? 'text-destructive' : 'text-foreground'
-                  }`}
+            {entries.map((entry) => {
+              const name = displayEventName(entry);
+              return (
+                <TableRow
+                  key={entry.id}
+                  onClick={() => onSelect(entry)}
+                  className="cursor-pointer transition-colors hover:bg-muted/40"
                 >
-                  {formatSignedAmount(entry.amount)}
-                </TableCell>
-                <TableCell className="text-muted-foreground tabular-nums">
-                  {entry.ruleVersionId ? entry.ruleVersionId.slice(0, 8) : '默认'}
-                </TableCell>
-                <TableCell className="text-muted-foreground tabular-nums">
-                  {formatDateTime(entry.recordedAt)}
-                </TableCell>
-                <TableCell>
-                  <span className="flex flex-wrap items-center gap-1.5">
-                    <StatusBadge kind="points" value={ledgerStatusBadge(entry.status)} />
-                    {entry.reversesEntryId && (
-                      <span className="text-xs text-muted-foreground">冲正历史记录</span>
-                    )}
-                    {entry.replacedByEntryId && (
-                      <span className="text-xs text-muted-foreground">已被替代</span>
-                    )}
-                  </span>
-                </TableCell>
-              </TableRow>
-            ))}
+                  <TableCell className="tabular-nums">{entry.scoreMonth}</TableCell>
+                  <TableCell className="max-w-72" title={name}>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelect(entry);
+                      }}
+                      className="group flex max-w-full items-center gap-1.5 text-left font-medium text-foreground hover:text-primary"
+                    >
+                      <FileTextIcon className="size-3.5 shrink-0 text-muted-foreground group-hover:text-primary" aria-hidden="true" />
+                      <span className="truncate">{name}</span>
+                    </button>
+                  </TableCell>
+                  <TableCell className="text-muted-foreground">
+                    {CATEGORY_LABELS[entry.category] ?? entry.category}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right font-medium tabular-nums ${
+                      Number(entry.amount) < 0 ? 'text-destructive' : 'text-foreground'
+                    }`}
+                  >
+                    {formatSignedAmount(entry.amount)}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground tabular-nums">
+                    {formatDateTime(entry.recordedAt)}
+                  </TableCell>
+                  <TableCell>
+                    <span className="flex flex-wrap items-center gap-1.5">
+                      <StatusBadge kind="points" value={ledgerStatusBadge(entry.status)} />
+                      {entry.reversesEntryId && (
+                        <span className="text-xs text-muted-foreground">冲正历史记录</span>
+                      )}
+                      {entry.replacedByEntryId && (
+                        <span className="text-xs text-muted-foreground">已被替代</span>
+                      )}
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs text-primary"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSelect(entry);
+                      }}
+                    >
+                      查看
+                      <ChevronRightIcon className="size-3.5" aria-hidden="true" />
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       </div>
       <ul className="flex flex-col divide-y divide-border md:hidden">
-        {entries.map((entry) => (
-          <li key={entry.id} className="flex flex-col gap-1 py-3">
-            <span className="flex items-center justify-between gap-2">
-              <span className="text-sm text-foreground">
-                {CATEGORY_LABELS[entry.category] ?? entry.category} ·{' '}
-                <span className="tabular-nums">{entry.scoreMonth}</span>
-              </span>
-              <span
-                className={`text-sm font-semibold tabular-nums ${
-                  Number(entry.amount) < 0 ? 'text-destructive' : 'text-foreground'
-                }`}
+        {entries.map((entry) => {
+          const name = displayEventName(entry);
+          return (
+            <li key={entry.id}>
+              <button
+                type="button"
+                onClick={() => onSelect(entry)}
+                className="flex w-full flex-col gap-1 py-3 text-left transition-colors hover:bg-muted/30"
               >
-                {formatSignedAmount(entry.amount)}
-              </span>
-            </span>
-            <span className="truncate text-xs text-muted-foreground" title={entry.sourceKey}>
-              {entry.sourceKey}
-            </span>
-            <span className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-              <StatusBadge kind="points" value={ledgerStatusBadge(entry.status)} />
-              {entry.reversesEntryId && <span>冲正</span>}
-              <span className="tabular-nums">{formatDateTime(entry.recordedAt)}</span>
-            </span>
-          </li>
-        ))}
+                <span className="flex items-start justify-between gap-2">
+                  <span className="min-w-0 flex-1 text-sm font-medium text-foreground">{name}</span>
+                  <span
+                    className={`shrink-0 text-sm font-semibold tabular-nums ${
+                      Number(entry.amount) < 0 ? 'text-destructive' : 'text-foreground'
+                    }`}
+                  >
+                    {formatSignedAmount(entry.amount)}
+                  </span>
+                </span>
+                <span className="flex flex-wrap items-center justify-between gap-1.5 text-xs text-muted-foreground">
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    <StatusBadge kind="points" value={ledgerStatusBadge(entry.status)} />
+                    <span>{CATEGORY_LABELS[entry.category] ?? entry.category}</span>
+                    <span className="tabular-nums">{entry.scoreMonth}</span>
+                    {entry.reversesEntryId && <span>冲正</span>}
+                  </span>
+                  <span className="inline-flex items-center gap-0.5 text-primary">
+                    查看详情
+                    <ChevronRightIcon className="size-3.5" aria-hidden="true" />
+                  </span>
+                </span>
+              </button>
+            </li>
+          );
+        })}
       </ul>
     </>
+  );
+}
+
+/** 积分流水详情抽屉：展示事件完整信息、竞赛计分公式、关联活动/贡献说明与快捷跳转/申诉入口 */
+function LedgerDetailDrawer({
+  entry,
+  onOpenChange,
+  onAppeal,
+}: {
+  entry: LedgerEntryDto | null;
+  onOpenChange: (open: boolean) => void;
+  onAppeal: (entry: LedgerEntryDto) => void;
+}) {
+  const navigate = useNavigate();
+  if (!entry) return null;
+
+  const name = displayEventName(entry);
+  const detail = entry.detail ?? {};
+  const meta = entry.eventMeta ?? {};
+  const formula =
+    detail.formula && typeof detail.formula === 'object' && !Array.isArray(detail.formula)
+      ? (detail.formula as Record<string, unknown>)
+      : null;
+  const note = typeof detail.note === 'string' && detail.note.trim() ? detail.note.trim() : null;
+  const bonusLabel = typeof detail.bonusLabel === 'string' && detail.bonusLabel.trim() ? detail.bonusLabel.trim() : null;
+  const teamName =
+    (typeof meta.teamName === 'string' && meta.teamName.trim()) ||
+    (typeof detail.teamName === 'string' && detail.teamName.trim()) ||
+    null;
+  const venue = typeof meta.venue === 'string' && meta.venue.trim() ? meta.venue.trim() : null;
+  const activityType = typeof meta.activityType === 'string' ? meta.activityType : null;
+  const platform =
+    (typeof meta.platform === 'string' && meta.platform) ||
+    (typeof detail.platform === 'string' && detail.platform) ||
+    null;
+  const claimDesc = typeof meta.description === 'string' && meta.description.trim() ? meta.description.trim() : null;
+  const claimReviewNote = typeof meta.reviewNote === 'string' && meta.reviewNote.trim() ? meta.reviewNote.trim() : null;
+  const reversalReason =
+    entry.reversalReason ??
+    (typeof meta.reversalReason === 'string' ? meta.reversalReason : null) ??
+    (typeof detail.reason === 'string' ? detail.reason : null);
+  const originalTitle = typeof meta.originalTitle === 'string' ? meta.originalTitle : null;
+
+  return (
+    <ResponsiveDetail
+      open={Boolean(entry)}
+      onOpenChange={onOpenChange}
+      title={name}
+      description={`${CATEGORY_LABELS[entry.category] ?? entry.category} · 计入 ${entry.scoreMonth}`}
+      footer={
+        <div className="flex w-full flex-wrap items-center justify-between gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onAppeal(entry)}
+          >
+            <ScaleIcon aria-hidden="true" />
+            对此笔积分申诉
+          </Button>
+          {entry.eventLink && (
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => {
+                const target = entry.eventLink!;
+                onOpenChange(false);
+                navigate(target);
+              }}
+            >
+              <ExternalLinkIcon aria-hidden="true" />
+              {eventLinkLabel(entry.eventKind)}
+            </Button>
+          )}
+        </div>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        <div className="flex items-center justify-between rounded-xl border border-border bg-muted/30 p-4">
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">变动分值</span>
+            <span
+              className={`text-2xl font-semibold tabular-nums ${
+                Number(entry.amount) < 0 ? 'text-destructive' : 'text-foreground'
+              }`}
+            >
+              {formatSignedAmount(entry.amount)}
+            </span>
+          </div>
+          <div className="flex flex-col items-end gap-1">
+            <StatusBadge kind="points" value={ledgerStatusBadge(entry.status)} />
+            <span className="text-xs text-muted-foreground tabular-nums">
+              计入月份 {entry.scoreMonth}
+            </span>
+          </div>
+        </div>
+
+        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+          <dt className="text-muted-foreground">事件类别</dt>
+          <dd className="text-foreground">
+            {CATEGORY_LABELS[entry.category] ?? entry.category}
+            {activityType ? ` · ${activityTypeLabel(activityType)}` : ''}
+            {bonusLabel ? ` · ${bonusLabel}` : ''}
+          </dd>
+          {entry.eventTime && (
+            <>
+              <dt className="text-muted-foreground">事件时间</dt>
+              <dd className="text-foreground tabular-nums">{formatDateTime(entry.eventTime)}</dd>
+            </>
+          )}
+          <dt className="text-muted-foreground">入账时间</dt>
+          <dd className="text-foreground tabular-nums">{formatDateTime(entry.recordedAt)}</dd>
+          {venue && (
+            <>
+              <dt className="text-muted-foreground">活动地点</dt>
+              <dd className="text-foreground">{venue}</dd>
+            </>
+          )}
+          {platform && (
+            <>
+              <dt className="text-muted-foreground">比赛平台</dt>
+              <dd className="text-foreground">{platformLabel(platform)}</dd>
+            </>
+          )}
+          {teamName && (
+            <>
+              <dt className="text-muted-foreground">所属队伍</dt>
+              <dd className="text-foreground">{teamName}</dd>
+            </>
+          )}
+          <dt className="text-muted-foreground">规则版本</dt>
+          <dd className="text-foreground tabular-nums">
+            {entry.ruleVersionId ? entry.ruleVersionId.slice(0, 8) : '默认规则'}
+          </dd>
+        </dl>
+
+        {formula && (
+          <div className="flex flex-col gap-2 rounded-xl border border-border bg-muted/20 p-3.5">
+            <h3 className="text-xs font-semibold text-foreground">竞赛计分明细</h3>
+            <div className="grid grid-cols-3 gap-2 text-xs sm:grid-cols-6">
+              {[
+                { k: 'B', label: '到场分' },
+                { k: 'lambda', label: 'λ 系数' },
+                { k: 'S', label: '题数分 S' },
+                { k: 'R', label: '社内排名 R' },
+                { k: 'X', label: '外部奖 X' },
+                { k: 'W', label: '总计 W' },
+              ].map(({ k, label }) =>
+                formula[k] != null ? (
+                  <div key={k} className="rounded-lg bg-card px-2 py-1.5 text-center ring-1 ring-border">
+                    <div className="text-[10px] text-muted-foreground">{label}</div>
+                    <div className="font-semibold text-foreground tabular-nums">{String(formula[k])}</div>
+                  </div>
+                ) : null,
+              )}
+            </div>
+            {typeof detail.lambdaSource === 'string' && (
+              <p className="text-[11px] text-muted-foreground">λ 档来源：{detail.lambdaSource}</p>
+            )}
+          </div>
+        )}
+
+        {claimDesc && (
+          <div className="flex flex-col gap-1 rounded-xl bg-muted/30 p-3.5 text-xs leading-5">
+            <span className="font-medium text-foreground">申报内容</span>
+            <p className="whitespace-pre-wrap text-muted-foreground">{claimDesc}</p>
+            {claimReviewNote && (
+              <p className="mt-1 text-foreground">审核意见：{claimReviewNote}</p>
+            )}
+          </div>
+        )}
+
+        {note && (
+          <div className="flex flex-col gap-1 rounded-xl bg-muted/30 p-3.5 text-xs leading-5">
+            <span className="font-medium text-foreground">说明 / 备注</span>
+            <p className="whitespace-pre-wrap text-muted-foreground">{note}</p>
+          </div>
+        )}
+
+        {(reversalReason || originalTitle) && (
+          <Alert>
+            <AlertTitle>{entry.category === 'reversal' ? '冲正说明' : '记录已冲正'}</AlertTitle>
+            <AlertDescription>
+              {originalTitle && <span>原事件：{originalTitle}；</span>}
+              {reversalReason ?? '已按制度完成冲正处理。'}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        <p className="border-t border-border pt-2 font-mono text-[11px] break-all text-muted-foreground/75">
+          溯源编号：{entry.sourceKey}
+        </p>
+      </div>
+    </ResponsiveDetail>
   );
 }
 
 function AppealDrawer({
   principalId,
   open,
+  preset,
   onOpenChange,
 }: {
   principalId: string;
   open: boolean;
+  preset?: { entry?: LedgerEntryDto; ledgerEntryId?: string; subject?: string } | null;
   onOpenChange: (open: boolean) => void;
 }) {
   const queryClient = useQueryClient();
+  const [selectedLedgerId, setSelectedLedgerId] = useState('');
+  const [entrySearch, setEntrySearch] = useState('');
   const [subject, setSubject] = useState('');
+  const [autoSubject, setAutoSubject] = useState('');
   const [materials, setMaterials] = useState('');
+
+  const ledgerOptionsQuery = usePrivateQuery<
+    { items: LedgerEntryDto[]; nextCursor?: string | null },
+    ApiError
+  >(
+    principalId,
+    ['me', 'points', 'appeal-options'],
+    async () => (await api.get<{ items: LedgerEntryDto[]; nextCursor?: string | null }>('/me/points')).data,
+    { enabled: open },
+  );
+
+  const ledgerOptions = useMemo(() => {
+    const base = ledgerOptionsQuery.data?.items ?? [];
+    if (preset?.entry && !base.some((item) => item.id === preset.entry!.id)) {
+      return [preset.entry, ...base];
+    }
+    return base;
+  }, [ledgerOptionsQuery.data, preset?.entry]);
+
+  const filteredOptions = useMemo(() => {
+    const keyword = entrySearch.trim().toLowerCase();
+    if (!keyword) return ledgerOptions;
+    return ledgerOptions.filter((entry) => {
+      const name = displayEventName(entry).toLowerCase();
+      const cat = (CATEGORY_LABELS[entry.category] ?? entry.category).toLowerCase();
+      return (
+        name.includes(keyword) ||
+        cat.includes(keyword) ||
+        entry.scoreMonth.includes(keyword) ||
+        formatSignedAmount(entry.amount).includes(keyword)
+      );
+    });
+  }, [ledgerOptions, entrySearch]);
+
+  const selectedEntry = useMemo(
+    () => ledgerOptions.find((item) => item.id === selectedLedgerId) ?? null,
+    [ledgerOptions, selectedLedgerId],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    if (preset?.ledgerEntryId) {
+      setSelectedLedgerId(preset.ledgerEntryId);
+      const nextSubject = preset.subject ?? '';
+      setSubject(nextSubject);
+      setAutoSubject(nextSubject);
+    } else {
+      setSelectedLedgerId('');
+      setSubject('');
+      setAutoSubject('');
+    }
+    setEntrySearch('');
+  }, [open, preset]);
+
+  const selectEntry = (entry: LedgerEntryDto) => {
+    setSelectedLedgerId(entry.id);
+    const defaultSubject = `对「${displayEventName(entry)}」（${entry.scoreMonth}，${formatSignedAmount(entry.amount)} 分）积分有疑问`;
+    if (!subject.trim() || subject === autoSubject) {
+      setSubject(defaultSubject);
+      setAutoSubject(defaultSubject);
+    }
+  };
+
   const mutation = useMutation({
-    mutationFn: async (input: { subject: string; materials?: string }) =>
+    mutationFn: async (input: { subject: string; materials?: string; ledgerEntryId: string }) =>
       (await api.post<{ appealId: string }>('/me/appeals', input)).data,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'me', 'appeals'] });
     },
   });
+
+  const canSubmit = !mutation.isPending && Boolean(selectedLedgerId) && subject.trim().length >= 5;
 
   return (
     <ResponsiveDetail
@@ -563,22 +982,27 @@ function AppealDrawer({
       onOpenChange={(next) => {
         if (!next) {
           mutation.reset();
+          setSelectedLedgerId('');
+          setEntrySearch('');
           setSubject('');
+          setAutoSubject('');
           setMaterials('');
         }
         onOpenChange(next);
       }}
       title="积分申诉"
-      description="对公示结果或某笔流水有疑问时提交；请写明申诉对象与依据。"
+      description="请选择有异议的对应积分流水后提交申诉，管理端可直接联动核查与调账。"
       footer={
         <Button
           onClick={() => {
+            if (!selectedLedgerId) return;
             mutation.mutate({
               subject: subject.trim(),
               materials: materials.trim() || undefined,
+              ledgerEntryId: selectedLedgerId,
             });
           }}
-          disabled={mutation.isPending || subject.trim().length < 5}
+          disabled={!canSubmit}
           className="w-full sm:w-auto"
         >
           {mutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}
@@ -590,7 +1014,7 @@ function AppealDrawer({
         {mutation.isSuccess && (
           <Alert>
             <AlertTitle>申诉已提交</AlertTitle>
-            <AlertDescription>负责人会在公示期内处理，结果会在此反馈。</AlertDescription>
+            <AlertDescription>负责人会在工作台结合对应流水核查处理，结果将同步在此反馈。</AlertDescription>
           </Alert>
         )}
         {mutation.isError && (
@@ -599,13 +1023,94 @@ function AppealDrawer({
             <AlertDescription>{(mutation.error as ApiError).message}</AlertDescription>
           </Alert>
         )}
+
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="appeal-ledger-search">选择对应积分流水（必选）</Label>
+            {selectedEntry && (
+              <span className="text-xs text-primary">已选 1 笔流水</span>
+            )}
+          </div>
+          {ledgerOptionsQuery.isPending ? (
+            <div className="flex flex-col gap-2">
+              <Skeleton className="h-14" />
+              <Skeleton className="h-14" />
+            </div>
+          ) : ledgerOptions.length === 0 ? (
+            <Alert>
+              <AlertTitle>暂无可申诉的积分流水</AlertTitle>
+              <AlertDescription>
+                当前账号还没有积分流水记录；如存在漏记活动或贡献，请前往「贡献申报」提交申报。
+              </AlertDescription>
+            </Alert>
+          ) : (
+            <>
+              {ledgerOptions.length > 5 && (
+                <Input
+                  id="appeal-ledger-search"
+                  value={entrySearch}
+                  onChange={(event) => setEntrySearch(event.target.value)}
+                  placeholder="按活动名称、月份或分值筛选流水…"
+                />
+              )}
+              <div
+                role="radiogroup"
+                aria-label="选择要申诉的积分流水"
+                className="flex max-h-56 flex-col gap-1.5 overflow-y-auto rounded-xl border border-border bg-muted/20 p-2"
+              >
+                {filteredOptions.length === 0 ? (
+                  <p className="py-4 text-center text-xs text-muted-foreground">没有匹配的积分流水。</p>
+                ) : (
+                  filteredOptions.map((entry) => {
+                    const active = entry.id === selectedLedgerId;
+                    const name = displayEventName(entry);
+                    return (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        onClick={() => selectEntry(entry)}
+                        className={`flex w-full flex-col gap-1 rounded-lg border px-3 py-2 text-left transition-colors ${
+                          active
+                            ? 'border-primary bg-primary/5 ring-1 ring-primary/30'
+                            : 'border-border/60 bg-card hover:bg-muted/40'
+                        }`}
+                      >
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="min-w-0 truncate text-sm font-medium text-foreground">
+                            {name}
+                          </span>
+                          <span
+                            className={`shrink-0 text-sm font-semibold tabular-nums ${
+                              Number(entry.amount) < 0 ? 'text-destructive' : 'text-foreground'
+                            }`}
+                          >
+                            {formatSignedAmount(entry.amount)}
+                          </span>
+                        </span>
+                        <span className="flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+                          <StatusBadge kind="points" value={ledgerStatusBadge(entry.status)} />
+                          <span>{CATEGORY_LABELS[entry.category] ?? entry.category}</span>
+                          <span className="tabular-nums">{entry.scoreMonth}</span>
+                          <span className="tabular-nums">{formatDateTime(entry.recordedAt)}</span>
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
         <div className="grid gap-1.5">
           <Label htmlFor="appeal-subject">申诉事项（5-500 字）</Label>
           <Input
             id="appeal-subject"
             value={subject}
             onChange={(event) => setSubject(event.target.value)}
-            placeholder="如：10 月 8 日周赛的出勤认定缺少我的签退"
+            placeholder="选择上方流水后将自动带出，也可补充具体疑问"
             required
             minLength={5}
             maxLength={500}
@@ -619,7 +1124,7 @@ function AppealDrawer({
             onChange={(event) => setMaterials(event.target.value)}
             rows={5}
             maxLength={4000}
-            placeholder="凭证描述、时间点、可联系的证明人等"
+            placeholder="凭证描述、时间点、期望更正分值、可联系的证明人等"
           />
         </div>
       </div>

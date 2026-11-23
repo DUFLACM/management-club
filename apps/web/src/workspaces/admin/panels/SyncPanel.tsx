@@ -331,6 +331,7 @@ function SyncBody({ principalId }: { principalId: string }) {
         actions={
           <Button
             variant="outline"
+            disabled={jobsQuery.isFetching || failuresQuery.isFetching || workerStatusQuery.isFetching}
             onClick={() => {
               void jobsQuery.refetch();
               void failuresQuery.refetch();
@@ -338,7 +339,10 @@ function SyncBody({ principalId }: { principalId: string }) {
               void workerStatusQuery.refetch();
             }}
           >
-            <RefreshCwIcon aria-hidden="true" />
+            <RefreshCwIcon
+              className={jobsQuery.isFetching || failuresQuery.isFetching || workerStatusQuery.isFetching ? 'animate-spin' : ''}
+              aria-hidden="true"
+            />
             刷新状态
           </Button>
         }

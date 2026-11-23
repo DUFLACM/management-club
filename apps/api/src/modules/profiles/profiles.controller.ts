@@ -46,7 +46,7 @@ export class ProfilesController {
     return ok(await this.profiles.memberRatings(actor, memberId))
   }
 
-  /** 比赛成绩（四平台 + 自定义；按比赛时间倒序，支持平台/时间段筛选，分页） */
+  /** 比赛成绩（牛客/CF/AtCoder/VJudge/校内 OJ；合并平台同步结果与已结算/历史导入的平台赛流水） */
   @Get('profiles/:memberId/competition-results')
   async competitionResults(
     @CurrentActor() actor: SessionActor,
@@ -60,42 +60,135 @@ export class ProfilesController {
     const fromAt = from && !Number.isNaN(Date.parse(from)) ? new Date(from) : null
     const toAt = to && !Number.isNaN(Date.parse(to)) ? new Date(to) : null
     const accounts = await this.db.platformAccount.findMany({ where: { userId: memberId } })
+    const verifiedPlatforms = new Set(accounts.filter((a) => a.status === 'verified').map((a) => a.platform))
     const contestFilter = {
       ...(platform ? { platform } : {}),
       ...((fromAt || toAt) ? { startTime: { ...(fromAt ? { gte: fromAt } : {}), ...(toAt ? { lte: toAt } : {}) } } : {}),
     }
-    const rows = await this.db.platformResult.findMany({
-      where: {
-        platformAccountId: { in: accounts.map((a) => a.id) },
-        ...(Object.keys(contestFilter).length > 0 ? { platformContest: contestFilter } : {}),
-      },
-      orderBy: [{ platformContest: { startTime: 'desc' } }, { id: 'desc' }],
-      take: 26,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      include: { platformContest: true, platformAccount: true },
+    const [rows, contestLedger] = await Promise.all([
+      this.db.platformResult.findMany({
+        where: {
+          platformAccountId: { in: accounts.map((a) => a.id) },
+          ...(Object.keys(contestFilter).length > 0 ? { platformContest: contestFilter } : {}),
+        },
+        orderBy: [{ platformContest: { startTime: 'desc' } }, { id: 'desc' }],
+        take: 200,
+        include: { platformContest: true, platformAccount: true },
+      }),
+      this.db.pointsLedgerEntry.findMany({
+        where: {
+          userId: memberId,
+          status: 'approved',
+          category: { in: ['contest', 'remote_contest'] },
+          sourceKey: { startsWith: 'contest:' },
+        },
+        orderBy: { recordedAt: 'desc' },
+        take: 200,
+        select: { id: true, sourceKey: true, amount: true, recordedAt: true, detail: true },
+      }),
+    ])
+
+    type ResultItem = {
+      cursorKey: string
+      platform: string
+      contestId: string
+      contestName: string
+      startTime: string
+      participationType: string
+      score: number | null
+      fullScore: number | null
+      acceptedCount: number | null
+      problemCount: number | null
+      rank: number | null
+      rankTotal: number | null
+      status: string
+      verifiedBinding: boolean
+    }
+
+    const items: ResultItem[] = rows.map((r) => ({
+      cursorKey: `pr:${r.id}`,
+      platform: r.platformContest.platform,
+      contestId: r.platformContest.externalContestId,
+      contestName: r.platformContest.name,
+      startTime: r.platformContest.startTime.toISOString(),
+      participationType: r.participationType,
+      score: r.score ? Number(r.score) : null,
+      fullScore: r.fullScore ? Number(r.fullScore) : null,
+      acceptedCount: r.acceptedCount,
+      problemCount: r.problemCount,
+      rank: r.rank,
+      rankTotal: r.rankTotal,
+      status: r.status,
+      verifiedBinding: r.platformAccount.status === 'verified',
+    }))
+
+    const seenKeys = new Set(items.map((item) => `${item.platform}:${item.contestId}`))
+
+    // 历史已结算或 Excel 导入的平台赛（尤其是 VJudge）回补展示，不重复
+    const activityIds: string[] = []
+    for (const entry of contestLedger) {
+      const d = (entry.detail && typeof entry.detail === 'object' ? entry.detail : {}) as Record<string, unknown>
+      if (typeof d.activityId === 'string' && /^[0-9a-f-]{36}$/i.test(d.activityId)) {
+        activityIds.push(d.activityId)
+      }
+    }
+    const activities = activityIds.length > 0
+      ? await this.db.activity.findMany({
+          where: { id: { in: [...new Set(activityIds)] } },
+          select: { id: true, title: true, startAt: true, teamSize: true },
+        })
+      : []
+    const actMap = new Map(activities.map((a) => [a.id, a]))
+
+    for (const entry of contestLedger) {
+      const parts = entry.sourceKey.split(':')
+      const plat = parts[1]
+      const cid = parts[2]
+      if (!plat || !cid) continue
+      const dedupeKey = `${plat}:${cid}`
+      if (seenKeys.has(dedupeKey)) continue
+      if (platform && plat !== platform) continue
+      const d = (entry.detail && typeof entry.detail === 'object' ? entry.detail : {}) as Record<string, unknown>
+      const act = typeof d.activityId === 'string' ? actMap.get(d.activityId) : undefined
+      const startDate =
+        act?.startAt ??
+        (typeof d.activityDate === 'string' && !Number.isNaN(Date.parse(d.activityDate)) ? new Date(d.activityDate) : entry.recordedAt)
+      if (fromAt && startDate < fromAt) continue
+      if (toAt && startDate > toAt) continue
+      seenKeys.add(dedupeKey)
+      const isTeam = Boolean(d.teamId || d.teamName || (act?.teamSize && act.teamSize > 1))
+      const contestName =
+        act?.title ??
+        (typeof d.activityTitle === 'string' && d.activityTitle.trim() ? d.activityTitle.trim() : `${plat.toUpperCase()} #${cid}`)
+      items.push({
+        cursorKey: `le:${entry.id}`,
+        platform: plat,
+        contestId: cid,
+        contestName,
+        startTime: startDate.toISOString(),
+        participationType: isTeam ? 'TEAM' : 'OFFICIAL',
+        score: Number(entry.amount),
+        fullScore: null,
+        acceptedCount: null,
+        problemCount: null,
+        rank: null,
+        rankTotal: null,
+        status: 'complete',
+        verifiedBinding: verifiedPlatforms.has(plat),
+      })
+    }
+
+    items.sort((a, b) => b.startTime.localeCompare(a.startTime) || b.cursorKey.localeCompare(a.cursorKey))
+
+    const startIndex = cursor ? Math.max(0, items.findIndex((item) => item.cursorKey === cursor) + 1) : 0
+    const page = items.slice(startIndex, startIndex + 25)
+    const nextCursor = startIndex + 25 < items.length ? page.at(-1)?.cursorKey : undefined
+
+    return ok({
+      items: page.map(({ cursorKey: _k, ...rest }) => rest),
+      nextCursor,
+      note: isSelf ? undefined : '他人视图仅含可见字段',
     })
-    const nextCursor = rows.length > 25 ? rows.pop()!.id : undefined
-    return ok(
-      {
-        items: rows.map((r) => ({
-          platform: r.platformContest.platform,
-          contestId: r.platformContest.externalContestId,
-          contestName: r.platformContest.name,
-          startTime: r.platformContest.startTime.toISOString(),
-          participationType: r.participationType,
-          score: r.score ? Number(r.score) : null,
-          fullScore: r.fullScore ? Number(r.fullScore) : null,
-          acceptedCount: r.acceptedCount,
-          problemCount: r.problemCount,
-          rank: r.rank,
-          rankTotal: r.rankTotal,
-          status: r.status,
-          verifiedBinding: r.platformAccount.status === 'verified',
-        })),
-        nextCursor,
-        note: isSelf ? undefined : '他人视图仅含可见字段',
-      },
-    )
   }
 
   /** 活动参与历史（报名/到场/认定分维度） */
