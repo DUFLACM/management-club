@@ -15,6 +15,7 @@ import {
   PlusIcon,
   SendIcon,
   ShuffleIcon,
+  Trash2Icon,
   UsersIcon,
 } from 'lucide-react';
 
@@ -49,6 +50,13 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -98,6 +106,7 @@ function ContestsBody({ principalId }: { principalId: string }) {
   const [statusFilter, setStatusFilter] = useState('all');
   const [createOpen, setCreateOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [pageNotice, setPageNotice] = useState<string | null>(null);
 
   const listQuery = usePrivateQuery<AdminCompetitionEventDto[], ApiError>(
     principalId,
@@ -126,9 +135,17 @@ function ContestsBody({ principalId }: { principalId: string }) {
           onClose={() => setCreateOpen(false)}
           onCreated={(eventId) => {
             setCreateOpen(false);
+            setPageNotice(null);
             setSelectedId(eventId);
           }}
         />
+      )}
+
+      {pageNotice && (
+        <Alert variant="info">
+          <AlertTitle>已删除赛事</AlertTitle>
+          <AlertDescription>{pageNotice}</AlertDescription>
+        </Alert>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
@@ -205,7 +222,16 @@ function ContestsBody({ principalId }: { principalId: string }) {
         )}
       </QueryBoundary>
 
-      {selected && <EventDetail principalId={principalId} event={selected} />}
+      {selected && (
+        <EventDetail
+          principalId={principalId}
+          event={selected}
+          onDeleted={(message) => {
+            setSelectedId(null);
+            setPageNotice(message);
+          }}
+        />
+      )}
 
       <DesignatedCatalogSection principalId={principalId} />
     </div>
@@ -594,13 +620,19 @@ function CreateEventForm({
 function EventDetail({
   principalId,
   event,
+  onDeleted,
 }: {
   principalId: string;
   event: AdminCompetitionEventDto;
+  onDeleted: (message: string) => void;
 }) {
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
   const [settleResult, setSettleResult] = useState<SettleResultDto | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [reversePoints, setReversePoints] = useState(
+    event.status === 'settled' || event.status === 'archived',
+  );
 
   const invalidate = () => {
     void queryClient.invalidateQueries({
@@ -657,11 +689,29 @@ function EventDetail({
     },
   });
 
+  const deleteMutation = useMutation({
+    mutationFn: () => competitionsAdminApi.deleteEvent(event.id, { reversePoints }),
+    onSuccess: (result) => {
+      setDeleteOpen(false);
+      void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
+      onDeleted(
+        result.reversedPointsCount > 0
+          ? `已删除正式赛事「${event.title}」，并同步冲正了 ${result.reversedPointsCount} 条已入账积分流水。`
+          : `已删除正式赛事「${event.title}」及其报名与资格名单记录。`,
+      );
+    },
+    onError: (error: ApiError) => {
+      setDeleteOpen(false);
+      setNotice({ tone: 'error', text: error.message });
+    },
+  });
+
   const anyPending =
     publishMutation.isPending ||
     shortlistMutation.isPending ||
     forceAssignMutation.isPending ||
-    settleMutation.isPending;
+    settleMutation.isPending ||
+    deleteMutation.isPending;
 
   return (
     <Card>
@@ -744,6 +794,19 @@ function EventDetail({
                 导出名单
               </a>
             </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-destructive hover:text-destructive"
+              disabled={anyPending}
+              onClick={() => {
+                setReversePoints(event.status === 'settled' || event.status === 'archived');
+                setDeleteOpen(true);
+              }}
+            >
+              <Trash2Icon aria-hidden="true" />
+              删除赛事
+            </Button>
           </div>
         </div>
 
@@ -793,6 +856,59 @@ function EventDetail({
             </p>
           </TabsContent>
         </Tabs>
+
+        <Dialog
+          open={deleteOpen}
+          onOpenChange={(next) => {
+            if (deleteMutation.isPending) return;
+            setDeleteOpen(next);
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>确认删除正式赛事</DialogTitle>
+              <DialogDescription>
+                将删除「{event.title}」及其全部报名名单（
+                {event.teamSize ? `${event._count.teamEntries} 支队伍` : `${event._count.registrations} 人`}
+                ）、资格名单与佐证材料，此操作不可撤销。
+              </DialogDescription>
+            </DialogHeader>
+            <label className="flex items-start gap-2.5 rounded-lg border border-border bg-muted/40 p-3 text-sm text-foreground">
+              <Checkbox
+                checked={reversePoints}
+                onCheckedChange={(checked) => setReversePoints(checked === true)}
+                className="mt-0.5"
+              />
+              <span className="flex flex-col gap-0.5">
+                <span className="font-medium">同时冲正该赛事已入账的积分流水</span>
+                <span className="text-xs leading-5 text-muted-foreground">
+                  勾选后会通过冲正条目撤销本场比赛已发放的所有生效积分（不删除账本历史）；不勾选则仅删除赛事记录，保留已发放积分。
+                </span>
+              </span>
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={deleteMutation.isPending}
+                onClick={() => setDeleteOpen(false)}
+              >
+                取消
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                disabled={deleteMutation.isPending}
+                onClick={() => deleteMutation.mutate()}
+              >
+                {deleteMutation.isPending && (
+                  <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                )}
+                确认删除
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
       </CardContent>
     </Card>
   );

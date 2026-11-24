@@ -1,5 +1,5 @@
 import {
-  BadRequestException, Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, Res, StreamableFile, UploadedFile, UseGuards, UseInterceptors,
+  BadRequestException, Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post, Query, Res, StreamableFile, UploadedFile, UseGuards, UseInterceptors,
 } from '@nestjs/common'
 import { FileInterceptor } from '@nestjs/platform-express'
 import { createReadStream } from 'node:fs'
@@ -104,6 +104,16 @@ export class CompetitionAdminController {
   async publish(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
     await this.events.publish(actor, id)
     return ok({ published: true })
+  }
+
+  @Delete(':id')
+  @RequireAction('competitions.manage')
+  async remove(
+    @CurrentActor() actor: SessionActor,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('reversePoints') reversePoints?: string,
+  ) {
+    return ok(await this.events.deleteEvent(actor, id, { reversePoints: reversePoints === 'true' }))
   }
 
   @Post(':id/build-shortlist')

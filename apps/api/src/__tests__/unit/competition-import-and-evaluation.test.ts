@@ -5,6 +5,7 @@ import {
   resolveOfficialAwardPoints,
 } from '../../modules/scoring/competition-import.service.js'
 import { EvaluationService } from '../../modules/evaluation/evaluation.service.js'
+import { CompetitionEventService } from '../../modules/competitions/competition-event.service.js'
 
 const ACTOR: SessionActor = {
   sessionId: 'sess-1',
@@ -296,5 +297,52 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
     })
     expect(res).toEqual({ updated: true })
     expect(db.evaluationRow.update).toHaveBeenCalled()
+  })
+})
+
+describe('CompetitionEventService.deleteEvent 删除正式赛事', () => {
+  it('删除正式赛事并级联清理报名/资格/材料；开启 reversePoints 时同步冲正已入账流水', async () => {
+    const eventId = '66666666-6666-4666-8666-666666666666'
+    const tx = {
+      $executeRaw: vi.fn().mockResolvedValue(1),
+      competitionRegistrationMaterial: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
+      competitionRegistration: { deleteMany: vi.fn().mockResolvedValue({ count: 2 }) },
+      teamCompetitionMaterial: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
+      teamCompetitionEntry: { deleteMany: vi.fn().mockResolvedValue({ count: 0 }) },
+      competitionShortlistRow: { deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
+      competitionEvent: { delete: vi.fn().mockResolvedValue({}) },
+    }
+    const db = {
+      competitionEvent: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: eventId,
+          title: '2026 蓝桥杯省赛',
+          status: 'archived',
+          _count: { registrations: 2, teamEntries: 0, shortlist: 1 },
+          registrations: [{ materials: [] }],
+          teamEntries: [],
+        }),
+      },
+      pointsLedgerEntry: {
+        findMany: vi.fn().mockResolvedValue([{ id: 'le-1' }, { id: 'le-2' }]),
+      },
+      $transaction: vi.fn().mockImplementation(async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
+    }
+    const audit = { log: vi.fn().mockResolvedValue(undefined) }
+    const scoring = { reverseEntry: vi.fn().mockResolvedValue({ reversalId: 'rev-1', replacementId: null }) }
+    const svc = new CompetitionEventService(db as never, audit as never, scoring as never, {} as never)
+
+    const result = await svc.deleteEvent(ACTOR, eventId, { reversePoints: true })
+    expect(result).toEqual({ deleted: true, reversedPointsCount: 2 })
+    expect(scoring.reverseEntry).toHaveBeenCalledTimes(2)
+    expect(tx.competitionRegistrationMaterial.deleteMany).toHaveBeenCalledTimes(1)
+    expect(tx.competitionRegistration.deleteMany).toHaveBeenCalledTimes(1)
+    expect(tx.teamCompetitionMaterial.deleteMany).toHaveBeenCalledTimes(1)
+    expect(tx.teamCompetitionEntry.deleteMany).toHaveBeenCalledTimes(1)
+    expect(tx.competitionShortlistRow.deleteMany).toHaveBeenCalledTimes(1)
+    expect(tx.competitionEvent.delete).toHaveBeenCalledWith({ where: { id: eventId } })
+    expect(audit.log).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'competition_event.delete', resourceId: eventId }),
+    )
   })
 })

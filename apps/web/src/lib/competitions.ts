@@ -545,6 +545,14 @@ export const competitionsAdminApi = {
   async publish(eventId: string) {
     await api.post(`/admin/competition-events/${eventId}/publish`);
   },
+  async deleteEvent(eventId: string, options?: { reversePoints?: boolean }) {
+    const suffix = options?.reversePoints ? '?reversePoints=true' : '';
+    return (
+      await api.delete<{ deleted: boolean; reversedPointsCount: number }>(
+        `/admin/competition-events/${eventId}${suffix}`,
+      )
+    ).data;
+  },
   async buildShortlist(eventId: string) {
     return (await api.post<{ shortlisted: number; total: number }>(`/admin/competition-events/${eventId}/build-shortlist`)).data;
   },

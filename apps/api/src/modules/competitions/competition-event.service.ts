@@ -140,6 +140,78 @@ export class CompetitionEventService {
     await this.audit.log({ actorPrincipalId: actor.principalId, action: 'competition_event.publish', resourceType: 'competition_event', resourceId: eventId, summary: `发布赛事：${event.title}` })
   }
 
+  /**
+   * 删除正式赛事：任意状态均可删除，清除关联的资格名单、个人/团队报名与佐证材料。
+   * 当 reversePoints=true 时，先通过积分冲正撤销该赛事所有已生效的积分流水（保留账本历史）。
+   */
+  async deleteEvent(
+    actor: SessionActor,
+    eventId: string,
+    options: { reversePoints?: boolean } = {},
+  ): Promise<{ deleted: true; reversedPointsCount: number }> {
+    const event = await this.db.competitionEvent.findUnique({
+      where: { id: eventId },
+      include: {
+        _count: { select: { registrations: true, teamEntries: true, shortlist: true } },
+        registrations: { select: { materials: { select: { storageKey: true } } } },
+        teamEntries: { select: { materials: { select: { storageKey: true } } } },
+      },
+    })
+    if (!event) throw new CompetitionError('赛事不存在', 'NOT_FOUND')
+
+    let reversedPointsCount = 0
+    if (options.reversePoints) {
+      const ledgerEntries = await this.db.pointsLedgerEntry.findMany({
+        where: {
+          status: 'approved',
+          OR: [
+            { sourceKey: { startsWith: `competition:${eventId}:` } },
+            { sourceKey: { startsWith: `team-competition:${eventId}:` } },
+          ],
+        },
+        select: { id: true },
+      })
+      const reason = `删除正式赛事「${event.title}」同步冲正`.slice(0, 500)
+      for (const entry of ledgerEntries) {
+        await this.scoring.reverseEntry(actor, entry.id, reason, null)
+        reversedPointsCount++
+      }
+    }
+
+    await this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM competition_events WHERE id = ${eventId}::uuid FOR UPDATE`
+      await tx.competitionRegistrationMaterial.deleteMany({ where: { registration: { eventId } } })
+      await tx.competitionRegistration.deleteMany({ where: { eventId } })
+      await tx.teamCompetitionMaterial.deleteMany({ where: { entry: { eventId } } })
+      await tx.teamCompetitionEntry.deleteMany({ where: { eventId } })
+      await tx.competitionShortlistRow.deleteMany({ where: { eventId } })
+      await tx.competitionEvent.delete({ where: { id: eventId } })
+    })
+
+    const storageKeys = [
+      ...event.registrations.flatMap((r) => r.materials.map((m) => m.storageKey)),
+      ...event.teamEntries.flatMap((e) => e.materials.map((m) => m.storageKey)),
+    ]
+    if (storageKeys.length > 0) {
+      const fs = await import('node:fs/promises')
+      const path = await import('node:path')
+      const baseDir = process.env.STORAGE_LOCAL_DIR ?? './storage'
+      for (const key of storageKeys) {
+        await fs.rm(path.join(baseDir, key), { force: true }).catch(() => undefined)
+      }
+    }
+
+    const c = event._count
+    await this.audit.log({
+      actorPrincipalId: actor.principalId,
+      action: 'competition_event.delete',
+      resourceType: 'competition_event',
+      resourceId: eventId,
+      summary: `删除正式赛事（${event.status}）：${event.title}；个人报名 ${c.registrations}、队伍报名 ${c.teamEntries}、资格名单 ${c.shortlist}${reversedPointsCount > 0 ? `、同步冲正积分 ${reversedPointsCount} 条` : ''}`,
+    })
+    return { deleted: true, reversedPointsCount }
+  }
+
   async adminList(status?: string) {
     return this.db.competitionEvent.findMany({
       where: status ? { status } : undefined,
