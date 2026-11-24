@@ -1,5 +1,5 @@
 import { DomainError } from '../../common/domain-error.js'
-import { Inject, Injectable } from '@nestjs/common'
+import { Inject, Injectable, Optional } from '@nestjs/common'
 import { z } from 'zod'
 import {
   Decimal,
@@ -20,6 +20,7 @@ import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { ScoringService } from '../scoring/scoring.service.js'
 import { ContestStandingsService, contestExternalUrl } from '../activities/contest-standings.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { newId, monthKey, memberName } from '../../common/utils.js'
 import type { SessionActor } from '../auth/session.service.js'
 
@@ -77,6 +78,7 @@ export class CompetitionEventService {
     private readonly audit: AuditService,
     private readonly scoring: ScoringService,
     private readonly standings: ContestStandingsService,
+    @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
   async createEvent(actor: SessionActor, input: CompetitionEventInput): Promise<{ eventId: string }> {
@@ -138,6 +140,21 @@ export class CompetitionEventService {
     if (event.status !== 'draft') throw new CompetitionError('仅草稿状态可发布', 'STATE_INVALID')
     await this.db.competitionEvent.update({ where: { id: eventId }, data: { status: 'open' } })
     await this.audit.log({ actorPrincipalId: actor.principalId, action: 'competition_event.publish', resourceType: 'competition_event', resourceId: eventId, summary: `发布赛事：${event.title}` })
+    const fmt = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+    await this.notifications?.broadcastExternal({
+      category: 'competitions',
+      title: `正式赛事开放报名：${event.title}`,
+      body: `类别：${event.category} 类｜报名截止：${fmt.format(event.registerDeadline)}｜开赛时间：${fmt.format(event.startAt)}`,
+      link: '/app?section=contests&tab=entry',
+      dedupeKey: `wxpusher:competition:publish:${eventId}`,
+    })
   }
 
   /**

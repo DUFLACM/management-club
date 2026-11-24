@@ -41,6 +41,7 @@ interface NotificationListDto {
 }
 
 const KIND_LABELS: Record<string, string> = {
+  points_change: '积分变动',
   leave_decision: '请假审批',
   remote_decision: '远程审批',
   appeal_decision: '积分申诉',
@@ -140,18 +141,31 @@ export function NotificationCenter() {
                 <DialogTitle>个人消息通知</DialogTitle>
                 <DialogDescription>审批结果、申诉回复与个人动态会在这里提醒。</DialogDescription>
               </div>
-              {unreadCount > 0 && (
+              <div className="flex items-center gap-2">
                 <Button
                   type="button"
                   size="sm"
-                  variant="outline"
-                  disabled={markAllMutation.isPending}
-                  onClick={() => markAllMutation.mutate()}
+                  variant="ghost"
+                  onClick={() => {
+                    setOpen(false);
+                    navigate('/app?section=profile&tab=edit');
+                  }}
                 >
-                  <CheckCheckIcon aria-hidden="true" />
-                  全部已读
+                  微信推送设置
                 </Button>
-              )}
+                {unreadCount > 0 && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={markAllMutation.isPending}
+                    onClick={() => markAllMutation.mutate()}
+                  >
+                    <CheckCheckIcon aria-hidden="true" />
+                    全部已读
+                  </Button>
+                )}
+              </div>
             </div>
           </DialogHeader>
 

@@ -534,6 +534,26 @@ export class ScoringService {
       resourceId: id,
       summary: `${input.category} ${input.amount}（${input.scoreMonth}，来源 ${input.sourceKey}）`,
     })
+    const numericAmount = Number(input.amount)
+    if (Number.isFinite(numericAmount) && numericAmount !== 0) {
+      const sign = numericAmount > 0 ? `+${numericAmount}` : `${numericAmount}`
+      const detailObj = input.detail && typeof input.detail === 'object' && !Array.isArray(input.detail)
+        ? (input.detail as Record<string, unknown>)
+        : null
+      const label =
+        (typeof detailObj?.activityTitle === 'string' && detailObj.activityTitle) ||
+        (typeof detailObj?.eventTitle === 'string' && detailObj.eventTitle) ||
+        (typeof detailObj?.title === 'string' && detailObj.title) ||
+        (typeof detailObj?.reason === 'string' && detailObj.reason) ||
+        input.category
+      await this.notifications?.notify({
+        userId: input.userId,
+        kind: 'points_change',
+        title: `积分变动：${sign} 分`,
+        body: `归属月份 ${input.scoreMonth}，项目「${label}」已入账 ${sign} 分。`,
+        link: '/app?section=points',
+      })
+    }
     return { entryId: id, deduplicated: false }
   }
 
@@ -544,7 +564,26 @@ export class ScoringService {
     reason: string,
     replacementAmount: string | null,
   ): Promise<{ reversalId: string; replacementId: string | null }> {
-    return this.db.$transaction((tx) => this.reverseEntryTx(tx, actor, entryId, reason, replacementAmount))
+    const result = await this.db.$transaction(async (tx) => {
+      const original = await tx.pointsLedgerEntry.findUnique({
+        where: { id: entryId },
+        select: { userId: true, amount: true, scoreMonth: true },
+      })
+      const ids = await this.reverseEntryTx(tx, actor, entryId, reason, replacementAmount)
+      return { ...ids, original }
+    })
+    if (result.original) {
+      const origNum = Number(result.original.amount)
+      const replacementText = replacementAmount != null ? `，并按 ${Number(replacementAmount)} 分重新入账` : ''
+      await this.notifications?.notify({
+        userId: result.original.userId,
+        kind: 'points_change',
+        title: '积分流水已更正（冲正）',
+        body: `归属月份 ${result.original.scoreMonth} 原 ${origNum} 分记录已冲正${replacementText}。原因：${reason}`,
+        link: '/app?section=points',
+      })
+    }
+    return { reversalId: result.reversalId, replacementId: result.replacementId }
   }
 
   /** 事务内的冲正，供撤回审核与独立冲正共用 */

@@ -11,6 +11,8 @@ import {
   fetchAtCoderHistory,
   atCoderEntryToParticipation,
   AdapterError,
+  sendWxPusherMessage,
+  WxPusherError,
   type NormalizedParticipationRecord,
 } from '@acm/integrations'
 
@@ -433,6 +435,117 @@ const handlers: Record<string, JobHandler> = {
       await ctx.db.hydroEventReceipt.updateMany({ where: { eventId }, data: { status: 'processed' } }).catch(() => undefined)
     }
     return { note: 'connector 已启用：拉取实现待实例联调后启用' }
+  },
+
+  /** WxPusher 单人微信推送：按用户偏好校验后异步下发，不阻塞 API 请求 */
+  'notification.wxpusher_send': async (ctx, payload) => {
+    const appToken = process.env.WXPUSHER_APP_TOKEN?.trim()
+    if (!appToken) return { skipped: true, reason: 'not_configured' }
+    const userId = String(payload.userId ?? '')
+    const content = String(payload.content ?? '')
+    const summary = typeof payload.summary === 'string' ? payload.summary : undefined
+    const url = typeof payload.url === 'string' ? payload.url : undefined
+    const preferenceKey = String(payload.preferenceKey ?? 'approvals')
+    const force = payload.force === true
+    if (!userId || !content) return { skipped: true, reason: 'invalid_payload' }
+
+    const binding = await ctx.db.userWxPusherBinding.findUnique({ where: { userId } })
+    if (!binding) return { skipped: true, reason: 'not_bound' }
+    if (!force && !binding.enabled) return { skipped: true, reason: 'disabled' }
+    const prefAllowed =
+      force ||
+      (preferenceKey === 'points'
+        ? binding.notifyPoints
+        : preferenceKey === 'activities'
+          ? binding.notifyActivities
+          : preferenceKey === 'competitions'
+            ? binding.notifyCompetitions
+            : preferenceKey === 'announcements'
+              ? binding.notifyAnnouncements
+              : binding.notifyApprovals)
+    if (!prefAllowed) return { skipped: true, reason: 'preference_disabled' }
+
+    try {
+      const result = await sendWxPusherMessage({
+        appToken,
+        content,
+        summary,
+        contentType: 3,
+        uids: [binding.wxpusherUid],
+        url,
+      })
+      const okSend = result.acceptedCount > 0
+      await ctx.db.userWxPusherBinding.update({
+        where: { userId },
+        data: {
+          lastPushedAt: okSend ? new Date() : binding.lastPushedAt,
+          lastError: okSend ? null : 'WxPusher 未受理推送，请确认成员未取关公众号',
+        },
+      })
+      return { sent: okSend, acceptedCount: result.acceptedCount, failedCount: result.failedCount }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : 'WxPusher 发送异常'
+      await ctx.db.userWxPusherBinding.update({
+        where: { userId },
+        data: { lastError: msg.slice(0, 500) },
+      }).catch(() => undefined)
+      if (error instanceof WxPusherError && !error.retryable) {
+        return { sent: false, error: msg, retryable: false }
+      }
+      throw error
+    }
+  },
+
+  /** WxPusher 社团广播推送：按偏好分批查询绑定 UID 并控频发送（<= 500 UID/批） */
+  'notification.wxpusher_broadcast': async (ctx, payload) => {
+    const appToken = process.env.WXPUSHER_APP_TOKEN?.trim()
+    if (!appToken) return { skipped: true, reason: 'not_configured' }
+    const content = String(payload.content ?? '')
+    const summary = typeof payload.summary === 'string' ? payload.summary : undefined
+    const url = typeof payload.url === 'string' ? payload.url : undefined
+    const preferenceKey = String(payload.preferenceKey ?? 'announcements')
+    if (!content) return { skipped: true, reason: 'invalid_payload' }
+
+    const where = {
+      enabled: true,
+      user: { accountStatus: 'active' },
+      ...(preferenceKey === 'activities'
+        ? { notifyActivities: true }
+        : preferenceKey === 'competitions'
+          ? { notifyCompetitions: true }
+          : { notifyAnnouncements: true }),
+    }
+    const bindings = await ctx.db.userWxPusherBinding.findMany({
+      where,
+      select: { wxpusherUid: true },
+    })
+    const uids = bindings.map((b) => b.wxpusherUid)
+    if (uids.length === 0) return { skipped: true, reason: 'no_subscribers', targetCount: 0 }
+
+    const BATCH_SIZE = 500
+    let acceptedTotal = 0
+    let failedTotal = 0
+    for (let i = 0; i < uids.length; i += BATCH_SIZE) {
+      const chunk = uids.slice(i, i + BATCH_SIZE)
+      if (i > 0) await new Promise((resolve) => setTimeout(resolve, 600))
+      const result = await sendWxPusherMessage({
+        appToken,
+        content,
+        summary,
+        contentType: 3,
+        uids: chunk,
+        url,
+      })
+      acceptedTotal += result.acceptedCount
+      failedTotal += result.failedCount
+    }
+    if (acceptedTotal > 0) {
+      await ctx.db.userWxPusherBinding.updateMany({
+        where: { wxpusherUid: { in: uids } },
+        data: { lastPushedAt: new Date(), lastError: null },
+      }).catch(() => undefined)
+    }
+    return { targetCount: uids.length, acceptedCount: acceptedTotal, failedCount: failedTotal }
   },
 }
 

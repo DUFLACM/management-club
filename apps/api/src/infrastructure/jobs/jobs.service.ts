@@ -21,6 +21,8 @@ export type JobType =
   | 'activity.settle_attendance'
   | 'media.process_avatar'
   | 'badge.evaluate_rules'
+  | 'notification.wxpusher_send'
+  | 'notification.wxpusher_broadcast'
 
 export interface EnqueueJobOptions {
   type: JobType

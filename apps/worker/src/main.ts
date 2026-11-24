@@ -67,6 +67,7 @@ async function main(): Promise<void> {
           last_error = COALESCE(last_error, '') || '; lease expired'
         WHERE status = 'running' AND lease_until < now()`
       await db.anonymousBinding.deleteMany({ where: { expiresAt: { lt: new Date(Date.now() - 3600_000) } } })
+      await db.wxPusherBindToken.deleteMany({ where: { expiresAt: { lt: new Date(Date.now() - 3600_000) } } }).catch(() => undefined)
       await db.hydroNonce.deleteMany({ where: { expiresAt: { lt: new Date() } } })
       await db.appMeta.deleteMany({
         where: { key: { startsWith: 'worker:heartbeat:' }, updatedAt: { lt: new Date(Date.now() - 7 * 24 * 3600_000) } },

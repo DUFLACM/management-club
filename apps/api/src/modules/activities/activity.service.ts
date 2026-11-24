@@ -1,11 +1,12 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { DomainError } from '../../common/domain-error.js'
 import { loadEnv } from '../../config/env.js'
-import { Inject, Injectable } from '@nestjs/common'
+import { Inject, Injectable, Optional } from '@nestjs/common'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { JobsService } from '../../infrastructure/jobs/jobs.service.js'
 import { VenueService } from '../venues/venue.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import { newId, memberName, visibleAvatar } from '../../common/utils.js'
 import { actorCan } from '../../common/guards.js'
 import { ContestStandingsService, contestExternalUrl, type StandingsSnapshot } from './contest-standings.service.js'
@@ -139,6 +140,7 @@ export class ActivityService {
     private readonly audit: AuditService,
     private readonly jobs: JobsService,
     private readonly venueService: VenueService,
+    @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
   /** 创建活动草稿（自定义比赛/普通活动） */
@@ -408,7 +410,7 @@ export class ActivityService {
   }
 
   async publish(actor: SessionActor, activityId: string): Promise<void> {
-    const title = await this.db.$transaction(async (tx) => {
+    const published = await this.db.$transaction(async (tx) => {
       // 与草稿保存共用行锁，校验和快照始终来自同一版配置。
       await tx.$executeRaw`SELECT id FROM activities WHERE id = ${activityId}::uuid FOR UPDATE`
       const activity = await tx.activity.findUnique({
@@ -459,14 +461,29 @@ export class ActivityService {
         data: { frozenAt: new Date() },
       })
       await this.scheduleAttendanceSettlement(tx, activityId, attendanceDeadline(activity))
-      return activity.title
+      return { title: activity.title, startAt: activity.startAt, endAt: activity.endAt, type: activity.type }
     })
     await this.audit.log({
       actorPrincipalId: actor.principalId,
       action: 'activity.publish',
       resourceType: 'activity',
       resourceId: activityId,
-      summary: `发布活动 ${title}`,
+      summary: `发布活动 ${published.title}`,
+    })
+    const fmt = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+    await this.notifications?.broadcastExternal({
+      category: 'activities',
+      title: `新活动发布：${published.title}`,
+      body: `活动时间：${fmt.format(published.startAt)} ~ ${fmt.format(published.endAt)}，请及时前往协会系统查看详情与报名。`,
+      link: '/app?section=activities',
+      dedupeKey: `wxpusher:activity:publish:${activityId}`,
     })
   }
 

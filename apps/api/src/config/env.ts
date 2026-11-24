@@ -56,6 +56,9 @@ const envSchema = z.object({
 
   STORAGE_DRIVER: z.enum(['local']).default('local'),
   STORAGE_LOCAL_DIR: z.string().default('./storage'),
+
+  WXPUSHER_APP_TOKEN: z.preprocess((value) => (value === '' ? undefined : value), z.string().min(1).optional()),
+  WXPUSHER_ADDRESS: z.preprocess((value) => (value === '' ? undefined : value), z.union([z.ipv4(), z.ipv6()]).optional()),
 })
 
 export type AppEnv = z.infer<typeof envSchema>

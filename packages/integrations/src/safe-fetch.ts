@@ -66,6 +66,7 @@ const PLATFORM_ADDRESS_ENV: Record<string, string> = {
   'atcoder.jp': 'PLATFORM_ATCODER_ADDRESS',
   'kenkoooo.com': 'PLATFORM_ATCODER_PROBLEMS_ADDRESS',
   'vjudge.net': 'PLATFORM_VJUDGE_ADDRESS',
+  'wxpusher.zjiecode.com': 'WXPUSHER_ADDRESS',
 }
 
 export interface SafeFetchOptions {

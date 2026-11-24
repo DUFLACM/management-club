@@ -47,6 +47,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { MemberAvatar } from '@/components/club/MemberAvatar';
+import { WxPusherSettingsCard } from '@/components/club/WxPusherSettingsCard';
 
 const RatingChart = lazy(() => import('@/components/club/RatingChart'));
 
@@ -1052,6 +1053,7 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
           </CardContent>
         </Card>
       </div>
+      <WxPusherSettingsCard principalId={principalId} />
     </div>
   );
 }

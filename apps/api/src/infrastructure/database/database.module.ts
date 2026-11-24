@@ -29,18 +29,21 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
 export class SchemaStateService implements OnApplicationBootstrap {
   announcementsReady = true
   notificationsReady = true
+  wxpusherReady = true
 
   constructor(@Inject(PrismaService) private readonly db: PrismaService) {}
 
   async onApplicationBootstrap(): Promise<void> {
     try {
-      const rows = await this.db.$queryRaw<Array<{ announcements: boolean; notifications: boolean }>>`
+      const rows = await this.db.$queryRaw<Array<{ announcements: boolean; notifications: boolean; wxpusher: boolean }>>`
         SELECT
           to_regclass('public.announcements') IS NOT NULL AS announcements,
-          to_regclass('public.user_notifications') IS NOT NULL AS notifications
+          to_regclass('public.user_notifications') IS NOT NULL AS notifications,
+          (to_regclass('public.user_wxpusher_bindings') IS NOT NULL AND to_regclass('public.wxpusher_bind_tokens') IS NOT NULL) AS wxpusher
       `
       this.announcementsReady = rows[0]?.announcements !== false
       this.notificationsReady = rows[0]?.notifications !== false
+      this.wxpusherReady = rows[0]?.wxpusher !== false
       if (!this.announcementsReady) {
         // eslint-disable-next-line no-console
         console.error(
@@ -52,6 +55,13 @@ export class SchemaStateService implements OnApplicationBootstrap {
         // eslint-disable-next-line no-console
         console.error(
           '[schema] 数据库缺少 user_notifications 表：个人通知将降级为空列表。' +
+            '请执行 `pnpm db:migrate:deploy` 后重启 API。',
+        )
+      }
+      if (!this.wxpusherReady) {
+        // eslint-disable-next-line no-console
+        console.error(
+          '[schema] 数据库缺少 WxPusher 绑定表：微信推送绑定与异步下发将降级关闭。' +
             '请执行 `pnpm db:migrate:deploy` 后重启 API。',
         )
       }

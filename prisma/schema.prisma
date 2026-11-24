@@ -70,6 +70,8 @@ model User {
   teamJoinRequests     TeamJoinRequest[]
   evaluationRows       EvaluationRow[]
   notifications        UserNotification[]
+  wxpusherBinding      UserWxPusherBinding?
+  wxpusherBindTokens   WxPusherBindToken[]
 
   @@index([studentNo])
   @@map("users")
@@ -1939,11 +1941,11 @@ model AnnouncementRead {
   @@map("announcement_reads")
 }
 
-/// 个人事件通知：审批结果、申诉回复、徽标授予、训练室预约与平台核验等定向触达
+/// 个人事件通知：审批结果、申诉回复、徽标授予、积分变动、训练室预约与平台核验等定向触达
 model UserNotification {
   id        String    @id @db.Uuid
   userId    String    @map("user_id") @db.Uuid
-  kind      String    // leave_decision | remote_decision | appeal_decision | claim_decision | room_booking | badge_awarded | platform_review | general
+  kind      String    // leave_decision | remote_decision | appeal_decision | claim_decision | room_booking | badge_awarded | platform_review | points_change | general
   title     String
   body      String    @db.Text
   link      String?
@@ -1955,4 +1957,42 @@ model UserNotification {
   @@index([userId, createdAt])
   @@index([userId, readAt])
   @@map("user_notifications")
+}
+
+/// WxPusher 微信推送绑定：记录社员的 WxPusher UID 与分项订阅偏好
+model UserWxPusherBinding {
+  id                  String    @id @db.Uuid
+  userId              String    @unique @map("user_id") @db.Uuid
+  wxpusherUid         String    @unique @map("wxpusher_uid") @db.VarChar(64)
+  enabled             Boolean   @default(true)
+  notifyPoints        Boolean   @default(true) @map("notify_points")
+  notifyApprovals     Boolean   @default(true) @map("notify_approvals")
+  notifyActivities    Boolean   @default(true) @map("notify_activities")
+  notifyCompetitions  Boolean   @default(true) @map("notify_competitions")
+  notifyAnnouncements Boolean   @default(true) @map("notify_announcements")
+  boundAt             DateTime  @default(now()) @db.Timestamptz(3) @map("bound_at")
+  lastPushedAt        DateTime? @db.Timestamptz(3) @map("last_pushed_at")
+  lastError           String?   @map("last_error") @db.Text
+  updatedAt           DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([enabled])
+  @@map("user_wxpusher_bindings")
+}
+
+/// WxPusher 扫码绑定一次性票据：extra 仅承载短期随机令牌（<=64 字符），防伪造绑定
+model WxPusherBindToken {
+  id         String    @id @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  token      String    @unique @db.VarChar(64)
+  expiresAt  DateTime  @db.Timestamptz(3) @map("expires_at")
+  consumedAt DateTime? @db.Timestamptz(3) @map("consumed_at")
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+  @@map("wxpusher_bind_tokens")
 }

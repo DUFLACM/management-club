@@ -1,8 +1,9 @@
-import { Inject, Injectable } from '@nestjs/common'
+import { Inject, Injectable, Optional } from '@nestjs/common'
 import { z } from 'zod'
 import { Prisma } from '@acm/db'
 import { PrismaService, SchemaStateService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
 import type { SessionActor } from '../auth/session.service.js'
 import { newId } from '../../common/utils.js'
 import { DomainError } from '../../common/domain-error.js'
@@ -39,6 +40,7 @@ export class AnnouncementsService {
     @Inject(PrismaService) private readonly db: PrismaService,
     @Inject(AuditService) private readonly audit: AuditService,
     @Inject(SchemaStateService) private readonly schema: SchemaStateService,
+    @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
   /** 迁移未执行时直接给出可操作提示，不反复查询不存在的表 */
@@ -89,6 +91,15 @@ export class AnnouncementsService {
       actorPrincipalId: actor.principalId, action: publish ? 'announcements.publish' : 'announcements.create',
       resourceType: 'announcement', resourceId: row.id, summary: `${publish ? '发布' : '新建'}公告「${input.title}」`,
     })
+    if (publish) {
+      await this.notifications?.broadcastExternal({
+        category: 'announcements',
+        title: input.title,
+        body: input.content.slice(0, 600),
+        link: '/app',
+        dedupeKey: `wxpusher:announcement:publish:${row.id}`,
+      })
+    }
     return row
   }
 
@@ -121,6 +132,13 @@ export class AnnouncementsService {
     await this.audit.log({
       actorPrincipalId: actor.principalId, action: 'announcements.publish', resourceType: 'announcement', resourceId: id,
       summary: `发布公告「${row.title}」`,
+    })
+    await this.notifications?.broadcastExternal({
+      category: 'announcements',
+      title: row.title,
+      body: row.content.slice(0, 600),
+      link: '/app',
+      dedupeKey: `wxpusher:announcement:publish:${id}`,
     })
     return { id }
   }
@@ -205,7 +223,7 @@ export class AnnouncementsService {
 
   private async require(id: string) {
     this.ensureReady()
-    const row = await this.db.announcement.findUnique({ where: { id }, select: { id: true, title: true, status: true } })
+    const row = await this.db.announcement.findUnique({ where: { id }, select: { id: true, title: true, content: true, status: true } })
     if (!row) throw new AnnouncementsError('公告不存在', 'NOT_FOUND')
     return row
   }
