@@ -82,6 +82,29 @@ interface MemberDetailDto {
     createdAt: string;
     activity: { title: string; startAt: string } | null;
   }>;
+  competitionRegistrations?: Array<{
+    id: string;
+    status: string;
+    resultScore: string | null;
+    reviewNote: string | null;
+    registeredAt: string;
+    event: { id: string; title: string; category: string; startAt: string; status: string };
+  }>;
+  teamMemberships?: Array<{
+    id: string;
+    team: {
+      id: string;
+      name: string;
+      entries: Array<{
+        id: string;
+        status: string;
+        resultScore: string | null;
+        reviewNote: string | null;
+        registeredAt: string;
+        event: { id: string; title: string; category: string; startAt: string; status: string };
+      }>;
+    };
+  }>;
 }
 
 interface EvaluationDto {
@@ -950,6 +973,58 @@ function MemberDetail({
                 ))}
               </ul>
             )}
+          </section>
+
+          <section className="flex flex-col gap-2">
+            <h3 className="text-sm font-semibold text-foreground">正式赛事记录</h3>
+            {(() => {
+              const formalItems = [
+                ...(query.data.competitionRegistrations ?? []).map((reg) => ({
+                  key: `ind-${reg.id}`,
+                  title: reg.event.title,
+                  category: reg.event.category,
+                  teamName: null as string | null,
+                  reviewNote: reg.reviewNote,
+                  resultScore: reg.resultScore,
+                  startAt: reg.event.startAt,
+                })),
+                ...(query.data.teamMemberships ?? []).flatMap((tm) =>
+                  tm.team.entries.map((entry) => ({
+                    key: `team-${entry.id}`,
+                    title: entry.event.title,
+                    category: entry.event.category,
+                    teamName: tm.team.name,
+                    reviewNote: entry.reviewNote,
+                    resultScore: entry.resultScore,
+                    startAt: entry.event.startAt,
+                  })),
+                ),
+              ].sort((a, b) => b.startAt.localeCompare(a.startAt));
+              if (formalItems.length === 0) {
+                return <p className="text-sm text-muted-foreground">暂无正式赛事记录。</p>;
+              }
+              return (
+                <ul className="flex flex-col divide-y divide-border">
+                  {formalItems.map((item) => (
+                    <li key={item.key} className="flex flex-col gap-0.5 py-2 text-sm">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="min-w-0 truncate font-medium text-foreground">
+                          {item.category}类 · {item.title}
+                        </span>
+                        <span className="shrink-0 text-xs font-medium text-foreground tabular-nums">
+                          {item.resultScore != null ? `+${Number(item.resultScore)} 分` : '已登记'}
+                        </span>
+                      </div>
+                      <span className="text-xs text-muted-foreground tabular-nums">
+                        {formatDateTime(item.startAt)}
+                        {item.teamName ? ` · 队伍：${item.teamName}` : ''}
+                        {item.reviewNote ? ` · ${item.reviewNote}` : ''}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              );
+            })()}
           </section>
 
           {isApplicant && (

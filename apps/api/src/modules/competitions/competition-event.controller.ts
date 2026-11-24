@@ -20,6 +20,12 @@ export class CompetitionMeController {
     return ok(await this.events.listOpen(user?.userId ?? null))
   }
 
+  /** 我的全部正式赛事记录（含开放中、已结算与导入归档的个人/团队赛） */
+  @Get('my-competitions')
+  async myCompetitions(@CurrentUser() user: { userId: string }) {
+    return ok(await this.events.myCompetitions(user.userId))
+  }
+
   @Get('competition-events/:id')
   async detail(@CurrentUser() user: { userId: string } | null, @Param('id', ParseUUIDPipe) id: string) {
     return ok(await this.events.detailForUser(user?.userId ?? null, id))

@@ -718,6 +718,14 @@ function LedgerDetailDrawer({
     (typeof meta.teamName === 'string' && meta.teamName.trim()) ||
     (typeof detail.teamName === 'string' && detail.teamName.trim()) ||
     null;
+  const awardText =
+    (typeof meta.awardText === 'string' && meta.awardText.trim()) ||
+    (typeof detail.awardText === 'string' && detail.awardText.trim()) ||
+    null;
+  const rankText =
+    (typeof meta.rankText === 'string' && meta.rankText.trim()) ||
+    (typeof detail.rankText === 'string' && detail.rankText.trim()) ||
+    null;
   const venue = typeof meta.venue === 'string' && meta.venue.trim() ? meta.venue.trim() : null;
   const activityType = typeof meta.activityType === 'string' ? meta.activityType : null;
   const platform =
@@ -817,6 +825,18 @@ function LedgerDetailDrawer({
             <>
               <dt className="text-muted-foreground">所属队伍</dt>
               <dd className="text-foreground">{teamName}</dd>
+            </>
+          )}
+          {awardText && (
+            <>
+              <dt className="text-muted-foreground">奖项 / 成绩</dt>
+              <dd className="text-foreground">{awardText}</dd>
+            </>
+          )}
+          {rankText && (
+            <>
+              <dt className="text-muted-foreground">比赛排名</dt>
+              <dd className="text-foreground tabular-nums">{rankText}</dd>
             </>
           )}
           <dt className="text-muted-foreground">规则版本</dt>

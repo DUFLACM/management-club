@@ -72,10 +72,6 @@ export function loadEnv(): AppEnv {
     // 生产强制禁用模拟认证：宁可启动失败也不静默放行
     throw new Error('AUTH_DEV_SIMULATOR must be false in production')
   }
-  if (cached.NODE_ENV === 'production' && cached.EVALUATION_TEST_MODE) {
-    // 生产禁用综评测试口：建议分值一旦被当成正式结果上报，影响真实学生综评
-    throw new Error('EVALUATION_TEST_MODE must be false in production')
-  }
   return cached
 }
 
@@ -84,7 +80,7 @@ export function isDevSimulatorEnabled(env: AppEnv): boolean {
   return env.AUTH_DEV_SIMULATOR && env.NODE_ENV !== 'production'
 }
 
-/** 综评测试口：允许学期未结束就生成批次（仅非生产；产物标记 isTest） */
-export function isEvaluationTestModeEnabled(env: AppEnv): boolean {
-  return env.EVALUATION_TEST_MODE && env.NODE_ENV !== 'production'
+/** 综评折算现已全面开放实时生成与导出，保留此辅助函数以兼容旧调用 */
+export function isEvaluationTestModeEnabled(_env: AppEnv): boolean {
+  return false
 }

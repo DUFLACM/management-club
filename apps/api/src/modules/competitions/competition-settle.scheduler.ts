@@ -22,7 +22,7 @@ export class CompetitionSettleScheduler implements OnModuleInit, OnModuleDestroy
         const candidates = await this.db.competitionEvent.findMany({
           where: {
             scoringMode: 'platform_auto',
-            status: { not: 'settled' },
+            status: { notIn: ['settled', 'archived'] },
             platform: { not: null },
             platformContestId: { not: null },
             endAt: { gt: new Date(Date.now() - 7 * 24 * 3600_000), lt: new Date(Date.now() - 5 * 60_000) },

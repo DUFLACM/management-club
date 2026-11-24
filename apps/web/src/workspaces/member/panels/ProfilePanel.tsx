@@ -19,7 +19,8 @@ import { attendanceResultBadge, formatDateTime, formatStartEnd, membershipLabel,
 import {
   competitionsApi,
   entryStatusLabel,
-  type MemberCompetitionEventDto,
+  eventStatusLabel,
+  type MyCompetitionRecordDto,
   type TeamDto,
 } from '@/lib/competitions';
 import { PanelHeader } from '@/components/club/PanelHeader';
@@ -459,6 +460,7 @@ function ResultsSection({ principalId, targetId }: { principalId: string; target
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">全部平台</SelectItem>
+              <SelectItem value="formal">正式赛</SelectItem>
               <SelectItem value="nowcoder">牛客</SelectItem>
               <SelectItem value="codeforces">Codeforces</SelectItem>
               <SelectItem value="atcoder">AtCoder</SelectItem>
@@ -1055,14 +1057,14 @@ function EditSection({ principalId, profile }: { principalId: string; profile: M
 }
 
 /**
- * 正式赛事：我报名中的赛事与常驻小队。
+ * 正式赛事：我的全部正式赛参赛/归档记录与常驻小队。
  * 仅本人可见（数据来自 /me 端点）；详细报名操作在「竞赛 → 正式赛报名」。
  */
 function CompetitionsSection({ principalId }: { principalId: string }) {
-  const eventsQuery = usePrivateQuery<MemberCompetitionEventDto[], ApiError>(
+  const recordsQuery = usePrivateQuery<MyCompetitionRecordDto[], ApiError>(
     principalId,
-    ['me', 'competition-events'],
-    () => competitionsApi.listOpenEvents(),
+    ['me', 'my-competitions'],
+    () => competitionsApi.myCompetitions(),
   );
 
   const teamsQuery = usePrivateQuery<TeamDto[], ApiError>(
@@ -1071,50 +1073,65 @@ function CompetitionsSection({ principalId }: { principalId: string }) {
     () => competitionsApi.myTeams(),
   );
 
-  const myEvents = (eventsQuery.data ?? []).filter((event) => event.myStatus != null);
+  const myRecords = recordsQuery.data ?? [];
 
   return (
     <div className="flex flex-col gap-4">
       <Card>
         <CardContent className="flex flex-col gap-3 p-5">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-foreground">我的赛事报名</h3>
+            <h3 className="text-sm font-semibold text-foreground">我的正式赛事记录</h3>
             <Button size="sm" variant="outline" asChild>
-              <Link to="/app?section=contests&tab=entry">前往报名</Link>
+              <Link to="/app?section=contests&tab=entry">前往正式赛</Link>
             </Button>
           </div>
-          {eventsQuery.isPending ? (
+          {recordsQuery.isPending ? (
             <Skeleton className="h-16 rounded-xl" />
-          ) : eventsQuery.isError ? (
-            <p className="text-sm text-muted-foreground">{eventsQuery.error.message}</p>
-          ) : myEvents.length === 0 ? (
+          ) : recordsQuery.isError ? (
+            <p className="text-sm text-muted-foreground">{recordsQuery.error.message}</p>
+          ) : myRecords.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              当前没有报名中的正式赛事；开放报名的赛事在「竞赛 → 正式赛报名」查看。
+              暂无正式赛事报名或归档记录；开放报名的赛事在「竞赛 → 正式赛报名」查看。
             </p>
           ) : (
             <ul className="flex flex-col divide-y divide-border">
-              {myEvents.map((event) => (
-                <li key={event.id} className="flex flex-wrap items-center gap-2 py-2">
-                  <Badge variant={event.category === 'A' ? 'info' : 'success'}>
-                    {event.category} 类
-                  </Badge>
-                  <span className="min-w-0 flex-1 truncate text-sm text-foreground">
-                    {event.title}
-                  </span>
-                  <span className="text-xs text-muted-foreground tabular-nums">
-                    {formatDateTime(event.startAt)}
-                  </span>
-                  <Badge
-                    variant={
-                      event.myStatus === 'rejected'
-                        ? 'destructive'
-                        : event.myStatus === 'approved' || event.myStatus === 'confirmed'
-                          ? 'success'
-                          : 'warning'
-                    }
-                  >
-                    {entryStatusLabel(event.myStatus)}
-                  </Badge>
+              {myRecords.map((record) => (
+                <li key={`${record.kind}-${record.id}`} className="flex flex-col gap-1 py-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={record.event.category === 'A' ? 'info' : 'success'}>
+                      {record.event.category} 类
+                    </Badge>
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
+                      {record.event.title}
+                    </span>
+                    {record.teamName && (
+                      <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                        {record.teamName}
+                      </span>
+                    )}
+                    <Badge
+                      variant={
+                        record.status === 'rejected'
+                          ? 'destructive'
+                          : record.status === 'approved' || record.status === 'confirmed'
+                            ? 'success'
+                            : 'warning'
+                      }
+                    >
+                      {record.event.status === 'archived' ? eventStatusLabel(record.event.status) : entryStatusLabel(record.status)}
+                    </Badge>
+                    {record.resultScore != null && (
+                      <span className="text-sm font-semibold text-foreground tabular-nums">
+                        +{Number(record.resultScore)} 分
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
+                    <span>{formatDateTime(record.event.startAt)}</span>
+                    {record.awardText && <span className="text-foreground">{record.awardText}</span>}
+                    {record.rankText && <span>排名 {record.rankText}</span>}
+                    {!record.awardText && record.reviewNote && <span>{record.reviewNote}</span>}
+                  </div>
                 </li>
               ))}
             </ul>

@@ -71,6 +71,7 @@ const STATUS_FILTERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'shortlisted', label: '已出资格名单' },
   { value: 'team_forming', label: '组队中' },
   { value: 'settled', label: '已结算' },
+  { value: 'archived', label: '已归档' },
 ];
 
 /** datetime-local 值 → ISO；空值返回 undefined */
@@ -191,7 +192,7 @@ function ContestsBody({ principalId }: { principalId: string }) {
                             ? `${event._count.teamEntries} 队`
                             : `${event._count.registrations} 人`}
                         </span>
-                        <Badge variant={event.status === 'settled' ? 'success' : 'neutral'}>
+                        <Badge variant={event.status === 'settled' || event.status === 'archived' ? 'success' : 'neutral'}>
                           {eventStatusLabel(event.status)}
                         </Badge>
                       </span>
@@ -670,7 +671,7 @@ function EventDetail({
             <h2 className="flex flex-wrap items-center gap-2 text-sm font-semibold text-foreground">
               {event.title}
               <Badge variant={categoryBadge(event.category)}>{event.category} 类</Badge>
-              <Badge variant={event.status === 'settled' ? 'success' : 'neutral'}>
+              <Badge variant={event.status === 'settled' || event.status === 'archived' ? 'success' : 'neutral'}>
                 {eventStatusLabel(event.status)}
               </Badge>
             </h2>

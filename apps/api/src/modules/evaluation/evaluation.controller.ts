@@ -23,11 +23,37 @@ const overrideSchema = z.object({
 export class EvaluationAdminController {
   constructor(private readonly evaluation: EvaluationService) {}
 
-  /** 学期列表：ended 表示已达折算时点，canGenerate 含测试口放行 */
+  /** 学期列表：取消时间限制，所有学期均随时可实时生成与导出 */
   @Get('semesters')
   @RequireAction('evaluation.manage')
   async semesters() {
     return ok(await this.evaluation.semesters())
+  }
+
+  /** 按学期实时导出综评表（含积分）；UTF-8 BOM 方便 Excel 直接打开 */
+  @Get('semesters/:semesterId/export')
+  @RequireAction('evaluation.manage')
+  async exportRealtimeCsv(
+    @Param('semesterId', ParseUUIDPipe) semesterId: string,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
+    const { csv, filename } = await this.evaluation.exportRealtimeCsv(semesterId)
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="evaluation-live-${semesterId}.csv"; filename*=UTF-8''${encodeURIComponent(filename)}`)
+    return new StreamableFile(Buffer.from(`\uFEFF${csv}`, 'utf-8'))
+  }
+
+  /** 按学期实时导出全员积分汇总表 */
+  @Get('semesters/:semesterId/points-export')
+  @RequireAction('evaluation.manage')
+  async exportRealtimePointsCsv(
+    @Param('semesterId', ParseUUIDPipe) semesterId: string,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
+    const { csv, filename } = await this.evaluation.exportRealtimePointsCsv(semesterId)
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="points-live-${semesterId}.csv"; filename*=UTF-8''${encodeURIComponent(filename)}`)
+    return new StreamableFile(Buffer.from(`\uFEFF${csv}`, 'utf-8'))
   }
 
   @Get('batches')
@@ -69,6 +95,13 @@ export class EvaluationAdminController {
     return ok(await this.evaluation.recompute(actor, id))
   }
 
+  /** 用最新实时积分数据刷新快照（保留手工覆盖，永不锁定） */
+  @Post('batches/:id/refresh')
+  @RequireAction('evaluation.manage')
+  async refresh(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
+    return ok(await this.evaluation.refreshBatch(actor, id))
+  }
+
   @Post('batches/:id/publish')
   @RequireAction('evaluation.manage')
   async publish(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string) {
@@ -81,13 +114,23 @@ export class EvaluationAdminController {
     return ok(await this.evaluation.deleteBatch(actor, id))
   }
 
-  /** 导出 学号/姓名/加分；BOM 前置以便 Excel 正确识别 UTF-8 */
+  /** 导出综评表（含积分与加分）；BOM 前置以便 Excel 正确识别 UTF-8 */
   @Get('batches/:id/export')
   @RequireAction('evaluation.manage')
   async exportCsv(@Param('id', ParseUUIDPipe) id: string, @Res({ passthrough: true }) res: Response): Promise<StreamableFile> {
     const { csv, filename } = await this.evaluation.exportCsv(id)
     res.setHeader('Content-Type', 'text/csv; charset=utf-8')
     res.setHeader('Content-Disposition', `attachment; filename="evaluation-${id}.csv"; filename*=UTF-8''${encodeURIComponent(filename)}`)
-    return new StreamableFile(Buffer.from(`﻿${csv}`, 'utf-8'))
+    return new StreamableFile(Buffer.from(`\uFEFF${csv}`, 'utf-8'))
+  }
+
+  /** 导出全员积分明细表 */
+  @Get('batches/:id/points-export')
+  @RequireAction('evaluation.manage')
+  async exportPointsCsv(@Param('id', ParseUUIDPipe) id: string, @Res({ passthrough: true }) res: Response): Promise<StreamableFile> {
+    const { csv, filename } = await this.evaluation.exportPointsCsv(id)
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="evaluation-points-${id}.csv"; filename*=UTF-8''${encodeURIComponent(filename)}`)
+    return new StreamableFile(Buffer.from(`\uFEFF${csv}`, 'utf-8'))
   }
 }

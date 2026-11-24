@@ -30,6 +30,7 @@ import {
   competitionsApi,
   contestTierLabel,
   entryStatusLabel,
+  eventStatusLabel,
   LAMBDA_LABELS,
   type CompetitionEventDetailDto,
   type CompetitionMaterialDto,
@@ -37,6 +38,7 @@ import {
   type InvitableMemberDto,
   type MemberCompetitionEventDto,
   type MemberShortlistBoardDto,
+  type MyCompetitionRecordDto,
   type MyJoinRequestDto,
   type TeamDto,
   type TeamInviteDto,
@@ -93,17 +95,19 @@ interface CompetitionResultDto {
   verifiedBinding: boolean;
 }
 
-/** 平台徽标配色：牛客橙 / CF 蓝 / AtCoder 中性 / VJudge 紫 / 校内 OJ 绿 */
+/** 平台徽标配色：牛客橙 / CF 蓝 / AtCoder 中性 / VJudge 紫 / 校内 OJ 绿 / 正式赛金 */
 const PLATFORM_CHIP: Record<string, string> = {
   nowcoder: 'bg-warning-subtle text-warning-foreground',
   codeforces: 'bg-info-subtle text-info-foreground',
   atcoder: 'bg-muted text-foreground',
   vjudge: 'bg-primary/10 text-primary',
   hydro: 'bg-success-subtle text-success-foreground',
+  formal: 'bg-amber-500/15 text-amber-700 dark:text-amber-400',
 };
 
 const PLATFORM_FILTERS: ReadonlyArray<{ value: string; label: string }> = [
   { value: 'all', label: '全部平台' },
+  { value: 'formal', label: '正式赛' },
   { value: 'nowcoder', label: '牛客' },
   { value: 'codeforces', label: 'Codeforces' },
   { value: 'atcoder', label: 'AtCoder' },
@@ -683,6 +687,16 @@ function FormalEntrySection({ principalId }: { principalId: string }) {
     () => competitionsApi.listOpenEvents(),
   );
 
+  const historyQuery = usePrivateQuery<MyCompetitionRecordDto[], ApiError>(
+    principalId,
+    ['me', 'my-competitions'],
+    () => competitionsApi.myCompetitions(),
+  );
+
+  const archivedRecords = (historyQuery.data ?? []).filter(
+    (record) => record.event.status === 'settled' || record.event.status === 'archived' || record.event.status === 'closed',
+  );
+
   return (
     <div className="flex flex-col gap-4">
       <Alert>
@@ -756,6 +770,47 @@ function FormalEntrySection({ principalId }: { principalId: string }) {
           </ul>
         )}
       </QueryBoundary>
+
+      {archivedRecords.length > 0 && (
+        <Card>
+          <CardContent className="flex flex-col gap-3 p-5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold text-foreground">我的正式赛参赛与归档记录</h3>
+              <span className="text-xs text-muted-foreground tabular-nums">共 {archivedRecords.length} 场</span>
+            </div>
+            <ul className="flex flex-col divide-y divide-border">
+              {archivedRecords.map((record) => (
+                <li key={`${record.kind}-${record.id}`} className="flex flex-col gap-1 py-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={record.event.category === 'A' ? 'info' : 'success'}>
+                      {record.event.category} 类
+                    </Badge>
+                    <span className="text-sm font-medium text-foreground">{record.event.title}</span>
+                    {record.teamName && (
+                      <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                        队伍：{record.teamName}
+                      </span>
+                    )}
+                    <Badge variant="neutral">{eventStatusLabel(record.event.status)}</Badge>
+                    <span className="ml-auto text-sm font-semibold text-foreground tabular-nums">
+                      {record.resultScore != null ? `+${Number(record.resultScore)} 分` : '已登记名单'}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground tabular-nums">
+                    <span>{formatDateTime(record.event.startAt)}</span>
+                    {record.awardText && <span className="text-foreground">{record.awardText}</span>}
+                    {record.rankText && <span>排名 {record.rankText}</span>}
+                    {record.teammates.length > 0 && (
+                      <span>队员：{record.teammates.map((m) => m.name).join('、')}</span>
+                    )}
+                    {!record.awardText && record.reviewNote && <span>{record.reviewNote}</span>}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

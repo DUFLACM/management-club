@@ -412,6 +412,7 @@ export class MembersService {
             platformAccounts: true, badgeAwards: true, lectureRequests: true, uploadedMaterials: true,
             leaveRequests: true, remotePermissions: true, restrictions: true,
             membershipTerms: true, invitationRedemptions: true,
+            competitionRegistrations: true, competitionShortlistRows: true,
             teamMemberships: true, teamInvitesReceived: true, teamJoinRequests: true,
           },
         },

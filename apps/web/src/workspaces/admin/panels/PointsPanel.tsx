@@ -18,6 +18,7 @@ import {
   LoaderCircleIcon,
   RotateCcwIcon,
   SearchIcon,
+  TrophyIcon,
 } from 'lucide-react';
 
 import { api, ApiError } from '@/lib/api';
@@ -52,6 +53,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { HistoryImportDialog } from './HistoryImportDialog';
+import { CompetitionImportDialog } from './CompetitionImportDialog';
 
 interface ReviewCaseDto {
   id: string;
@@ -229,6 +231,7 @@ function PointsBody({ principalId }: { principalId: string }) {
   const [batchOpen, setBatchOpen] = useState(false);
   const [batchImportOpen, setBatchImportOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [competitionImportOpen, setCompetitionImportOpen] = useState(false);
   const [disclosureOpen, setDisclosureOpen] = useState(false);
   const queryClient = useQueryClient();
   const [queueNotice, setQueueNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
@@ -321,6 +324,10 @@ function PointsBody({ principalId }: { principalId: string }) {
             <Button variant="outline" onClick={() => setBatchImportOpen(true)}>
               <ClipboardListIcon aria-hidden="true" />
               批量加分
+            </Button>
+            <Button variant="outline" onClick={() => setCompetitionImportOpen(true)}>
+              <TrophyIcon aria-hidden="true" />
+              正式赛名单导入
             </Button>
             <Button variant="outline" onClick={() => setHistoryOpen(true)}>
               <HistoryIcon aria-hidden="true" />
@@ -451,6 +458,7 @@ function PointsBody({ principalId }: { principalId: string }) {
       <LedgerEntryDialog open={entryOpen} onOpenChange={setEntryOpen} />
       <BatchLedgerDialog open={batchImportOpen} onOpenChange={setBatchImportOpen} />
       <HistoryImportDialog open={historyOpen} onOpenChange={setHistoryOpen} />
+      <CompetitionImportDialog open={competitionImportOpen} onOpenChange={setCompetitionImportOpen} />
       <MonthlyBatchDialog open={batchOpen} onOpenChange={setBatchOpen} />
       <DisclosureDialog open={disclosureOpen} onOpenChange={setDisclosureOpen} />
     </div>

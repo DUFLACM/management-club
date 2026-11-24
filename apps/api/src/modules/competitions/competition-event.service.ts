@@ -169,6 +169,120 @@ export class CompetitionEventService {
     return events.map((e) => ({ ...e, myStatus: byEvent.get(e.id) ?? null }))
   }
 
+  /** 我的全部正式赛事记录（含开放中、已结算与历史/导入归档的个人赛与团队赛） */
+  async myCompetitions(userId: string) {
+    const [regs, teamEntries] = await Promise.all([
+      this.db.competitionRegistration.findMany({
+        where: { userId },
+        include: {
+          event: true,
+          platformAccount: { select: { id: true, platform: true, displayHandle: true, status: true } },
+        },
+        orderBy: { registeredAt: 'desc' },
+        take: 100,
+      }),
+      this.db.teamCompetitionEntry.findMany({
+        where: { team: { members: { some: { userId, status: 'active' } } } },
+        include: {
+          event: true,
+          team: {
+            include: {
+              members: {
+                where: { status: 'active' },
+                include: { user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } } } } },
+              },
+            },
+          },
+        },
+        orderBy: { registeredAt: 'desc' },
+        take: 100,
+      }),
+    ])
+
+    const items = [
+      ...regs.map((r) => {
+        const detail = (r.resultDetail && typeof r.resultDetail === 'object' && !Array.isArray(r.resultDetail)
+          ? r.resultDetail
+          : {}) as Record<string, unknown>
+        return {
+          id: r.id,
+          kind: 'individual' as const,
+          eventId: r.eventId,
+          status: r.status,
+          resultScore: r.resultScore ? r.resultScore.toString() : null,
+          awardText: typeof detail.awardText === 'string' ? detail.awardText : null,
+          rankText: typeof detail.rankText === 'string' ? detail.rankText : null,
+          teamName: typeof detail.teamName === 'string' ? detail.teamName : null,
+          reviewNote: r.reviewNote,
+          note: r.note,
+          registeredAt: r.registeredAt.toISOString(),
+          event: {
+            id: r.event.id,
+            title: r.event.title,
+            category: r.event.category,
+            teamSize: r.event.teamSize,
+            scoringMode: r.event.scoringMode,
+            contestTier: r.event.contestTier,
+            status: r.event.status,
+            startAt: r.event.startAt.toISOString(),
+            endAt: r.event.endAt.toISOString(),
+          },
+          teammates: [] as Array<{ userId: string; name: string }>,
+        }
+      }),
+      ...teamEntries.map((entry) => {
+        const detail = (entry.resultDetail && typeof entry.resultDetail === 'object' && !Array.isArray(entry.resultDetail)
+          ? entry.resultDetail
+          : {}) as Record<string, unknown>
+        const memberResults = Array.isArray(detail.memberResults)
+          ? (detail.memberResults as Array<Record<string, unknown>>)
+          : []
+        const myResult = memberResults.find((m) => m.userId === userId)
+        const myScore =
+          myResult && typeof myResult.points === 'string' && Number(myResult.points) !== 0
+            ? Number(myResult.points).toFixed(2)
+            : entry.resultScore
+              ? entry.resultScore.toString()
+              : null
+        return {
+          id: entry.id,
+          kind: 'team' as const,
+          eventId: entry.eventId,
+          status: entry.status,
+          resultScore: myScore,
+          awardText:
+            (myResult && typeof myResult.awardText === 'string' ? myResult.awardText : null) ??
+            (typeof detail.awardText === 'string' ? detail.awardText : null),
+          rankText:
+            (myResult && typeof myResult.rankText === 'string' ? myResult.rankText : null) ??
+            (typeof detail.rankText === 'string' ? detail.rankText : null),
+          teamName: entry.team.name,
+          reviewNote: entry.reviewNote,
+          note: myResult && typeof myResult.note === 'string' ? myResult.note : null,
+          registeredAt: entry.registeredAt.toISOString(),
+          event: {
+            id: entry.event.id,
+            title: entry.event.title,
+            category: entry.event.category,
+            teamSize: entry.event.teamSize,
+            scoringMode: entry.event.scoringMode,
+            contestTier: entry.event.contestTier,
+            status: entry.event.status,
+            startAt: entry.event.startAt.toISOString(),
+            endAt: entry.event.endAt.toISOString(),
+          },
+          teammates: entry.team.members.map((m) => ({
+            userId: m.userId,
+            name: memberName(m.user),
+          })),
+        }
+      }),
+    ]
+
+    items.sort((a, b) => b.event.startAt.localeCompare(a.event.startAt) || b.registeredAt.localeCompare(a.registeredAt))
+    return items
+  }
+
   /** 报名详情：赛事信息 + 我的报名/队伍状态 + 结算后积分 + 驳回原因 */
   async detailForUser(userId: string | null, eventId: string) {
     const event = await this.db.competitionEvent.findUnique({ where: { id: eventId } })
@@ -611,20 +725,48 @@ export class CompetitionEventService {
   }
 
   async exportRosterCsv(eventId: string): Promise<string> {
+    const csvCell = (value: unknown) => {
+      const text = String(value ?? '')
+      return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
+    }
     const event = await this.db.competitionEvent.findUniqueOrThrow({ where: { id: eventId } })
-    const header = '学号,姓名,平台账号,状态,积分\n'
+    const header = '学号,姓名,平台账号/队名,状态,成绩/备注,积分\n'
     if (event.teamSize) {
       const entries = await this.db.teamCompetitionEntry.findMany({
         where: { eventId },
         include: { team: { include: { members: { where: { status: 'active' }, include: { user: true } } } } },
       })
-      const lines = entries.flatMap((entry) =>
-        entry.team.members.map((m) => [m.user.studentNo, m.user.verifiedRealName, entry.team.name, entry.status, entry.resultScore ?? ''].join(',')),
-      )
+      const lines = entries.flatMap((entry) => {
+        const detail = (entry.resultDetail && typeof entry.resultDetail === 'object' && !Array.isArray(entry.resultDetail)
+          ? entry.resultDetail
+          : {}) as Record<string, unknown>
+        const memberResults = Array.isArray(detail.memberResults)
+          ? (detail.memberResults as Array<Record<string, unknown>>)
+          : []
+        return entry.team.members.map((m) => {
+          const mr = memberResults.find((item) => item.userId === m.userId)
+          const note =
+            [mr?.awardText, mr?.rankText ? `排名 ${mr.rankText}` : null, mr?.note].filter(Boolean).join(' · ') ||
+            entry.reviewNote ||
+            ''
+          const score =
+            mr && typeof mr.points === 'string' && Number(mr.points) !== 0
+              ? Number(mr.points).toFixed(2)
+              : (entry.resultScore ?? '')
+          return [m.user.studentNo, m.user.verifiedRealName, entry.team.name, entry.status, note, score].map(csvCell).join(',')
+        })
+      })
       return header + lines.join('\n')
     }
     const regs = await this.db.competitionRegistration.findMany({ where: { eventId }, include: { user: true, platformAccount: true } })
-    const lines = regs.map((r) => [r.user.studentNo, r.user.verifiedRealName, r.platformAccount?.displayHandle ?? '', r.status, r.resultScore ?? ''].join(','))
+    const lines = regs.map((r) => [
+      r.user.studentNo,
+      r.user.verifiedRealName,
+      r.platformAccount?.displayHandle ?? '',
+      r.status,
+      r.reviewNote ?? r.note ?? '',
+      r.resultScore ?? '',
+    ].map(csvCell).join(','))
     return header + lines.join('\n')
   }
 }

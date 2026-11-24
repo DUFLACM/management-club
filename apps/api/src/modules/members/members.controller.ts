@@ -94,6 +94,27 @@ export class MembersAdminController {
         platformAccounts: true,
         restrictions: true,
         registrations: { take: 10, orderBy: { createdAt: 'desc' }, include: { activity: { select: { title: true, startAt: true } } } },
+        competitionRegistrations: {
+          take: 20,
+          orderBy: { registeredAt: 'desc' },
+          include: { event: { select: { id: true, title: true, category: true, startAt: true, status: true } } },
+        },
+        teamMemberships: {
+          where: { status: 'active' },
+          include: {
+            team: {
+              select: {
+                id: true,
+                name: true,
+                entries: {
+                  take: 10,
+                  orderBy: { registeredAt: 'desc' },
+                  include: { event: { select: { id: true, title: true, category: true, startAt: true, status: true } } },
+                },
+              },
+            },
+          },
+        },
       },
     })
     return ok(user)

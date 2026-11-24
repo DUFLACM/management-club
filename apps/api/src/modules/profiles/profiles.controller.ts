@@ -65,7 +65,7 @@ export class ProfilesController {
       ...(platform ? { platform } : {}),
       ...((fromAt || toAt) ? { startTime: { ...(fromAt ? { gte: fromAt } : {}), ...(toAt ? { lte: toAt } : {}) } } : {}),
     }
-    const [rows, contestLedger] = await Promise.all([
+    const [rows, contestLedger, formalRegs, formalTeamEntries] = await Promise.all([
       this.db.platformResult.findMany({
         where: {
           platformAccountId: { in: accounts.map((a) => a.id) },
@@ -86,6 +86,30 @@ export class ProfilesController {
         take: 200,
         select: { id: true, sourceKey: true, amount: true, recordedAt: true, detail: true },
       }),
+      !platform || platform === 'formal'
+        ? (this.db.competitionRegistration?.findMany({
+            where: {
+              userId: memberId,
+              status: { in: ['approved', 'confirmed'] },
+              ...((fromAt || toAt) ? { event: { startAt: { ...(fromAt ? { gte: fromAt } : {}), ...(toAt ? { lte: toAt } : {}) } } } : {}),
+            },
+            include: { event: true },
+            orderBy: { registeredAt: 'desc' },
+            take: 100,
+          }) ?? Promise.resolve([]))
+        : Promise.resolve([]),
+      !platform || platform === 'formal'
+        ? (this.db.teamCompetitionEntry?.findMany({
+            where: {
+              status: { in: ['approved', 'confirmed'] },
+              team: { members: { some: { userId: memberId, status: 'active' } } },
+              ...((fromAt || toAt) ? { event: { startAt: { ...(fromAt ? { gte: fromAt } : {}), ...(toAt ? { lte: toAt } : {}) } } } : {}),
+            },
+            include: { event: true, team: true },
+            orderBy: { registeredAt: 'desc' },
+            take: 100,
+          }) ?? Promise.resolve([]))
+        : Promise.resolve([]),
     ])
 
     type ResultItem = {
@@ -175,6 +199,74 @@ export class ProfilesController {
         rankTotal: null,
         status: 'complete',
         verifiedBinding: verifiedPlatforms.has(plat),
+      })
+    }
+
+    // 正式赛事（个人赛与团队赛，含导入归档记录）联动展示在比赛成绩列表
+    const seenFormalEvents = new Set<string>()
+    for (const reg of formalRegs) {
+      if (seenFormalEvents.has(reg.eventId)) continue
+      seenFormalEvents.add(reg.eventId)
+      const d = (reg.resultDetail && typeof reg.resultDetail === 'object' && !Array.isArray(reg.resultDetail)
+        ? reg.resultDetail
+        : {}) as Record<string, unknown>
+      const awardLabel = typeof d.awardText === 'string' && d.awardText.trim() ? d.awardText.trim() : null
+      const rankNum = typeof d.rankText === 'string' && /^\d+$/.test(d.rankText.trim()) ? Number(d.rankText.trim()) : null
+      items.push({
+        cursorKey: `cr:${reg.id}`,
+        platform: 'formal',
+        contestId: reg.eventId,
+        contestName: reg.event.title,
+        startTime: reg.event.startAt.toISOString(),
+        participationType: awardLabel ?? 'OFFICIAL',
+        score: reg.resultScore ? Number(reg.resultScore) : null,
+        fullScore: null,
+        acceptedCount: null,
+        problemCount: null,
+        rank: rankNum,
+        rankTotal: null,
+        status: 'complete',
+        verifiedBinding: true,
+      })
+    }
+    for (const entry of formalTeamEntries) {
+      if (seenFormalEvents.has(entry.eventId)) continue
+      seenFormalEvents.add(entry.eventId)
+      const d = (entry.resultDetail && typeof entry.resultDetail === 'object' && !Array.isArray(entry.resultDetail)
+        ? entry.resultDetail
+        : {}) as Record<string, unknown>
+      const memberResults = Array.isArray(d.memberResults)
+        ? (d.memberResults as Array<Record<string, unknown>>)
+        : []
+      const mr = memberResults.find((m) => m.userId === memberId)
+      const awardLabel =
+        (mr && typeof mr.awardText === 'string' && mr.awardText.trim() ? mr.awardText.trim() : null) ??
+        (typeof d.awardText === 'string' && d.awardText.trim() ? d.awardText.trim() : null)
+      const rawRank =
+        (mr && typeof mr.rankText === 'string' ? mr.rankText.trim() : null) ??
+        (typeof d.rankText === 'string' ? d.rankText.trim() : null)
+      const rankNum = rawRank && /^\d+$/.test(rawRank) ? Number(rawRank) : null
+      const scoreVal =
+        mr && typeof mr.points === 'string' && Number(mr.points) !== 0
+          ? Number(mr.points)
+          : entry.resultScore
+            ? Number(entry.resultScore)
+            : null
+      items.push({
+        cursorKey: `te:${entry.id}`,
+        platform: 'formal',
+        contestId: entry.eventId,
+        contestName: entry.event.title,
+        startTime: entry.event.startAt.toISOString(),
+        participationType: awardLabel ? `${entry.team.name} · ${awardLabel}` : `TEAM · ${entry.team.name}`,
+        score: scoreVal,
+        fullScore: null,
+        acceptedCount: null,
+        problemCount: null,
+        rank: rankNum,
+        rankTotal: null,
+        status: 'complete',
+        verifiedBinding: true,
       })
     }
 

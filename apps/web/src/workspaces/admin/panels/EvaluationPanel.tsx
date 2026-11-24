@@ -1,19 +1,22 @@
 /**
- * 管理端 · 综评导出（evaluation.manage）：按附录三《综合素质评价建议折算表》生成学期建议分。
+ * 管理端 · 综评导出（evaluation.manage）：按附录三《综合素质评价建议折算表》实时生成与导出学期建议分及积分。
+ * - 不限学期结束时间，任何时候均可实时导出或生成可编辑快照，且不锁定；
+ * - 表单内支持「实时导出综评表（含积分）」与「导出成员积分表」；
  * - GET/POST /admin/evaluation/batches、GET /admin/evaluation/batches/:id
  * - POST /admin/evaluation/batches/:id/rows/:rowId（逐人修改，保存后自动重算定档）
- * - GET /admin/evaluation/batches/:id/export（学号/姓名/加分，UTF-8 BOM）
- * 学期结束后才开放生成；未结束学期仅在服务端 EVALUATION_TEST_MODE 下可生成，产物标为测试数据。
+ * - POST /admin/evaluation/batches/:id/refresh（同步最新实时积分）
+ * - GET /admin/evaluation/semesters/:id/export & /points-export（按学期实时直接导出）
+ * - GET /admin/evaluation/batches/:id/export & /points-export（按快照导出综评含积分 / 全员积分明细）
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   DownloadIcon,
-  FlaskConicalIcon,
+  FileSpreadsheetIcon,
   LoaderCircleIcon,
   PlusIcon,
   RefreshCwIcon,
-  SendIcon,
+  RotateCwIcon,
   Trash2Icon,
 } from 'lucide-react';
 
@@ -24,7 +27,7 @@ import { formatDateTime } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
 import { PrincipalGate, QueryBoundary } from '@/components/club/QueryBoundary';
 import { EmptyState } from '@/components/club/EmptyState';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -62,6 +65,12 @@ interface RowDto {
   id: string;
   studentNo: string;
   realName: string;
+  membership?: string;
+  currentE?: number;
+  semesterTotal?: number;
+  activityRaw?: number;
+  contestRaw?: number;
+  serviceRaw?: number;
   pointsAvg: number;
   pointsStd: number;
   contestStd: number;
@@ -132,6 +141,15 @@ function EvaluationBody({ principalId }: { principalId: string }) {
     return data;
   });
 
+  const semesters = semestersQuery.data?.semesters ?? [];
+
+  // 默认选中最新学期，打开页面即可一键实时生成或导出
+  useEffect(() => {
+    if (!semesterId && semesters.length > 0) {
+      setSemesterId(semesters[0]!.id);
+    }
+  }, [semesterId, semesters]);
+
   const generateMutation = useMutation({
     mutationFn: async (id: string) => {
       const { data } = await api.post<{ batchId: string; isTest: boolean; rowCount: number }>(
@@ -148,75 +166,92 @@ function EvaluationBody({ principalId }: { principalId: string }) {
     onError: (error: ApiError) => setActionError(error.message),
   });
 
-  const semesters = semestersQuery.data?.semesters ?? [];
-  const testMode = semestersQuery.data?.testMode ?? false;
   const selectedSemester = semesters.find((s) => s.id === semesterId) ?? null;
 
   return (
     <div className="flex flex-col gap-4">
       <PanelHeader
-        title="综评导出"
-        description="按附录三《综合素质评价建议折算表》生成学期建议加分，可逐人修改后导出 学号/姓名/加分。"
+        title="综评与积分导出"
+        description="按附录三实时生成学期综合素质评价建议分与成员积分，不受学期结束时间限制，不锁定，支持随时调整与导出。"
       />
-
-      {testMode && (
-        <Alert>
-          <FlaskConicalIcon aria-hidden="true" />
-          <AlertTitle>测试口已开启（EVALUATION_TEST_MODE）</AlertTitle>
-          <AlertDescription>
-            未结束的学期也能生成批次，结果固定标记为「测试数据」，导出文件名同样带标记。正式上报请在学期结束后重新生成。
-          </AlertDescription>
-        </Alert>
-      )}
 
       <Card>
         <CardContent className="flex flex-col gap-3 p-5">
-          <h2 className="text-sm font-semibold text-foreground">生成学期批次</h2>
+          <h2 className="text-sm font-semibold text-foreground">实时生成与导出</h2>
           <QueryBoundary query={semestersQuery}>
             {() =>
               semesters.length === 0 ? (
                 <EmptyState kind="empty" description="还没有学期记录，先在设置中建立学期。" />
               ) : (
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
-                  <div className="grid flex-1 gap-1.5">
-                    <Label htmlFor="evaluation-semester">学期</Label>
-                    <select
-                      id="evaluation-semester"
-                      value={semesterId}
-                      onChange={(event) => setSemesterId(event.target.value)}
-                      className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm text-foreground shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                    >
-                      <option value="">请选择学期</option>
-                      {semesters.map((semester) => (
-                        <option key={semester.id} value={semester.id}>
-                          {semester.code} {semester.name}
-                          {semester.ended ? '（已结束）' : '（进行中）'}
-                        </option>
-                      ))}
-                    </select>
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+                    <div className="grid flex-1 gap-1.5">
+                      <Label htmlFor="evaluation-semester">学期</Label>
+                      <select
+                        id="evaluation-semester"
+                        value={semesterId}
+                        onChange={(event) => setSemesterId(event.target.value)}
+                        className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm text-foreground shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                      >
+                        <option value="">请选择学期</option>
+                        {semesters.map((semester) => (
+                          <option key={semester.id} value={semester.id}>
+                            {semester.code} {semester.name}
+                            {semester.ended ? '（已结束）' : '（进行中 · 实时）'}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        disabled={!selectedSemester || generateMutation.isPending}
+                        onClick={() => selectedSemester && generateMutation.mutate(selectedSemester.id)}
+                      >
+                        {generateMutation.isPending ? (
+                          <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                        ) : (
+                          <PlusIcon aria-hidden="true" />
+                        )}
+                        生成实时名单
+                      </Button>
+                      {selectedSemester ? (
+                        <>
+                          <Button asChild variant="outline">
+                            <a href={`/api/v1/admin/evaluation/semesters/${selectedSemester.id}/export`}>
+                              <DownloadIcon aria-hidden="true" />
+                              实时导出综评表（含积分）
+                            </a>
+                          </Button>
+                          <Button asChild variant="outline">
+                            <a href={`/api/v1/admin/evaluation/semesters/${selectedSemester.id}/points-export`}>
+                              <FileSpreadsheetIcon aria-hidden="true" />
+                              实时导出积分表
+                            </a>
+                          </Button>
+                        </>
+                      ) : (
+                        <>
+                          <Button variant="outline" disabled>
+                            <DownloadIcon aria-hidden="true" />
+                            实时导出综评表（含积分）
+                          </Button>
+                          <Button variant="outline" disabled>
+                            <FileSpreadsheetIcon aria-hidden="true" />
+                            实时导出积分表
+                          </Button>
+                        </>
+                      )}
+                    </div>
                   </div>
-                  <Button
-                    disabled={!selectedSemester?.canGenerate || generateMutation.isPending}
-                    onClick={() => selectedSemester && generateMutation.mutate(selectedSemester.id)}
-                  >
-                    {generateMutation.isPending ? (
-                      <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
-                    ) : (
-                      <PlusIcon aria-hidden="true" />
-                    )}
-                    生成批次
-                  </Button>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    「实时导出综评表（含积分）」直接导出当前最新定档结果（含学号、姓名、有效积分、学期总积分、月均积分、H 分、档位与加分）；
+                    「实时导出积分表」导出全员积分明细（含活动/竞赛/服务/扣分构成）；如需逐人手工调整后再导出，可点击「生成实时名单」。
+                  </p>
                 </div>
               )
             }
           </QueryBoundary>
 
-          {selectedSemester && !selectedSemester.canGenerate && (
-            <p className="text-xs leading-5 text-muted-foreground">
-              该学期 {formatDateTime(selectedSemester.endsOn)} 结束，未到时点不开放折算；本地测试可在服务端设置
-              EVALUATION_TEST_MODE=true。
-            </p>
-          )}
           {actionError && (
             <Alert variant="destructive">
               <AlertDescription>{actionError}</AlertDescription>
@@ -227,7 +262,7 @@ function EvaluationBody({ principalId }: { principalId: string }) {
             <summary className="cursor-pointer font-medium text-foreground">折算口径（附录三）</summary>
             <p className="mt-2">H = 0.70×积分标准分 + 0.20×竞赛标准分 + 0.10×服务标准分 − 纪律扣减。</p>
             <ul className="mt-1 list-disc pl-4">
-              <li>积分标准分：学期各月有效积分平均值在符合评价条件成员中的百分位（0–100）</li>
+              <li>积分标准分：学期各月积分平均值在符合评价条件成员中的百分位（0–100）；未发布月度积分的月份自动按实时流水聚合</li>
               <li>竞赛标准分：学期内 正式赛/远程赛/获奖 账目合计的百分位</li>
               <li>服务标准分：学期内 贡献/服务 账目合计的百分位</li>
               <li>纪律扣减：学期内 penalty 账目金额合计 1:1 扣减 H，上限 20 分</li>
@@ -235,7 +270,7 @@ function EvaluationBody({ principalId }: { principalId: string }) {
               <li>并列按近三个月有效积分 → 正式竞赛积分 → 活动积分比较，仍相同者标注「需人工认定」</li>
             </ul>
             <p className="mt-2">
-              干部口径（社长按部长级、副社长按副部长级）需另行申报，系统无法区分社长/副社长，主席团成员单列在下方由你手工给分。
+              干部口径（社长按部长级、副社长按副部长级）需另行申报，主席团成员单列在下方可随时手工给分。
               结果只是社团内部排序与建议值，不等同学院最终记分。
             </p>
           </details>
@@ -244,12 +279,12 @@ function EvaluationBody({ principalId }: { principalId: string }) {
 
       <Card>
         <CardContent className="p-0">
-          <h2 className="border-b border-border p-5 pb-3 text-sm font-semibold text-foreground">历史批次</h2>
+          <h2 className="border-b border-border p-5 pb-3 text-sm font-semibold text-foreground">已生成名单快照（随时可改、不锁定）</h2>
           <QueryBoundary query={batchesQuery}>
             {(batches) =>
               batches.length === 0 ? (
                 <div className="p-5">
-                  <EmptyState kind="empty" description="还没有综评批次；选择学期后点「生成批次」。" />
+                  <EmptyState kind="empty" description="还没有已保存的综评快照；可直接点击上方实时导出，或点「生成实时名单」进行逐人调整。" />
                 </div>
               ) : (
                 <ul className="flex flex-col divide-y divide-border">
@@ -263,13 +298,8 @@ function EvaluationBody({ principalId }: { principalId: string }) {
                         <span className="text-sm font-medium text-foreground">
                           {batch.semesterCode} {batch.semesterName}
                         </span>
-                        {batch.isTest && (
-                          <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-400">
-                            测试数据
-                          </span>
-                        )}
                         <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                          {batch.status === 'published' ? '已发布' : '草稿'}
+                          可编辑
                         </span>
                         <span className="text-xs text-muted-foreground tabular-nums">
                           定档 {batch.memberCount} / 共 {batch.rowCount} 人 · {formatDateTime(batch.generatedAt)}
@@ -301,6 +331,7 @@ function BatchDetail({
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const detailQuery = usePrivateQuery<BatchDetailDto>(
     principalId,
@@ -316,17 +347,26 @@ function BatchDetail({
   };
 
   const actionMutation = useMutation({
-    mutationFn: async (action: 'recompute' | 'publish' | 'delete') => {
+    mutationFn: async (action: 'recompute' | 'refresh' | 'delete') => {
       if (action === 'delete') await api.delete(`/admin/evaluation/batches/${batchId}`);
       else await api.post(`/admin/evaluation/batches/${batchId}/${action}`);
       return action;
     },
     onSuccess: (action) => {
       setError(null);
-      if (action === 'delete') onDeleted();
+      if (action === 'delete') {
+        onDeleted();
+      } else if (action === 'refresh') {
+        setNotice('已按最新积分账本同步并重新定档（已保留手工修改项）。');
+      } else {
+        setNotice('已按当前分量重新计算 H 分与定档。');
+      }
       invalidate();
     },
-    onError: (err: ApiError) => setError(err.message),
+    onError: (err: ApiError) => {
+      setNotice(null);
+      setError(err.message);
+    },
   });
 
   return (
@@ -335,24 +375,16 @@ function BatchDetail({
         const tiered = rows.filter((r) => r.tier != null && !r.excluded && !r.cadre);
         const cadres = rows.filter((r) => r.cadre && !r.excluded);
         const excluded = rows.filter((r) => r.excluded);
-        const locked = batch.status === 'published';
         return (
           <Card>
             <CardContent className="flex flex-col gap-4 p-5">
               <div className="flex flex-wrap items-center gap-2">
                 <h2 className="text-sm font-semibold text-foreground">
-                  {batch.semesterCode} {batch.semesterName} · 建议名单
+                  {batch.semesterCode} {batch.semesterName} · 建议名单与积分
                 </h2>
-                {batch.isTest && (
-                  <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-xs text-amber-700 dark:text-amber-400">
-                    测试数据，不可作为正式结果上报
-                  </span>
-                )}
-                {locked && (
-                  <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                    已发布 {batch.publishedAt ? formatDateTime(batch.publishedAt) : ''}
-                  </span>
-                )}
+                <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground tabular-nums">
+                  更新于 {formatDateTime(batch.generatedAt)}
+                </span>
               </div>
 
               {batch.note && <p className="text-xs leading-5 text-muted-foreground">{batch.note}</p>}
@@ -361,13 +393,32 @@ function BatchDetail({
                 <Button asChild size="sm">
                   <a href={`/api/v1/admin/evaluation/batches/${batch.id}/export`}>
                     <DownloadIcon aria-hidden="true" />
-                    导出表格
+                    导出综评表（含积分）
+                  </a>
+                </Button>
+                <Button asChild size="sm" variant="outline">
+                  <a href={`/api/v1/admin/evaluation/batches/${batch.id}/points-export`}>
+                    <FileSpreadsheetIcon aria-hidden="true" />
+                    导出积分明细表
                   </a>
                 </Button>
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={locked || actionMutation.isPending}
+                  disabled={actionMutation.isPending}
+                  onClick={() => actionMutation.mutate('refresh')}
+                >
+                  {actionMutation.isPending && actionMutation.variables === 'refresh' ? (
+                    <LoaderCircleIcon className="animate-spin" aria-hidden="true" />
+                  ) : (
+                    <RotateCwIcon aria-hidden="true" />
+                  )}
+                  同步最新积分
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={actionMutation.isPending}
                   onClick={() => actionMutation.mutate('recompute')}
                 >
                   <RefreshCwIcon aria-hidden="true" />
@@ -376,26 +427,22 @@ function BatchDetail({
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={locked || actionMutation.isPending}
-                  onClick={() => actionMutation.mutate('publish')}
-                >
-                  <SendIcon aria-hidden="true" />
-                  发布锁定
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
                   disabled={actionMutation.isPending}
                   onClick={() => actionMutation.mutate('delete')}
                 >
                   <Trash2Icon aria-hidden="true" />
-                  删除批次
+                  删除快照
                 </Button>
               </div>
               <p className="text-xs leading-5 text-muted-foreground">
-                导出仅含定档成员与已手工给分者；发布后批次锁定，如需更正请重新生成。
+                批次永不锁定，随时可逐人修改、同步最新积分并反复导出；「导出综评表（含积分）」含定档成员与手工给分者，「导出积分明细表」含全员完整积分。
               </p>
 
+              {notice && (
+                <Alert variant="info">
+                  <AlertDescription>{notice}</AlertDescription>
+                </Alert>
+              )}
               {error && (
                 <Alert variant="destructive">
                   <AlertDescription>{error}</AlertDescription>
@@ -407,17 +454,15 @@ function BatchDetail({
                 rows={tiered}
                 emptyHint="没有符合评价条件的成员。"
                 batchId={batchId}
-                locked={locked}
                 editing={editing}
                 setEditing={setEditing}
                 onSaved={invalidate}
               />
               <RowGroup
-                title={`干部口径（${cadres.length} 人，需手工给分）`}
+                title={`干部口径（${cadres.length} 人，可手工给分）`}
                 rows={cadres}
                 emptyHint="本学期没有主席团成员在册。"
                 batchId={batchId}
-                locked={locked}
                 editing={editing}
                 setEditing={setEditing}
                 onSaved={invalidate}
@@ -427,7 +472,6 @@ function BatchDetail({
                 rows={excluded}
                 emptyHint="没有被排除的成员。"
                 batchId={batchId}
-                locked={locked}
                 editing={editing}
                 setEditing={setEditing}
                 onSaved={invalidate}
@@ -445,7 +489,6 @@ function RowGroup({
   rows,
   emptyHint,
   batchId,
-  locked,
   editing,
   setEditing,
   onSaved,
@@ -454,7 +497,6 @@ function RowGroup({
   rows: RowDto[];
   emptyHint: string;
   batchId: string;
-  locked: boolean;
   editing: string | null;
   setEditing: (id: string | null) => void;
   onSaved: () => void;
@@ -480,16 +522,18 @@ function RowGroup({
                 <span className="text-sm font-medium text-foreground tabular-nums">{row.studentNo}</span>
                 <span className="text-sm text-foreground">{row.realName}</span>
                 <span className="ml-auto text-sm font-semibold text-foreground tabular-nums">
-                  {row.finalScore.toFixed(3)} 分
+                  加分 {row.finalScore.toFixed(3)}
                 </span>
               </div>
               <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground tabular-nums">
-                <span>H {row.hScore.toFixed(2)}</span>
-                <span>积分 {row.pointsStd.toFixed(1)}</span>
-                <span>竞赛 {row.contestStd.toFixed(1)}</span>
-                <span>服务 {row.serviceStd.toFixed(1)}</span>
-                <span>扣减 {row.disciplinePenalty.toFixed(1)}</span>
+                {row.currentE != null && <span className="font-medium text-foreground">有效积分 E {row.currentE.toFixed(1)}</span>}
+                {row.semesterTotal != null && <span>学期总积分 {row.semesterTotal.toFixed(2)}</span>}
                 <span>月均积分 {row.pointsAvg.toFixed(2)}</span>
+                <span>H {row.hScore.toFixed(2)}</span>
+                <span>积分标 {row.pointsStd.toFixed(1)}</span>
+                <span>竞赛标 {row.contestStd.toFixed(1)}</span>
+                <span>服务标 {row.serviceStd.toFixed(1)}</span>
+                <span>扣减 {row.disciplinePenalty.toFixed(1)}</span>
                 {row.overridden && <span className="text-amber-700 dark:text-amber-400">已手工修改</span>}
                 {row.tiebreak?.needsManual && (
                   <span className="text-amber-700 dark:text-amber-400">并列需人工认定</span>
@@ -497,18 +541,16 @@ function RowGroup({
               </div>
               {row.excludeReason && <p className="text-xs text-muted-foreground">{row.excludeReason}</p>}
               {row.overrideReason && <p className="text-xs text-muted-foreground">修改理由：{row.overrideReason}</p>}
-              {!locked && (
-                <div>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setEditing(editing === row.id ? null : row.id)}
-                  >
-                    {editing === row.id ? '收起' : '修改'}
-                  </Button>
-                </div>
-              )}
-              {editing === row.id && !locked && (
+              <div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setEditing(editing === row.id ? null : row.id)}
+                >
+                  {editing === row.id ? '收起' : '修改'}
+                </Button>
+              </div>
+              {editing === row.id && (
                 <RowEditor batchId={batchId} row={row} onSaved={onSaved} onClose={() => setEditing(null)} />
               )}
             </li>
@@ -558,7 +600,6 @@ function RowEditor({
 
   const saveMutation = useMutation({
     mutationFn: async () => {
-      // 空字符串代表撤销覆盖，显式传 null；非法数字在这里拦住，避免把 NaN 发给服务端
       const payload: Record<string, unknown> = { reason: reason.trim(), excluded, cadre };
       for (const field of NUMBER_FIELDS) {
         const raw = values[field.key].trim();

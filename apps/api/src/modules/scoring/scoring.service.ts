@@ -823,13 +823,15 @@ export class ScoringService {
         eventKind = 'competition'
         eventName = compEvent.title
         eventTime = compEvent.startAt.toISOString()
-        eventLink = '/app?section=contests&tab=events'
+        eventLink = '/app?section=contests&tab=entry'
         eventMeta = {
           eventId: compEvent.id,
           category: compEvent.category,
           startAt: compEvent.startAt.toISOString(),
           endAt: compEvent.endAt.toISOString(),
           teamName: asStr(d.teamName),
+          awardText: asStr(d.awardText),
+          rankText: asStr(d.rankText),
         }
       } else if (claim) {
         eventKind = 'claim'
@@ -853,7 +855,7 @@ export class ScoringService {
         eventTime = actDate && !Number.isNaN(Date.parse(actDate)) ? new Date(actDate).toISOString() : row.recordedAt.toISOString()
         if (asStr(d.eventTitle)) {
           eventKind = 'competition'
-          eventLink = '/app?section=contests&tab=events'
+          eventLink = '/app?section=contests&tab=entry'
         } else if (asStr(d.title) && row.category === 'contribution') {
           eventKind = 'claim'
           eventLink = '/app?section=contributions'

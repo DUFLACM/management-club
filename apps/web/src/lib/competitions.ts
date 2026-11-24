@@ -154,6 +154,33 @@ export interface MemberCompetitionEventDto extends CompetitionEventDto {
   myStatus: string | null;
 }
 
+/** 我的全部正式赛参赛与归档记录（含个人赛与团队赛、所有赛事状态） */
+export interface MyCompetitionRecordDto {
+  id: string;
+  kind: 'individual' | 'team';
+  eventId: string;
+  status: string;
+  resultScore: string | null;
+  awardText: string | null;
+  rankText: string | null;
+  teamName: string | null;
+  reviewNote: string | null;
+  note: string | null;
+  registeredAt: string;
+  event: {
+    id: string;
+    title: string;
+    category: CompetitionCategory;
+    teamSize: number | null;
+    scoringMode: ScoringMode;
+    contestTier: string | null;
+    status: CompetitionEventStatus;
+    startAt: string;
+    endAt: string;
+  };
+  teammates: Array<{ userId: string; name: string }>;
+}
+
 export interface CompetitionMaterialDto {
   id: string;
   title: string;
@@ -417,6 +444,9 @@ export interface CompetitionEventInput {
 export const competitionsApi = {
   async listOpenEvents() {
     return (await api.get<MemberCompetitionEventDto[]>('/me/competition-events')).data;
+  },
+  async myCompetitions() {
+    return (await api.get<MyCompetitionRecordDto[]>('/me/my-competitions')).data;
   },
   async eventDetail(eventId: string) {
     return (await api.get<CompetitionEventDetailDto>(`/me/competition-events/${eventId}`)).data;

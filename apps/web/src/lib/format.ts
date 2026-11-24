@@ -253,6 +253,7 @@ export const PLATFORM_LABELS: Record<string, string> = {
   atcoder: 'AtCoder',
   vjudge: 'VJudge',
   hydro: 'Hydro',
+  formal: '正式赛',
 };
 
 export function platformLabel(platform: string | null | undefined): string {
