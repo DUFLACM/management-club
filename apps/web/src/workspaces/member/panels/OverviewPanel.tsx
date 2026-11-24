@@ -11,7 +11,9 @@ import { useState } from 'react';
 import { useSearchParams } from 'react-router';
 import {
   AlarmClockIcon,
+  BellRingIcon,
   CalendarClockIcon,
+  CheckCircle2Icon,
   ChevronRightIcon,
   CoinsIcon,
   ListTodoIcon,
@@ -32,6 +34,7 @@ import { StatusBadge } from '@/components/club/StatusBadge';
 import { TrainingRoomArt } from '@/components/club/TrainingRoomArt';
 import { MonthBars } from '@/components/club/MonthBars';
 import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Card, CardContent } from '@/components/ui/card';
 
@@ -441,6 +444,13 @@ function OverviewBody({ principalId }: { principalId: string }) {
                 components={data.score.components}
                 className="order-7 md:order-6 md:col-span-8"
               />
+
+              {/* 微信推送接收指引 */}
+              <WxPusherGuideCard
+                principalId={principalId}
+                className="order-8 md:order-8 md:col-span-12"
+                onOpenSettings={() => goSection('profile', { tab: 'edit' })}
+              />
             </div>
             <BindPlatformAccountDialog
               principalId={principalId}
@@ -595,6 +605,135 @@ function CompositionCard({
                 ×0.85 / ×0.7 / ×0.55 / ×0.4 / ×0.25）。
               </p>
             </>
+          )}
+        </CardContent>
+      </Card>
+    </section>
+  );
+}
+
+interface OverviewWxPusherStatus {
+  configured: boolean;
+  ready: boolean;
+  bound: boolean;
+  enabled: boolean;
+  preferences: {
+    points: boolean;
+    approvals: boolean;
+    activities: boolean;
+    competitions: boolean;
+    announcements: boolean;
+  };
+}
+
+const WXPUSHER_CATEGORY_LABELS: Array<{ key: keyof OverviewWxPusherStatus['preferences']; label: string }> = [
+  { key: 'points', label: '积分变动' },
+  { key: 'approvals', label: '审批与动态' },
+  { key: 'activities', label: '活动发布' },
+  { key: 'competitions', label: '正式赛事' },
+  { key: 'announcements', label: '社团公告' },
+];
+
+function WxPusherGuideCard({
+  principalId,
+  className,
+  onOpenSettings,
+}: {
+  principalId: string;
+  className?: string;
+  onOpenSettings: () => void;
+}) {
+  const statusQuery = usePrivateQuery<OverviewWxPusherStatus, ApiError>(
+    principalId,
+    ['me', 'wxpusher'],
+    async () => (await api.get<OverviewWxPusherStatus>('/me/notifications/wxpusher')).data,
+    { staleTime: 60_000 },
+  );
+
+  const status = statusQuery.data;
+  if (status && (!status.configured || !status.ready)) {
+    return null;
+  }
+
+  const bound = status?.bound === true;
+  const enabled = status?.enabled !== false;
+  const activeLabels = status
+    ? WXPUSHER_CATEGORY_LABELS.filter((item) => status.preferences[item.key]).map((item) => item.label)
+    : [];
+
+  return (
+    <section aria-label="如何接收微信消息推送" className={className}>
+      <Card>
+        <CardContent className="flex flex-col gap-4 p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className={cardTitleClass}>
+                <BellRingIcon className={cardIconClass} aria-hidden="true" />
+                如何接收微信消息推送
+              </h2>
+              {bound ? (
+                <Badge variant={enabled ? 'success' : 'warning'}>
+                  {enabled ? '已绑定 · 推送已开启' : '已绑定 · 推送已暂停'}
+                </Badge>
+              ) : (
+                <Badge variant="outline">未绑定</Badge>
+              )}
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant={bound ? 'outline' : 'default'}
+              onClick={onOpenSettings}
+            >
+              {bound ? '管理推送设置' : '去绑定微信推送'}
+              <ChevronRightIcon aria-hidden="true" />
+            </Button>
+          </div>
+
+          {bound ? (
+            <div className="flex flex-col gap-2 text-xs leading-5 text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+              <p className="flex items-center gap-1.5 text-foreground">
+                <CheckCircle2Icon className="size-4 shrink-0 text-emerald-600" aria-hidden="true" />
+                {enabled
+                  ? '你的微信已接入 WxPusher 实时通知，消息将通过微信「WxPusher消息推送平台」送达。'
+                  : '你已暂停微信推送，重新开启后可恢复实时提醒。'}
+              </p>
+              {enabled && activeLabels.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {activeLabels.map((label) => (
+                    <Badge key={label} variant="outline" className="font-normal">
+                      {label}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              <p className="text-xs leading-5 text-muted-foreground">
+                绑定微信后，协会的<strong>积分变动、审批结果、周赛/活动发布、正式赛事报名与社团公告</strong>都会第一时间推送到你的微信，避免错过签到和报名截止时间。
+              </p>
+              <ol className="grid grid-cols-1 gap-2.5 md:grid-cols-3">
+                <li className="flex flex-col gap-1 rounded-xl border border-border bg-muted/25 p-3">
+                  <span className="text-xs font-semibold text-foreground">1. 进入绑定入口</span>
+                  <span className="text-xs leading-5 text-muted-foreground">
+                    点击右上角「去绑定微信推送」，或随时在「我的 → 资料与隐私」找到微信推送卡片。
+                  </span>
+                </li>
+                <li className="flex flex-col gap-1 rounded-xl border border-border bg-muted/25 p-3">
+                  <span className="text-xs font-semibold text-foreground">2. 微信扫码关注</span>
+                  <span className="text-xs leading-5 text-muted-foreground">
+                    点击「生成微信绑定二维码」，用微信扫码关注「WxPusher消息推送平台」即可自动完成绑定。
+                  </span>
+                </li>
+                <li className="flex flex-col gap-1 rounded-xl border border-border bg-muted/25 p-3">
+                  <span className="text-xs font-semibold text-foreground">3. 测试并自选分类</span>
+                  <span className="text-xs leading-5 text-muted-foreground">
+                    点击「发送测试推送」确认手机收到提醒，并按需勾选想接收的通知分类（随时可暂停或解绑）。
+                  </span>
+                </li>
+              </ol>
+            </div>
           )}
         </CardContent>
       </Card>
