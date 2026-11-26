@@ -51,6 +51,23 @@ const MEMBERSHIP_LABELS: Record<string, string> = {
 type Weights = typeof WEIGHTS
 type TierRatios = typeof TIER_RATIOS
 
+interface EvaluationMemberIdentity {
+  verifiedRealName: string
+  studentNo: string
+  profile?: { displayName: string | null; visibility: string } | null
+}
+
+function publicEvaluationName(user: EvaluationMemberIdentity): string {
+  const name = user.verifiedRealName.trim()
+  const nickname = user.profile?.displayName?.trim()
+  if (user.profile?.visibility === 'public_opt_in' && nickname
+    && !(name && nickname.includes(name)) && !nickname.includes(user.studentNo)) {
+    return nickname
+  }
+  const initial = name.match(/^\p{Script=Han}(?=.)/u)?.[0]
+  return initial ? `${initial}同学` : '同学'
+}
+
 interface Tiebreak {
   /** 近三个月有效积分（§七(一)） */
   recentPoints: number
@@ -193,6 +210,10 @@ export class EvaluationService {
 
   async memberSemesters(userId: string) {
     await assertCurrentClubMember(this.db, userId)
+    return this.publicSemesters()
+  }
+
+  async publicSemesters() {
     const now = new Date()
     const terms = await this.db.semester.findMany({
       where: { startsOn: { lte: now } },
@@ -208,9 +229,17 @@ export class EvaluationService {
 
   async memberLeaderboard(userId: string, semesterId: string) {
     await assertCurrentClubMember(this.db, userId)
+    return this.semesterLeaderboard(semesterId, userId)
+  }
+
+  async publicLeaderboard(semesterId: string) {
+    return this.semesterLeaderboard(semesterId)
+  }
+
+  private async semesterLeaderboard(semesterId: string, viewerId?: string) {
     const semester = await this.db.semester.findFirst({ where: { id: semesterId, startsOn: { lte: new Date() } } })
     if (!semester) throw new EvaluationError('学期不存在或尚未开始', 'NOT_FOUND')
-    const ranked = await this.realtimeTierRows(semester)
+    const ranked = await this.realtimeTierRows(semester, viewerId ? memberName : publicEvaluationName)
     return {
       rows: ranked.map((r) => ({
         rank: r.rankNo,
@@ -219,7 +248,7 @@ export class EvaluationService {
         tier: r.tier,
         suggestedScore: r.suggestedScore,
         needsManual: r.tiebreak.needsManual,
-        isMe: r.userId === userId,
+        ...(viewerId ? { isMe: r.userId === viewerId } : {}),
       })),
     }
   }
@@ -376,7 +405,10 @@ export class EvaluationService {
   }
 
   /** 读取学期内的候选人与实时积分原始值 */
-  private async collect(semester: { id: string; startsOn: Date; endsOn: Date }) {
+  private async collect(
+    semester: { id: string; startsOn: Date; endsOn: Date },
+    displayNameFor: (user: EvaluationMemberIdentity) => string = memberName,
+  ) {
     const months = semesterMonths(semester.startsOn, semester.endsOn)
     const currentM = monthKey(new Date())
     const elapsed = months.filter((m) => m <= currentM)
@@ -387,7 +419,7 @@ export class EvaluationService {
       this.db.membershipTerm.findMany({
         where: { semesterId: semester.id },
         include: {
-          user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } }, principalId: true, accountStatus: true, createdAt: true } },
+          user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true, visibility: true } }, principalId: true, accountStatus: true, createdAt: true } },
         },
       }),
       this.db.user.findMany({
@@ -396,7 +428,7 @@ export class EvaluationService {
           id: true,
           studentNo: true,
           verifiedRealName: true,
-          profile: { select: { displayName: true } },
+          profile: { select: { displayName: true, visibility: true } },
           principalId: true,
           accountStatus: true,
           createdAt: true,
@@ -420,7 +452,7 @@ export class EvaluationService {
         userId: t.userId,
         studentNo: t.user.studentNo,
         realName: t.user.verifiedRealName,
-        displayName: memberName(t.user),
+        displayName: displayNameFor(t.user),
         principalId: t.user.principalId,
         accountStatus: t.user.accountStatus,
         membershipStatus: t.membershipStatus,
@@ -434,7 +466,7 @@ export class EvaluationService {
         userId: u.id,
         studentNo: u.studentNo,
         realName: u.verifiedRealName,
-        displayName: memberName(u),
+        displayName: displayNameFor(u),
         principalId: u.principalId,
         accountStatus: u.accountStatus,
         membershipStatus: latestStatus,
@@ -1052,8 +1084,11 @@ export class EvaluationService {
     return { csv: `${lines.join('\n')}\n`, filename }
   }
 
-  private async realtimeTierRows(semester: { id: string; startsOn: Date; endsOn: Date }) {
-    const { candidates } = await this.collect(semester)
+  private async realtimeTierRows(
+    semester: { id: string; startsOn: Date; endsOn: Date },
+    displayNameFor: (user: EvaluationMemberIdentity) => string = memberName,
+  ) {
+    const { candidates } = await this.collect(semester, displayNameFor)
     return this.assign(candidates)
       .filter((r): r is ScoredCandidate & { rankNo: number; tier: 'A' | 'B' | 'C' } => r.rankNo !== null && r.tier !== null)
       .sort((a, b) => a.rankNo - b.rankNo)

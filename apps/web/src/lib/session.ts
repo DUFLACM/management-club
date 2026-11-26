@@ -75,6 +75,7 @@ export function usePrincipal(): CsrfSession | null {
 
 /** 是否具备任一目标动作能力（与后端 ROLE_ACTIONS 映射保持一致）。 */
 export function hasAnyAction(roles: string[], actions: string[]): boolean {
+  if (roles.includes('system_admin')) return actions.length > 0;
   const roleActions: Record<string, string[]> = {
     member: [],
     activity_manager: [
@@ -115,15 +116,6 @@ export function hasAnyAction(roles: string[], actions: string[]): boolean {
       'disclosure.publish',
       'competitions.manage',
       'evaluation.manage',
-    ],
-    system_admin: [
-      'settings.manage',
-      'secrets.write',
-      'sync.manage',
-      'audit.read',
-      'platform.configure',
-      'members.read',
-      'announcements.manage',
     ],
   };
   return actions.some((action) =>

@@ -5,11 +5,13 @@ import { AdminLoginPage } from '@/pages/AdminLoginPage';
 import { RegisterPage } from '@/pages/RegisterPage';
 import { MemberWorkspace } from '@/workspaces/member/MemberWorkspace';
 import { AdminWorkspace } from '@/workspaces/admin/AdminWorkspace';
+import { PublicityPage } from '@/pages/PublicityPage';
 
 /**
  * 顶层路由。
  * /        → 重定向 /app
  * /app     → 成员工作台（?section= 白名单）
+ * /publicity → 学期公示（综测公开，加分明细需成员登录）
  * /admin   → 管理工作台（?section= 白名单）
  * /admin/login → 独立管理员双阶段登录
  * /login   → CAS 登录辅助页
@@ -21,6 +23,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/app" replace />} />
         <Route path="/app" element={<MemberWorkspace />} />
+        <Route path="/publicity" element={<PublicityPage />} />
         <Route path="/admin" element={<AdminWorkspace />} />
         <Route path="/admin/login" element={<AdminLoginPage />} />
         <Route path="/login" element={<LoginPage />} />

@@ -11,6 +11,7 @@ import { api, fetchCsrfToken, ApiError } from '@/lib/api';
 export async function startCasLogin(options: {
   purpose?: 'login' | 'register';
   registrationIntentId?: string;
+  returnTarget?: string;
 } = {}): Promise<void> {
   await fetchCsrfToken();
   const { data } = await api.post<{ redirectUrl?: string }>('/auth/cas/start', options);

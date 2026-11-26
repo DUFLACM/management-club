@@ -5,7 +5,7 @@ import request from 'supertest'
 import type { SessionActor } from '../../modules/auth/session.service.js'
 
 // 使用编译后的 Nest 控制器和守卫，覆盖路由、参数装饰器及业务动作权限。
-const { EvaluationMemberController } = require('../../../dist/modules/evaluation/evaluation.controller.js')
+const { EvaluationMemberController, EvaluationPublicController } = require('../../../dist/modules/evaluation/evaluation.controller.js')
 const { EvaluationService } = require('../../../dist/modules/evaluation/evaluation.service.js')
 const { ScoringAdminController, ScoringMeController } = require('../../../dist/modules/scoring/scoring.controller.js')
 const { ScoringService } = require('../../../dist/modules/scoring/scoring.service.js')
@@ -39,7 +39,7 @@ let app: INestApplication
 
 beforeAll(async () => {
   const module = await Test.createTestingModule({
-    controllers: [EvaluationMemberController, ScoringMeController, ScoringAdminController],
+    controllers: [EvaluationMemberController, EvaluationPublicController, ScoringMeController, ScoringAdminController],
     providers: [
       { provide: EvaluationService, useValue: new EvaluationService(db, {}) },
       { provide: ScoringService, useValue: scoring },
@@ -57,6 +57,19 @@ beforeEach(() => {
   actor = null
   db.user.findUnique.mockReset().mockResolvedValue({ accountStatus: 'active', membershipTerms: [{ membershipStatus: 'formal' }] })
   setBonusVisibility.mockClear()
+})
+
+it('匿名可读公开学期及综评排名，加分明细仅在成员接口提供', async () => {
+  const http = request(app.getHttpServer())
+  const terms = await http.get('/api/v1/public/evaluation/semesters').expect(200)
+  expect(terms.body.data).toEqual({
+    semesters: [{ id: semester.id, code: semester.code, name: semester.name }], defaultSemesterId: semester.id,
+  })
+  const board = await http.get(`/api/v1/public/evaluation/semesters/${semester.id}/leaderboard`).expect(200)
+  expect(board.body.data).toEqual({ rows: [] })
+  await http.get('/api/v1/public/evaluation/semesters/invalid/leaderboard').expect(400)
+  await http.get(`/api/v1/public/bonus-records?semesterId=${semester.id}`).expect(404)
+  await http.get(`/api/v1/me/bonus-records?semesterId=${semester.id}`).expect(401)
 })
 
 it.each([

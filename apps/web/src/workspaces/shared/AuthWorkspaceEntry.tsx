@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router';
-import { LoaderCircleIcon, LogInIcon, ShieldCheckIcon, TicketIcon } from 'lucide-react';
+import { ClipboardListIcon, LoaderCircleIcon, LogInIcon, ShieldCheckIcon, TicketIcon } from 'lucide-react';
 
 import { UniversityBrand } from '@/components/club/UniversityBrand';
 import { WelcomeTrainingArt } from '@/components/club/WelcomeTrainingArt';
@@ -92,7 +92,10 @@ export function AuthWorkspaceEntry({ loading, error, onRetry }: {
                   </Button>
               )}
             </div>
-            <div className="flex justify-center border-t border-border pt-1">
+            <div className="flex flex-wrap justify-center border-t border-border pt-1">
+              <Button asChild variant="ghost" className="h-11 rounded-xl px-3 text-muted-foreground hover:text-foreground">
+                <Link to="/publicity"><ClipboardListIcon aria-hidden="true" />学期公示</Link>
+              </Button>
               {loading || submitting ? (
                 <Button type="button" disabled variant="ghost" className="h-11 rounded-xl px-4 text-muted-foreground disabled:opacity-75">
                   <ShieldCheckIcon aria-hidden="true" />管理员登录

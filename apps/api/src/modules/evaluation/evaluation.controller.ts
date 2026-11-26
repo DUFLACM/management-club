@@ -18,6 +18,21 @@ const overrideSchema = z.object({
   reason: z.string().min(3, '请填写修改理由').max(500),
 })
 
+@Controller('/api/v1/public/evaluation')
+export class EvaluationPublicController {
+  constructor(private readonly evaluation: EvaluationService) {}
+
+  @Get('semesters')
+  async semesters() {
+    return ok(await this.evaluation.publicSemesters())
+  }
+
+  @Get('semesters/:semesterId/leaderboard')
+  async leaderboard(@Param('semesterId', ParseUUIDPipe) semesterId: string) {
+    return ok(await this.evaluation.publicLeaderboard(semesterId))
+  }
+}
+
 @Controller('/api/v1/me/evaluation')
 @UseGuards(SessionGuard, PermissionsGuard)
 export class EvaluationMemberController {

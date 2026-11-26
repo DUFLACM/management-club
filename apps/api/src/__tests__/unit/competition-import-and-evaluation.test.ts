@@ -296,9 +296,20 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
     expect(board.rows).toHaveLength(2)
     expect(db.semester.findFirst).toHaveBeenCalledWith({ where: { id: futureSemester.id, startsOn: { lte: expect.any(Date) } } })
 
+    const terms: Array<{ user: { verifiedRealName: string } }> = await db.membershipTerm.findMany()
+    const publicRows = (await svc.publicLeaderboard(futureSemester.id)).rows
+    expect(publicRows).toEqual(board.rows.map(({ isMe, ...row }, i) => ({
+      ...row, displayName: ['张同学', '李同学'][i],
+    })))
+    const nicknames = [{ visibility: 'public_opt_in', displayName: '稻米' }, { visibility: 'self_only', displayName: '自用昵称' }]
+    db.membershipTerm.findMany.mockResolvedValueOnce(terms.map((t, i) => ({ ...t, user: { ...t.user, profile: nicknames[i] } })))
+    expect((await svc.publicLeaderboard(futureSemester.id)).rows.map((r) => r.displayName)).toEqual(['稻米', '李同学'])
+    const identifyingNames = [{ visibility: 'public_opt_in', displayName: '稻米（张三）' }, { visibility: 'public_opt_in', displayName: '202400002' }]
+    db.membershipTerm.findMany.mockResolvedValueOnce(terms.map((t, i) => ({ ...t, user: { ...t.user, profile: identifyingNames[i] } })))
+    expect((await svc.publicLeaderboard(futureSemester.id)).rows).toEqual(publicRows)
+
     // 账本全空时所有指标完全相同，两次查询的原始顺序也可能不同。
     db.pointsLedgerEntry.groupBy.mockResolvedValue([])
-    const terms = await db.membershipTerm.findMany()
     db.membershipTerm.findMany.mockResolvedValueOnce(terms.toReversed())
     const tiedBoard = await svc.memberLeaderboard(U1, futureSemester.id)
     const tiedExport = await svc.exportRealtimeCsv(futureSemester.id)
@@ -328,6 +339,7 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
     expect((await svc.memberSemesters(U1)).defaultSemesterId).toBe(ended.id)
     expect(await svc.memberSemesters(U1)).toEqual({ semesters: [], defaultSemesterId: null })
     await expect(svc.memberLeaderboard(U1, futureSemester.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    await expect(svc.publicLeaderboard(futureSemester.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
   })
 
   it('非在册成员不能读取学期列表与综评排行榜', async () => {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect } from 'react';
-import { useSearchParams } from 'react-router';
+import { Navigate, useSearchParams } from 'react-router';
 import { useWorkspaceSession } from '@/lib/workspace-session';
 import { AuthWorkspaceEntry } from '@/workspaces/shared/AuthWorkspaceEntry';
 import {
@@ -134,6 +134,11 @@ export function MemberWorkspace({ user: providedUser, manageAccess }: MemberWork
     );
   }
 
+  if (currentSection === 'publicity' && (!session.principal?.authenticated || !session.principal.userId || session.principal.nowcoderBound === false)) {
+    const sharedParams = new URLSearchParams(searchParams);
+    sharedParams.delete('section');
+    return <Navigate replace to={{ pathname: '/publicity', search: sharedParams.toString() }} />;
+  }
   if (!session.principal?.authenticated) {
     return <AuthWorkspaceEntry loading={false} error={session.error?.message} onRetry={() => void session.refetch()} />;
   }

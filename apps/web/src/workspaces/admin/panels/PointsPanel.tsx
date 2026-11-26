@@ -327,7 +327,7 @@ function PointsBody({ principalId }: { principalId: string }) {
               <BookOpenIcon aria-hidden="true" />
               月度批次
             </Button>
-            <Button onClick={() => setDisclosureOpen(true)}>发布公示</Button>
+            <Button onClick={() => setDisclosureOpen(true)}>发布月度公示</Button>
           </div>
         }
       />
@@ -345,7 +345,7 @@ function PointsBody({ principalId }: { principalId: string }) {
             <TabsList aria-label="审核队列" className="flex-wrap">
               <TabsTrigger value="claims">贡献申报（{queue.claims.length}）</TabsTrigger>
               <TabsTrigger value="processed">已处理申报（{queue.processedClaims.length}）</TabsTrigger>
-              <TabsTrigger value="manual">批量 / 手动加分记录</TabsTrigger>
+              <TabsTrigger value="manual">积分流水与加分公示</TabsTrigger>
               <TabsTrigger value="appeals">申诉（{queue.appeals.length}）</TabsTrigger>
               <TabsTrigger value="cases">复核案件（{queue.cases.length}）</TabsTrigger>
             </TabsList>
@@ -364,7 +364,7 @@ function PointsBody({ principalId }: { principalId: string }) {
               />
             </TabsContent>
             <TabsContent value="manual" className="mt-4">
-              <ManualLedgerRecordsTab
+              <LedgerRecordsTab
                 principalId={principalId}
                 onNotice={setQueueNotice}
                 onHandled={invalidateQueue}
@@ -389,11 +389,11 @@ function PointsBody({ principalId }: { principalId: string }) {
 
       <Card>
         <CardContent className="flex flex-col gap-3 p-5">
-          <h2 className="text-sm font-semibold text-foreground">公示记录</h2>
+          <h2 className="text-sm font-semibold text-foreground">月度公示记录</h2>
           <QueryBoundary
             query={disclosuresQuery}
             isEmpty={(rows) => rows.length === 0}
-            emptyNode={<p className="text-sm text-muted-foreground">暂无公示记录。</p>}
+            emptyNode={<p className="text-sm text-muted-foreground">暂无月度公示记录。</p>}
             skeleton={<div className="h-16 animate-pulse rounded-lg bg-muted" />}
           >
             {(rows) => (
@@ -1192,8 +1192,8 @@ function AppealsQueue({
   );
 }
 
-/** 批量 / 手动加分与流水台账：展示批量手动加分记录，支持筛选、搜索与直接冲正调分 */
-function ManualLedgerRecordsTab({
+/** 积分流水、加分公示与冲正调分 */
+function LedgerRecordsTab({
   principalId,
   onNotice,
   onHandled,
@@ -1206,7 +1206,7 @@ function ManualLedgerRecordsTab({
   onOpenBatch: () => void;
   onOpenSingle: () => void;
 }) {
-  const [scope, setScope] = useState<'manual_batch' | 'manual' | 'all'>('manual_batch');
+  const [scope, setScope] = useState<'manual_batch' | 'manual' | 'all'>('all');
   const [month, setMonth] = useState('');
   const [status, setStatus] = useState('all');
   const [searchInput, setSearchInput] = useState('');
@@ -1299,7 +1299,7 @@ function ManualLedgerRecordsTab({
             disabled={visibilityMutation.isPending}
             onClick={() => visibilityMutation.mutate(item)}
           >
-            {item.bonusVisible ? '隐藏' : '恢复公示'}
+            {item.bonusVisible ? '隐藏公示' : '恢复公示'}
           </Button>
         )}
       </span>
@@ -1324,9 +1324,9 @@ function ManualLedgerRecordsTab({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="all">全部积分流水</SelectItem>
                   <SelectItem value="manual_batch">批量手动加分</SelectItem>
                   <SelectItem value="manual">全部手动 / 调账</SelectItem>
-                  <SelectItem value="all">全部积分流水</SelectItem>
                 </SelectContent>
               </Select>
               <Input
