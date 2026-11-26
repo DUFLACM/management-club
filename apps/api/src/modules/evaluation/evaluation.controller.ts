@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post, Res, StreamableFile, UseGuards } from '@nestjs/common'
 import type { Response } from 'express'
 import { z } from 'zod'
-import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentActor, ok } from '../../common/guards.js'
+import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentActor, CurrentUser, ok } from '../../common/guards.js'
 import { EvaluationService, EvaluationError } from './evaluation.service.js'
 import type { SessionActor } from '../auth/session.service.js'
 
@@ -17,6 +17,25 @@ const overrideSchema = z.object({
   cadre: z.boolean().optional(),
   reason: z.string().min(3, '请填写修改理由').max(500),
 })
+
+@Controller('/api/v1/me/evaluation')
+@UseGuards(SessionGuard, PermissionsGuard)
+export class EvaluationMemberController {
+  constructor(private readonly evaluation: EvaluationService) {}
+
+  @Get('semesters')
+  async semesters(@CurrentUser() user: { userId: string }) {
+    return ok(await this.evaluation.memberSemesters(user.userId))
+  }
+
+  @Get('semesters/:semesterId/leaderboard')
+  async leaderboard(
+    @CurrentUser() user: { userId: string },
+    @Param('semesterId', ParseUUIDPipe) semesterId: string,
+  ) {
+    return ok(await this.evaluation.memberLeaderboard(user.userId, semesterId))
+  }
+}
 
 @Controller('/api/v1/admin/evaluation')
 @UseGuards(SessionGuard, PermissionsGuard, ActionGuard)

@@ -2,6 +2,7 @@ import { computeEffectiveScore, defaultRuleParams } from '@acm/scoring-core'
 import { mergeRuleParams } from './rule-params.js'
 import type { PrismaService } from '../../infrastructure/database/database.module.js'
 import { memberName, visibleAvatar } from '../../common/utils.js'
+import { DomainError } from '../../common/domain-error.js'
 
 /**
  * 当前有效榜的唯一口径（首页「当前有效榜排名」与榜单页「当前有效榜」共用，保证两处名次一致）。
@@ -13,6 +14,19 @@ import { memberName, visibleAvatar } from '../../common/utils.js'
 
 /** 参与当前有效榜的成员身份（制度口径：正式/预备/考察） */
 export const RANKED_MEMBERSHIPS: readonly string[] = ['formal', 'provisional', 'observing']
+
+export async function assertCurrentClubMember(db: PrismaService, userId: string): Promise<void> {
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: {
+      accountStatus: true,
+      membershipTerms: { orderBy: { createdAt: 'desc' }, take: 1, select: { membershipStatus: true } },
+    },
+  })
+  if (user?.accountStatus !== 'active' || !RANKED_MEMBERSHIPS.includes(user.membershipTerms[0]?.membershipStatus ?? '')) {
+    throw new DomainError('仅在册社团成员可查看', 'FORBIDDEN')
+  }
+}
 
 export interface RankedMember {
   userId: string

@@ -9,6 +9,7 @@ import {
   LayoutDashboardIcon,
   LoaderCircleIcon,
   ListOrderedIcon,
+  ClipboardListIcon,
   TrophyIcon,
   UserRoundIcon,
 } from 'lucide-react';
@@ -36,7 +37,7 @@ import {
  * - 竞赛与贡献已拆为两个 section（contests&tab=claims 旧链接自动重定向到 contributions）。
  */
 
-/** 成员导航顺序：概览、活动、竞赛、贡献、积分、榜单、我的 */
+/** 成员导航顺序与侧栏一致。 */
 export const MEMBER_SECTIONS: readonly WorkspaceSection[] = [
   { key: 'overview', title: '概览', icon: LayoutDashboardIcon },
   { key: 'activities', title: '活动', icon: CalendarDaysIcon },
@@ -44,6 +45,7 @@ export const MEMBER_SECTIONS: readonly WorkspaceSection[] = [
   { key: 'contributions', title: '贡献', icon: FileSignatureIcon },
   { key: 'points', title: '积分', icon: CoinsIcon },
   { key: 'ranking', title: '榜单', icon: ListOrderedIcon },
+  { key: 'publicity', title: '公示', icon: ClipboardListIcon },
   { key: 'profile', title: '我的', icon: UserRoundIcon },
 ];
 

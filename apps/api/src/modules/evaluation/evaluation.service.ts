@@ -3,8 +3,8 @@ import { computeEffectiveScore } from '@acm/scoring-core'
 import { DomainError } from '../../common/domain-error.js'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
-import { newId, monthKey, monthKeyPlus } from '../../common/utils.js'
-import { resolveEffectiveWeights } from '../scoring/effective-ranking.js'
+import { newId, monthKey, monthKeyPlus, memberName } from '../../common/utils.js'
+import { assertCurrentClubMember, resolveEffectiveWeights } from '../scoring/effective-ranking.js'
 import type { SessionActor } from '../auth/session.service.js'
 
 /**
@@ -66,6 +66,7 @@ interface Candidate {
   userId: string
   studentNo: string
   realName: string
+  displayName: string
   membership: string
   currentE: number
   semesterTotal: number
@@ -187,6 +188,39 @@ export class EvaluationService {
           canGenerate: true,
         }
       }),
+    }
+  }
+
+  async memberSemesters(userId: string) {
+    await assertCurrentClubMember(this.db, userId)
+    const now = new Date()
+    const terms = await this.db.semester.findMany({
+      where: { startsOn: { lte: now } },
+      orderBy: [{ startsOn: 'desc' }, { code: 'asc' }],
+      select: { id: true, code: true, name: true, endsOn: true },
+    })
+    const selected = terms.find((term) => term.endsOn >= now) ?? terms[0]
+    return {
+      semesters: terms.map(({ id, code, name }) => ({ id, code, name })),
+      defaultSemesterId: selected?.id ?? null,
+    }
+  }
+
+  async memberLeaderboard(userId: string, semesterId: string) {
+    await assertCurrentClubMember(this.db, userId)
+    const semester = await this.db.semester.findFirst({ where: { id: semesterId, startsOn: { lte: new Date() } } })
+    if (!semester) throw new EvaluationError('学期不存在或尚未开始', 'NOT_FOUND')
+    const ranked = await this.realtimeTierRows(semester)
+    return {
+      rows: ranked.map((r) => ({
+        rank: r.rankNo,
+        displayName: r.displayName,
+        hScore: r.hScore,
+        tier: r.tier,
+        suggestedScore: r.suggestedScore,
+        needsManual: r.tiebreak.needsManual,
+        isMe: r.userId === userId,
+      })),
     }
   }
 
@@ -353,7 +387,7 @@ export class EvaluationService {
       this.db.membershipTerm.findMany({
         where: { semesterId: semester.id },
         include: {
-          user: { select: { id: true, studentNo: true, verifiedRealName: true, principalId: true, accountStatus: true, createdAt: true } },
+          user: { select: { id: true, studentNo: true, verifiedRealName: true, profile: { select: { displayName: true } }, principalId: true, accountStatus: true, createdAt: true } },
         },
       }),
       this.db.user.findMany({
@@ -362,6 +396,7 @@ export class EvaluationService {
           id: true,
           studentNo: true,
           verifiedRealName: true,
+          profile: { select: { displayName: true } },
           principalId: true,
           accountStatus: true,
           createdAt: true,
@@ -375,6 +410,7 @@ export class EvaluationService {
       userId: string
       studentNo: string
       realName: string
+      displayName: string
       principalId: string
       accountStatus: string
       membershipStatus: string
@@ -384,6 +420,7 @@ export class EvaluationService {
         userId: t.userId,
         studentNo: t.user.studentNo,
         realName: t.user.verifiedRealName,
+        displayName: memberName(t.user),
         principalId: t.user.principalId,
         accountStatus: t.user.accountStatus,
         membershipStatus: t.membershipStatus,
@@ -397,6 +434,7 @@ export class EvaluationService {
         userId: u.id,
         studentNo: u.studentNo,
         realName: u.verifiedRealName,
+        displayName: memberName(u),
         principalId: u.principalId,
         accountStatus: u.accountStatus,
         membershipStatus: latestStatus,
@@ -527,6 +565,7 @@ export class EvaluationService {
         userId: member.userId,
         studentNo: member.studentNo,
         realName: member.realName,
+        displayName: member.displayName,
         membership: member.membershipStatus,
         currentE: round(Number(eff.e), 2),
         semesterTotal,
@@ -682,7 +721,8 @@ export class EvaluationService {
     })
 
     const tierable = scored.filter((r) => !r.excluded && !r.cadre)
-    tierable.sort(compareForTier)
+    // 完全同分仍标记「需人工认定」，在裁定前让各次实时读取显示一致的名次。
+    tierable.sort((a, b) => compareForTier(a, b) || a.studentNo.localeCompare(b.studentNo))
     for (let i = 1; i < tierable.length; i += 1) {
       const prev = tierable[i - 1]!
       const curr = tierable[i]!
@@ -872,7 +912,7 @@ export class EvaluationService {
     })
 
     const tierable = effective.filter((r) => !r.excluded && !r.cadre)
-    tierable.sort(compareForTier)
+    tierable.sort((a, b) => compareForTier(a, b) || a.studentNo.localeCompare(b.studentNo))
     const counts = tierCounts(tierable.length, ratios)
     tierable.forEach((row, index) => {
       row.rankNo = index + 1
@@ -1012,18 +1052,21 @@ export class EvaluationService {
     return { csv: `${lines.join('\n')}\n`, filename }
   }
 
+  private async realtimeTierRows(semester: { id: string; startsOn: Date; endsOn: Date }) {
+    const { candidates } = await this.collect(semester)
+    return this.assign(candidates)
+      .filter((r): r is ScoredCandidate & { rankNo: number; tier: 'A' | 'B' | 'C' } => r.rankNo !== null && r.tier !== null)
+      .sort((a, b) => a.rankNo - b.rankNo)
+  }
+
   /** 实时按学期直接导出综评表（含积分），不落库、不锁定、不受时间限制 */
   async exportRealtimeCsv(semesterId: string): Promise<{ csv: string; filename: string }> {
     const semester = await this.db.semester.findUnique({ where: { id: semesterId } })
     if (!semester) throw new EvaluationError('学期不存在', 'NOT_FOUND')
-    const { candidates } = await this.collect(semester)
-    const scored = this.assign(candidates)
+    const tierable = await this.realtimeTierRows(semester)
     const lines = [
       '学号,姓名,口径,排名,定档,当前有效积分,学期总积分,月均积分,积分标准分,竞赛标准分,服务标准分,纪律扣减,综合分H,加分',
     ]
-    const tierable = scored
-      .filter((r) => !r.excluded && !r.cadre && r.tier != null)
-      .sort((a, b) => (a.rankNo ?? 0) - (b.rankNo ?? 0) || a.studentNo.localeCompare(b.studentNo))
     for (const r of tierable) {
       lines.push([
         csvCell(r.studentNo),

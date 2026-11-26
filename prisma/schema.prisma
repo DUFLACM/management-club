@@ -1186,6 +1186,7 @@ model PointsLedgerEntry {
   scoreMonth     String    @map("score_month") @db.VarChar(7)
   recordedAt     DateTime @db.Timestamptz(3)  @map("recorded_at")
   status         String    @default("approved") // approved | reversed | superseded
+  bonusVisible   Boolean   @default(true) @map("bonus_visible") // 成员共享加分明细的逐笔可见性
   batchId        String?   @map("batch_id") @db.Uuid
   ruleVersionId  String?   @map("rule_version_id") @db.Uuid
   detail         Json? // 计算过程、组件、上限调整

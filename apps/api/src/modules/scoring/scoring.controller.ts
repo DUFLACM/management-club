@@ -1,4 +1,4 @@
-import { Body, Controller, Inject, Delete, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common'
+import { Body, Controller, Inject, Delete, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common'
 import { z } from 'zod'
 import { SessionGuard, PermissionsGuard, ActionGuard, RequireAction, CurrentUser, CurrentActor, ok } from '../../common/guards.js'
 import { ScoringService, ScoringError, ledgerEntrySchema } from './scoring.service.js'
@@ -30,6 +30,15 @@ export class ScoringMeController {
     const viewerId = user?.userId ?? null
     const validKind = kind === 'disclosure' ? kind : 'current'
     return ok(await this.scoring.leaderboard(validKind, ref, viewerId))
+  }
+
+  @Get('bonus-records')
+  async bonusRecords(
+    @CurrentUser() user: { userId: string },
+    @Query('semesterId', ParseUUIDPipe) semesterId: string,
+    @Query('cursor', new ParseUUIDPipe({ optional: true })) cursor?: string,
+  ) {
+    return ok(await this.scoring.memberBonusRecords(user.userId, semesterId, cursor))
   }
 
   /** 成员端公示批次卡片列表（进行中优先，不再依赖粘贴引用） */
@@ -111,11 +120,20 @@ export class ScoringAdminController {
     return ok(await this.scoring.listAdminLedgerEntries({ scope: validScope, month, status, q, cursor }))
   }
 
+  @Patch('ledger-entries/:id/bonus-visibility')
+  @RequireAction('points.review')
+  async setBonusVisibility(@CurrentActor() actor: SessionActor, @Param('id', ParseUUIDPipe) id: string, @Body() body: unknown) {
+    const parsed = z.object({ visible: z.boolean() }).safeParse(body)
+    if (!parsed.success) throw new ScoringError('请选择加分记录的展示状态', 'INVALID_INPUT')
+    return ok(await this.scoring.setBonusVisibility(actor, id, parsed.data.visible))
+  }
+
   @Post('ledger-entries')
   @RequireAction('points.review')
   async postEntry(@CurrentActor() actor: SessionActor, @Body() body: unknown) {
-    const input = ledgerEntrySchema.parse(body)
-    return ok(await this.scoring.postLedgerEntry(actor, input))
+    const parsed = ledgerEntrySchema.safeParse(body)
+    if (!parsed.success) throw new ScoringError(parsed.error.issues[0].message, 'INVALID_INPUT')
+    return ok(await this.scoring.postLedgerEntry(actor, parsed.data))
   }
 
   /** 批量核对成员：粘贴的学号或姓名可能同名，先返回候选让管理员选 */
@@ -142,6 +160,7 @@ export class ScoringAdminController {
     const parsed = z.object({
       rows: z.array(rowSchema).min(1).max(200),
       category: z.enum(['contest', 'remote_contest', 'activity', 'contribution', 'service', 'award', 'initial', 'penalty']).default('activity'),
+      bonusVisible: z.boolean().optional(),
       activityId: z.string().uuid().optional(),
       scoreMonth: z.string().regex(/^\d{4}-\d{2}$/).optional(),
     }).safeParse(body)

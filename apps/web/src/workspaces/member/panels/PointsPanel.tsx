@@ -26,6 +26,7 @@ import {
   formatDateTime,
   formatSignedAmount,
   ledgerStatusBadge,
+  LEDGER_CATEGORY_LABELS as CATEGORY_LABELS,
   monthLabel,
   platformLabel,
 } from '@/lib/format';
@@ -122,18 +123,6 @@ const APPEAL_STATUS_LABELS: Record<string, string> = {
   in_review: '受理中',
   resolved: '已采纳结案',
   rejected: '已驳回',
-};
-
-const CATEGORY_LABELS: Record<string, string> = {
-  contest: '比赛',
-  remote_contest: '远程比赛',
-  activity: '活动',
-  contribution: '贡献',
-  service: '服务',
-  award: '奖项',
-  initial: '入社基础分',
-  penalty: '扣分',
-  reversal: '冲正',
 };
 
 export default function PointsPanel() {

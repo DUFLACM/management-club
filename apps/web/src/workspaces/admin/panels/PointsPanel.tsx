@@ -7,7 +7,7 @@
  * - 月度批次 POST /admin/scoring-batches（blocked=R01 提示）；
  * - 公示 POST /admin/disclosures（48h 校验错误显示）+ GET /admin/disclosures 列表。
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useId, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -24,12 +24,13 @@ import {
 import { api, ApiError } from '@/lib/api';
 import { usePrivateQuery } from '@/lib/query';
 import { usePrivateInfiniteQuery } from '@/lib/private-infinite';
-import { usePrincipal } from '@/lib/session';
+import { hasAnyAction, usePrincipal } from '@/lib/session';
 import { LoadMoreButton } from '@/lib/hooks';
 import {
   currentMonthKey,
   formatDateTime,
   formatSignedAmount,
+  LEDGER_CATEGORY_LABELS,
   ledgerStatusBadge,
 } from '@/lib/format';
 import { PanelHeader } from '@/components/club/PanelHeader';
@@ -152,19 +153,8 @@ interface AdminLedgerEntryDto {
   note: string | null;
   eventName: string;
   eventKind: string;
+  bonusVisible: boolean;
 }
-
-const LEDGER_CATEGORY_LABELS: Record<string, string> = {
-  contest: '比赛',
-  remote_contest: '远程比赛',
-  activity: '活动',
-  contribution: '贡献',
-  service: '服务',
-  award: '奖项',
-  initial: '入社基础分',
-  penalty: '扣分',
-  reversal: '冲正',
-};
 
 interface DisclosureRowDto {
   id: string;
@@ -1224,6 +1214,9 @@ function ManualLedgerRecordsTab({
   const [reverseTarget, setReverseTarget] = useState<AdminLedgerEntryDto | null>(null);
   const [reverseReason, setReverseReason] = useState('');
   const [replacementAmount, setReplacementAmount] = useState('');
+  const queryClient = useQueryClient();
+  const principal = usePrincipal();
+  const canManageVisibility = hasAnyAction(principal?.roles ?? [], ['points.review']);
 
   useEffect(() => {
     const timer = setTimeout(() => setQueryText(searchInput.trim()), 300);
@@ -1270,6 +1263,48 @@ function ManualLedgerRecordsTab({
     },
     onError: (error: ApiError) => onNotice({ tone: 'error', text: error.message }),
   });
+
+  const visibilityMutation = useMutation({
+    mutationFn: async (item: AdminLedgerEntryDto) => (
+      await api.patch<{ id: string; visible: boolean }>(`/admin/ledger-entries/${item.id}/bonus-visibility`, {
+        visible: !item.bonusVisible,
+      })
+    ).data,
+    onSuccess: async ({ visible }, item) => {
+      onNotice({ tone: 'info', text: `「${item.eventName}」${visible ? '已恢复公示' : '已从加分公示中隐藏'}。` });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'ledger-entries'] }),
+        queryClient.invalidateQueries({
+          predicate: ({ queryKey }) => queryKey[0] === 'principal' && queryKey[2] === 'me' && queryKey[3] === 'bonus-records',
+        }),
+      ]);
+    },
+    onError: (error: ApiError) => onNotice({ tone: 'error', text: error.message }),
+  });
+
+  function renderBonusVisibility(item: AdminLedgerEntryDto) {
+    if (item.status !== 'approved' || Number(item.amount) <= 0 || item.category === 'reversal') {
+      return <span className="text-xs text-muted-foreground">不参与公示</span>;
+    }
+    return (
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs">
+        <span className="text-muted-foreground">{item.bonusVisible ? '已公示' : '已隐藏'}</span>
+        {canManageVisibility && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="h-7 px-2 text-xs"
+            aria-label={`${item.bonusVisible ? '隐藏' : '恢复'}${item.user?.verifiedRealName ?? ''}的「${item.eventName}」加分公示`}
+            disabled={visibilityMutation.isPending}
+            onClick={() => visibilityMutation.mutate(item)}
+          >
+            {item.bonusVisible ? '隐藏' : '恢复公示'}
+          </Button>
+        )}
+      </span>
+    );
+  }
 
   const items = ledgerQuery.data?.pages.flatMap((page) => page.items) ?? [];
   const activeApproved = items.filter((item) => item.status === 'approved');
@@ -1378,6 +1413,7 @@ function ManualLedgerRecordsTab({
                       <TableHead className="text-right">分值</TableHead>
                       <TableHead>状态</TableHead>
                       <TableHead>入账时间</TableHead>
+                      <TableHead>加分公示</TableHead>
                       <TableHead className="text-right">操作</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -1437,6 +1473,7 @@ function ManualLedgerRecordsTab({
                           <TableCell className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">
                             {formatDateTime(item.recordedAt)}
                           </TableCell>
+                          <TableCell>{renderBonusVisibility(item)}</TableCell>
                           <TableCell className="text-right whitespace-nowrap">
                             {canReverse ? (
                               <Button
@@ -1496,6 +1533,7 @@ function ManualLedgerRecordsTab({
                             </span>
                           )}
                         </span>
+                        {renderBonusVisibility(item)}
                         {canReverse && (
                           <Button
                             type="button"
@@ -1757,6 +1795,27 @@ interface BatchMemberResolution {
   error?: string;
 }
 
+function BonusPublicationField({ checked, onChange }: { checked: boolean; onChange: (checked: boolean) => void }) {
+  const hintId = useId();
+  return (
+    <div className="grid gap-1 sm:col-span-2">
+      <label className="flex items-center gap-2 text-sm font-medium">
+        <input
+          className="size-4 accent-primary"
+          type="checkbox"
+          checked={checked}
+          onChange={(event) => onChange(event.target.checked)}
+          aria-describedby={hintId}
+        />
+        在成员端公示加分
+      </label>
+      <p id={hintId} className="pl-6 text-xs text-muted-foreground">
+        勾选后，全体成员可在「加分公示」查看正分记录。本人始终可以查看自己的积分流水。
+      </p>
+    </div>
+  );
+}
+
 /** 解析粘贴/CSV 行：`学号或姓名 分数 备注`，分隔符支持逗号（中英）、Tab、空白 */
 function parseBatchRows(text: string): ParsedBatchRow[] {
   return text
@@ -1790,6 +1849,7 @@ function BatchLedgerDialog({
   const [scoreMonth, setScoreMonth] = useState(currentMonthKey());
   const [activityId, setActivityId] = useState('none');
   const [rawText, setRawText] = useState('');
+  const [bonusVisible, setBonusVisible] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ posted: number; deduplicated: number; failed: Array<{ studentNo: string; error: string }> } | null>(null);
   /** 同名候选：输入值 → 选定的学号 */
@@ -1806,6 +1866,7 @@ function BatchLedgerDialog({
 
   const parsed = parseBatchRows(rawText);
   const validRows = parsed.filter((row) => !row.error);
+  const hasBonus = validRows.some((row) => Number(row.amount) > 0);
   const invalidRows = parsed.filter((row) => row.error);
   const identifierKey = [...new Set(validRows.map((row) => row.query))].sort().join('\u0000');
 
@@ -1860,6 +1921,7 @@ function BatchLedgerDialog({
           })),
           category,
           scoreMonth,
+          ...(!bonusVisible && hasBonus ? { bonusVisible: false } : {}),
           ...(activityId !== 'none' ? { activityId } : {}),
         },
       );
@@ -1870,6 +1932,7 @@ function BatchLedgerDialog({
       setError(null);
       setRawText('');
       setMemberChoices({});
+      setBonusVisible(true);
       void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
     },
     onError: (cause: ApiError) => {
@@ -2058,6 +2121,9 @@ function BatchLedgerDialog({
             </div>
           )}
         </div>
+        {(validRows.length === 0 || hasBonus) && (
+          <BonusPublicationField checked={bonusVisible} onChange={setBonusVisible} />
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <Button
             disabled={mutation.isPending || checking || readyRows.length === 0 || readyRows.length !== validRows.length}
@@ -2092,6 +2158,7 @@ function LedgerEntryDialog({
     amount: '',
     scoreMonth: currentMonthKey(),
     detail: '',
+    bonusVisible: true,
   });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -2106,6 +2173,7 @@ function LedgerEntryDialog({
           category: form.category,
           amount: form.amount.trim(),
           scoreMonth: form.scoreMonth,
+          ...(!form.bonusVisible && Number(form.amount) > 0 ? { bonusVisible: false } : {}),
           ...(form.detail.trim() ? { detail: { note: form.detail.trim() } } : {}),
         },
       );
@@ -2227,6 +2295,12 @@ function LedgerEntryDialog({
               maxLength={200}
             />
           </div>
+          {(!form.amount.trim() || Number(form.amount) > 0) && (
+            <BonusPublicationField
+              checked={form.bonusVisible}
+              onChange={(bonusVisible) => setForm({ ...form, bonusVisible })}
+            />
+          )}
           <div className="sm:col-span-2">
             <Button type="submit" disabled={mutation.isPending}>
               {mutation.isPending && <LoaderCircleIcon className="animate-spin" aria-hidden="true" />}

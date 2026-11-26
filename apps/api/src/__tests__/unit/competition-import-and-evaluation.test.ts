@@ -206,22 +206,31 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
       semester: {
         findMany: vi.fn().mockResolvedValue([futureSemester]),
         findUnique: vi.fn().mockResolvedValue(futureSemester),
+        findFirst: vi.fn().mockResolvedValue(futureSemester),
       },
       membershipTerm: {
         findMany: vi.fn().mockResolvedValue([
           {
             userId: U1,
             membershipStatus: 'formal',
-            user: { id: U1, studentNo: '202400001', verifiedRealName: '张三', principalId: 'p-1', accountStatus: 'active', createdAt: new Date('2026-09-01T00:00:00Z') },
+            user: { id: U1, studentNo: '202400001', verifiedRealName: '张三', profile: { displayName: '小张' }, principalId: 'p-1', accountStatus: 'active', createdAt: new Date('2026-09-01T00:00:00Z') },
           },
           {
             userId: U2,
             membershipStatus: 'formal',
             user: { id: U2, studentNo: '202400002', verifiedRealName: '李四', principalId: 'p-2', accountStatus: 'active', createdAt: new Date('2026-09-01T00:00:00Z') },
           },
+          {
+            userId: U3,
+            membershipStatus: 'observing',
+            user: { id: U3, studentNo: '202400003', verifiedRealName: '王五', principalId: 'p-3', accountStatus: 'active', createdAt: new Date('2026-09-01T00:00:00Z') },
+          },
         ]),
       },
-      user: { findMany: vi.fn().mockResolvedValue([]) },
+      user: {
+        findMany: vi.fn().mockResolvedValue([]),
+        findUnique: vi.fn().mockResolvedValue({ accountStatus: 'active', membershipTerms: [{ membershipStatus: 'formal' }] }),
+      },
       monthlyScore: { findMany: vi.fn().mockResolvedValue([]) },
       pointsLedgerEntry: {
         groupBy: vi.fn().mockImplementation(async ({ by }: { by: string[] }) => {
@@ -260,7 +269,7 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
     expect(semRes.semesters[0]?.canGenerate).toBe(true)
 
     const gen = await svc.generate(ACTOR, futureSemester.id)
-    expect(gen).toMatchObject({ isTest: false, rowCount: 2 })
+    expect(gen).toMatchObject({ isTest: false, rowCount: 3 })
 
     const liveEval = await svc.exportRealtimeCsv(futureSemester.id)
     expect(liveEval.filename).not.toContain('测试数据')
@@ -271,6 +280,63 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
     expect(livePoints.csv).toContain('学号,姓名,在册身份,综评状态,当前有效积分,学期总积分,月均积分,活动积分,竞赛积分,服务贡献积分')
     expect(livePoints.csv).toContain('202400001,张三')
     expect(livePoints.csv).toContain('202400002,李四')
+    expect(livePoints.csv).toContain('202400003,王五')
+
+    const board = await svc.memberLeaderboard(U1, futureSemester.id)
+    const exported = liveEval.csv.trim().split('\n').slice(1).map((line) => line.split(','))
+    expect(board.rows).toEqual(exported.map((cells) => ({
+      rank: Number(cells[3]),
+      displayName: cells[1] === '张三' ? '小张（张三）' : '李四',
+      hScore: Number(cells[12]),
+      tier: cells[4],
+      suggestedScore: Number(cells[13]),
+      needsManual: false,
+      isMe: cells[0] === '202400001',
+    })))
+    expect(board.rows).toHaveLength(2)
+    expect(db.semester.findFirst).toHaveBeenCalledWith({ where: { id: futureSemester.id, startsOn: { lte: expect.any(Date) } } })
+
+    // 账本全空时所有指标完全相同，两次查询的原始顺序也可能不同。
+    db.pointsLedgerEntry.groupBy.mockResolvedValue([])
+    const terms = await db.membershipTerm.findMany()
+    db.membershipTerm.findMany.mockResolvedValueOnce(terms.toReversed())
+    const tiedBoard = await svc.memberLeaderboard(U1, futureSemester.id)
+    const tiedExport = await svc.exportRealtimeCsv(futureSemester.id)
+    expect(tiedBoard.rows.map((row) => row.isMe)).toEqual([true, false])
+    expect(tiedBoard.rows.map((row) => row.needsManual)).toEqual([true, true])
+    expect(tiedExport.csv.trim().split('\n').slice(1).map((line) => line.split(',')[0]))
+      .toEqual(['202400001', '202400002'])
+  })
+
+  it('成员可选已开始的学期，默认进行中的学期，间歇期回退至最近学期', async () => {
+    const now = Date.now()
+    const ended = { ...futureSemester, id: 'ended', endsOn: new Date(now - 86_400_000) }
+    const active = { ...futureSemester, id: 'active', endsOn: new Date(now + 86_400_000) }
+    const db = {
+      semester: {
+        findMany: vi.fn().mockResolvedValueOnce([ended, active]).mockResolvedValueOnce([ended]).mockResolvedValueOnce([]),
+        findFirst: vi.fn().mockResolvedValue(null),
+      },
+      user: { findUnique: vi.fn().mockResolvedValue({ accountStatus: 'active', membershipTerms: [{ membershipStatus: 'observing' }] }) },
+    }
+    const svc = new EvaluationService(db as never, {} as never)
+    expect((await svc.memberSemesters(U1)).defaultSemesterId).toBe(active.id)
+    expect(db.semester.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { startsOn: { lte: expect.any(Date) } },
+      orderBy: [{ startsOn: 'desc' }, { code: 'asc' }],
+    }))
+    expect((await svc.memberSemesters(U1)).defaultSemesterId).toBe(ended.id)
+    expect(await svc.memberSemesters(U1)).toEqual({ semesters: [], defaultSemesterId: null })
+    await expect(svc.memberLeaderboard(U1, futureSemester.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+  })
+
+  it('非在册成员不能读取学期列表与综评排行榜', async () => {
+    const db = {
+      user: { findUnique: vi.fn().mockResolvedValue({ accountStatus: 'active', membershipTerms: [{ membershipStatus: 'withdrawn' }] }) },
+    }
+    const svc = new EvaluationService(db as never, {} as never)
+    await expect(svc.memberSemesters(U1)).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    await expect(svc.memberLeaderboard(U1, futureSemester.id)).rejects.toMatchObject({ code: 'FORBIDDEN' })
   })
 
   it('历史已发布状态的批次不再锁定，仍可修改与重算', async () => {

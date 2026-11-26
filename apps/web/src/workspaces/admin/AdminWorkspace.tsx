@@ -37,7 +37,7 @@ import {
  * - 顶栏明确“管理工作台”与当前授权角色，避免与成员端混淆；
  * - section/tab 来自 URL query（白名单解析，非法值回 overview）；
  *   面板内子标签（如 activities 的 venues、现场码显示模式）由面板自读 searchParams；
- * - 手机端使用顶部菜单按钮 + 导航 Sheet，不挤入成员六项底栏。
+ * - 手机端使用顶部菜单按钮 + 导航 Sheet，不挤入成员底栏。
  */
 
 export const ADMIN_SECTIONS: readonly WorkspaceSection[] = [

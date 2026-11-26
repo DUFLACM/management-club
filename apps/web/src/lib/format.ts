@@ -121,6 +121,18 @@ export function formatVenue(venue: {
 
 // ---------------- 领域文案 ----------------
 
+export const LEDGER_CATEGORY_LABELS: Record<string, string> = {
+  contest: '比赛',
+  remote_contest: '远程比赛',
+  activity: '活动',
+  contribution: '贡献',
+  service: '服务',
+  award: '奖项',
+  initial: '入社基础分',
+  penalty: '扣分',
+  reversal: '冲正',
+};
+
 export const ACTIVITY_TYPE_LABELS: Record<string, string> = {
   weekly_contest: '周赛',
   monthly_contest: '月赛',

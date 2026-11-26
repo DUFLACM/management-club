@@ -2,6 +2,7 @@ import { beforeAll, afterAll, describe, expect, it } from 'vitest'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { ScoringService, ledgerEntrySchema } from '../../modules/scoring/scoring.service.js'
+import { ScoringAdminController } from '../../modules/scoring/scoring.controller.js'
 import { CompetitionEventService } from '../../modules/competitions/competition-event.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { createTestUser, makeActor } from './helpers.js'
@@ -106,6 +107,103 @@ describe('公示', () => {
     await expect(
       scoring.publishMonthlyDisclosure(makeActor(), '2026-09', now, new Date(now.getTime() + 24 * 3600_000)),
     ).rejects.toMatchObject({ code: 'DISCLOSURE_TOO_SHORT' })
+  })
+})
+
+describe('学期共享加分明细', () => {
+  it('按积分归属月、可见性与生效状态过滤，同一秒多笔记录跨页完整', async () => {
+    const semester = await db.semester.create({ data: {
+      id: crypto.randomUUID(), code: 'BONUS', name: '公示测试',
+      startsOn: new Date('2021-08-31T16:00:00Z'), endsOn: new Date('2021-10-31T15:59:59Z'),
+    } })
+    const viewer = await createTestUser(db, { studentNo: '202606071', membership: 'observing' })
+    const owner = await createTestUser(db, { studentNo: '202606072', name: '加分成员' })
+    const reviewer = makeActor()
+    const record = (amount: string, scoreMonth = '2021-09', category = 'service', status = 'approved') => ({
+      id: crypto.randomUUID(), userId: owner.userId, sourceKey: crypto.randomUUID(), category, amount, scoreMonth, status,
+      recordedAt: new Date('2022-01-01T00:00:00Z'), detail: { note: '审核备注仅本人可见' },
+    })
+    const visible = Array.from({ length: 27 }, (_, i) => record('3.75', i === 0 ? '2021-10' : '2021-09'))
+    const others = [
+      record('0'), record('-2'), record('2', '2021-09', 'reversal'), record('3', '2021-09', 'service', 'reversed'),
+      record('1', '2021-08'), record('1', '2021-11'),
+    ]
+    await db.pointsLedgerEntry.createMany({ data: [...visible, ...others] })
+    const first = await scoring.memberBonusRecords(viewer.userId, semester.id)
+    expect(first.items).toHaveLength(25)
+    expect(first.items[0]).toEqual({
+      id: expect.any(String), displayName: '加分成员', amount: '3.75', scoreMonth: expect.any(String),
+      recordedAt: '2022-01-01T00:00:00.000Z', category: 'service', eventName: expect.stringMatching(/^服务积分/),
+    })
+    expect(first.nextCursor).toBe(first.items[24]!.id)
+    const second = await scoring.memberBonusRecords(viewer.userId, semester.id, first.nextCursor)
+    expect(second.nextCursor).toBeUndefined()
+    expect([...first.items, ...second.items].map((r) => r.id).sort()).toEqual(visible.map((r) => r.id).sort())
+
+    const id = first.nextCursor!
+    await scoring.setBonusVisibility(reviewer, id, false)
+    await scoring.setBonusVisibility(reviewer, id, false)
+    expect((await scoring.memberBonusRecords(viewer.userId, semester.id)).items.some((r) => r.id === id)).toBe(false)
+    expect((await scoring.memberBonusRecords(viewer.userId, semester.id, id)).items).toEqual(second.items)
+    const admin = await scoring.listAdminLedgerEntries({ scope: 'all', q: '202606072' })
+    expect(admin.items.find((r) => r.id === id)).toMatchObject({ bonusVisible: false, status: 'approved', amount: '3.75' })
+    expect((await db.pointsLedgerEntry.findUniqueOrThrow({ where: { id } })).userId).toBe(owner.userId)
+    await scoring.setBonusVisibility(reviewer, id, true)
+    expect((await scoring.memberBonusRecords(viewer.userId, semester.id)).items).toEqual(first.items)
+    expect(await db.auditLog.count({ where: { resourceId: id, action: 'points.bonus_visibility' } })).toBe(2)
+    await expect(scoring.setBonusVisibility(reviewer, others[0]!.id, false)).rejects.toMatchObject({ code: 'STATE_INVALID' })
+
+    await scoring.setBonusVisibility(reviewer, id, false)
+    const { replacementId } = await scoring.reverseEntry(reviewer, id, '修正分值', '4')
+    expect(await db.pointsLedgerEntry.findUniqueOrThrow({ where: { id: replacementId! } })).toMatchObject({ bonusVisible: false })
+    expect((await scoring.myLedger(owner.userId, { month: first.items[24]!.scoreMonth })).items.some((r) => r.id === replacementId)).toBe(true)
+  })
+
+  it('要求在册成员，拒绝未来学期，只返回已经开始的归属月', async () => {
+    const viewer = await createTestUser(db, { studentNo: '202606073', membership: 'provisional' })
+    await expect(scoring.memberBonusRecords(viewer.userId, crypto.randomUUID())).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    const future = await db.semester.create({ data: {
+      id: crypto.randomUUID(), code: 'BONUS-FUTURE', name: '未来学期',
+      startsOn: new Date('2100-01-01'), endsOn: new Date('2100-06-30'),
+    } })
+    await expect(scoring.memberBonusRecords(viewer.userId, future.id)).rejects.toMatchObject({ code: 'NOT_FOUND' })
+    const semester = await db.semester.create({ data: {
+      id: crypto.randomUUID(), code: 'BONUS-ONGOING', name: '当前学期', startsOn: new Date(), endsOn: new Date('2100-06-30'),
+    } })
+    const reviewer = makeActor()
+    const { entryId } = await scoring.postLedgerEntry(reviewer, {
+      userId: viewer.userId, sourceKey: 'manual:future-bonus', category: 'activity', amount: '5', scoreMonth: '2100-05',
+    })
+    expect((await scoring.memberBonusRecords(viewer.userId, semester.id)).items.map((r) => r.id)).not.toContain(entryId)
+    const applicant = await createTestUser(db, { studentNo: '202606074', membership: 'applicant' })
+    await expect(scoring.memberBonusRecords(applicant.userId, semester.id)).rejects.toMatchObject({ code: 'FORBIDDEN' })
+    const adminController = new ScoringAdminController(scoring, db, {} as never, {} as never)
+    await expect(adminController.setBonusVisibility(reviewer, entryId, { visible: 'false' })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+  })
+
+  it('单笔及批量入账可直接隐藏，幂等重试与撤回重记都保留隐藏状态', async () => {
+    const owner = await createTestUser(db, { studentNo: '202606075' })
+    await createTestUser(db, { studentNo: '202606076' })
+    const reviewer = makeActor()
+    const controller = new ScoringAdminController(scoring, db, {} as never, {} as never)
+    const input = { userId: owner.userId, sourceKey: 'manual:hidden-at-post', category: 'activity', amount: '2.5', scoreMonth: '2021-09' }
+    const { data: { entryId } } = await controller.postEntry(reviewer, { ...input, bonusVisible: false })
+    expect(await db.pointsLedgerEntry.findUniqueOrThrow({ where: { id: entryId } })).toMatchObject({ bonusVisible: false })
+    expect((await db.auditLog.findFirstOrThrow({ where: { resourceId: entryId, action: 'points.post' } })).summary).toContain('不公示')
+    expect((await controller.postEntry(reviewer, { ...input, bonusVisible: true })).data).toEqual({ entryId, deduplicated: true })
+    await scoring.reverseEntry(reviewer, entryId, '重新核定积分', null)
+    const repost = await controller.postEntry(reviewer, { ...input, idempotencyKey: 'manual:post-again' })
+    expect(await db.pointsLedgerEntry.findUniqueOrThrow({ where: { id: repost.data.entryId } })).toMatchObject({ bonusVisible: false })
+
+    const batch = await controller.postEntriesBatch(reviewer, { scoreMonth: '2021-09', bonusVisible: false, rows: [
+      { studentNo: '202606075', amount: '4' }, { studentNo: '202606076', amount: '-1' },
+    ] })
+    expect(batch.data.posted).toBe(2)
+    const rows = await db.pointsLedgerEntry.findMany({
+      where: { sourceKey: { startsWith: `manual:${batch.data.batchId}:` } }, orderBy: { amount: 'desc' },
+    })
+    expect(rows.map((r) => r.bonusVisible)).toEqual([false, true])
+    await expect(controller.postEntry(reviewer, { ...input, bonusVisible: 'no' })).rejects.toMatchObject({ code: 'INVALID_INPUT' })
   })
 })
 

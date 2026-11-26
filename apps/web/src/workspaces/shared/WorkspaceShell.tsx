@@ -45,7 +45,7 @@ import { ChangePasswordDialog } from '@/workspaces/shared/ChangePasswordDialog';
  *
  * - ≥1024px：232px 侧栏 + 64px 顶栏，内容 max-width 1440px、padding 32px；
  * - 768–1023px：72px 图标侧栏，可展开为 232px 浮层，不压缩内容区；
- * - 320–767px：56px 顶栏 + 56px 加安全区的六项底栏（成员端）；
+ * - 320–767px：56px 顶栏 + 56px 加安全区的成员底栏；
  *   管理端手机使用顶栏菜单按钮 + 导航 Sheet。
  * - 选中项：淡蓝底、蓝字、左侧 3px 标记、圆角 10px；
  * - 内容容器 min-w-0，避免表格/长字段撑破布局。
@@ -101,7 +101,7 @@ function navigationGroups(variant: 'member' | 'admin', sections: readonly Worksp
   const groups = variant === 'member'
     ? [
       { label: '训练室', keys: ['overview', 'activities', 'attendance', 'contests', 'contributions'] },
-      { label: '积分与资料', keys: ['points', 'ranking', 'profile'] },
+      { label: '积分与资料', keys: ['points', 'ranking', 'publicity', 'profile'] },
     ]
     : [
       { label: '业务管理', keys: ['overview', 'members', 'activities', 'contests', 'points', 'evaluation'] },
@@ -582,7 +582,7 @@ export function WorkspaceShell({
           </div>
         </main>
 
-        {/* 手机六项底栏：仅成员端；管理端用顶栏菜单 + Sheet */}
+        {/* 手机底栏：仅成员端；管理端用顶栏菜单 + Sheet */}
         {variant === 'member' && (
           <MobileNavigation currentSection={currentSection} onNavigate={onNavigate} />
         )}

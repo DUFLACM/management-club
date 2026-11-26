@@ -17,7 +17,7 @@ import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { ActivityService } from '../activities/activity.service.js'
 import { ContestStandingsService } from '../activities/contest-standings.service.js'
-import { initialSummary, rankEligibleMembers } from './effective-ranking.js'
+import { assertCurrentClubMember, initialSummary, rankEligibleMembers } from './effective-ranking.js'
 import { mergeRuleParams } from './rule-params.js'
 import { computeContestW, hasValidSubmission, type LambdaKey } from './contest-formula.js'
 import { newId, monthKey, monthKeyPlus, memberName, visibleAvatar } from '../../common/utils.js'
@@ -44,6 +44,7 @@ export const ledgerEntrySchema = z.object({
   category: z.enum(['contest', 'remote_contest', 'activity', 'contribution', 'service', 'award', 'initial', 'penalty', 'reversal']),
   amount: z.string().regex(/^-?\d+(\.\d+)?$/, '金额为十进制字符串'),
   scoreMonth: z.string().regex(/^\d{4}-\d{2}$/),
+  bonusVisible: z.boolean().optional(),
   detail: z.record(z.string(), z.unknown()).optional(),
   evidenceRef: z.string().max(500).optional(),
   idempotencyKey: z.string().min(8).max(120).optional(),
@@ -408,6 +409,7 @@ export class ScoringService {
       category: string;
       activityId?: string;
       scoreMonth?: string;
+      bonusVisible?: boolean;
     },
   ): Promise<{
     batchId: string;
@@ -450,6 +452,7 @@ export class ScoringService {
           sourceKey: `manual:${batchId}:${user.id}`,
           category: input.category as never,
           amount: row.amount,
+          bonusVisible: input.bonusVisible,
           scoreMonth,
           detail: { note: row.note ?? null, activityId: input.activityId ?? null, activityTitle, batchId },
         })
@@ -505,11 +508,16 @@ export class ScoringService {
   }
 
   async postLedgerEntry(actor: SessionActor | null, input: z.infer<typeof ledgerEntrySchema>): Promise<{ entryId: string; deduplicated: boolean }> {
-    const existing = await this.db.pointsLedgerEntry.findFirst({ where: { sourceKey: input.sourceKey, status: 'approved' } })
-    if (existing) {
+    // 有生效记录时优先复用；撤回后按同一逻辑来源重新入账时延续原来的展示选择。
+    const existing = await this.db.pointsLedgerEntry.findFirst({
+      where: { sourceKey: input.sourceKey },
+      orderBy: [{ status: 'asc' }, { recordedAt: 'desc' }, { id: 'desc' }],
+      select: { id: true, status: true, bonusVisible: true },
+    })
+    if (existing?.status === 'approved') {
       return { entryId: existing.id, deduplicated: true }
     }
-    const entryId = await this.createApprovedEntry(this.db, actor, input)
+    const entryId = await this.createApprovedEntry(this.db, actor, input, existing?.bonusVisible)
     await this.notifyPostedPoints(input)
     return { entryId, deduplicated: false }
   }
@@ -572,8 +580,11 @@ export class ScoringService {
     db: Prisma.TransactionClient,
     actor: SessionActor | null,
     input: z.infer<typeof ledgerEntrySchema>,
+    previousVisibility?: boolean,
   ): Promise<string> {
     const rule = await this.currentRuleVersion(db)
+    const hideBonus = (previousVisibility === false || input.bonusVisible === false)
+      && input.category !== 'reversal' && new Decimal(input.amount).gt(0)
     const id = newId()
     await db.pointsLedgerEntry.create({
       data: {
@@ -582,6 +593,7 @@ export class ScoringService {
         sourceKey: input.sourceKey,
         category: input.category,
         amount: input.amount,
+        ...(hideBonus ? { bonusVisible: false } : {}),
         scoreMonth: input.scoreMonth,
         recordedAt: new Date(),
         status: 'approved',
@@ -597,7 +609,7 @@ export class ScoringService {
       action: 'points.post',
       resourceType: 'points_ledger',
       resourceId: id,
-      summary: `${input.category} ${input.amount}（${input.scoreMonth}，来源 ${input.sourceKey}）`,
+      summary: `${input.category} ${input.amount}（${input.scoreMonth}，来源 ${input.sourceKey}）${hideBonus ? '，加分明细不公示' : ''}`,
     }, db)
     return id
   }
@@ -712,6 +724,7 @@ export class ScoringService {
           sourceKey: `${original.sourceKey}:replacement:${Date.now()}`,
           category: original.category,
           amount: replacementAmount,
+          bonusVisible: original.bonusVisible,
           scoreMonth: original.scoreMonth,
           recordedAt: new Date(),
           status: 'approved',
@@ -742,6 +755,7 @@ export class ScoringService {
   /** 本人流水（含冲正历史；自动解析关联的活动/赛事/贡献事件名称与跳转链接） */
   async myLedger(userId: string, filters: { month?: string; cursor?: string }) {
     const rows = await this.db.pointsLedgerEntry.findMany({
+      omit: { bonusVisible: true },
       where: {
         userId,
         ...(filters.month ? { scoreMonth: filters.month } : {}),
@@ -753,6 +767,81 @@ export class ScoringService {
     const nextCursor = rows.length > 25 ? rows.pop()!.id : undefined
     const enriched = await this.enrichLedgerEntries(rows)
     return { items: enriched, nextCursor }
+  }
+
+  /** 成员共享的学期加分明细。月份与综评汇总均以积分归属月为准。 */
+  async memberBonusRecords(userId: string, semesterId: string, cursor?: string) {
+    await assertCurrentClubMember(this.db, userId)
+    const semester = await this.db.semester.findUnique({
+      where: { id: semesterId }, select: { startsOn: true, endsOn: true },
+    })
+    const now = new Date()
+    if (!semester || semester.startsOn > now) throw new ScoringError('学期不存在', 'NOT_FOUND')
+    const through = semester.endsOn < now ? semester.endsOn : now
+    const scoreMonth = { gte: monthKey(semester.startsOn), lte: monthKey(through) }
+    // 翻页期间上一页末笔可能被隐藏或冲正，仍从它原来的排序位置继续。
+    const boundary = cursor ? await this.db.pointsLedgerEntry.findFirst({
+      where: { id: cursor, scoreMonth }, select: { recordedAt: true, id: true },
+    }) : null
+    if (cursor && !boundary) throw new ScoringError('分页位置已失效，请重新加载', 'INVALID_INPUT')
+    const pageSize = 25
+    const rows = await this.db.pointsLedgerEntry.findMany({
+      where: {
+        status: 'approved',
+        amount: { gt: 0 },
+        category: { not: 'reversal' },
+        bonusVisible: true,
+        scoreMonth,
+        ...(boundary ? { OR: [
+          { recordedAt: { lt: boundary.recordedAt } },
+          { recordedAt: boundary.recordedAt, id: { lt: boundary.id } },
+        ] } : {}),
+      },
+      orderBy: [{ recordedAt: 'desc' }, { id: 'desc' }],
+      take: pageSize + 1,
+      select: {
+        id: true, amount: true, scoreMonth: true, category: true, recordedAt: true,
+        sourceKey: true, detail: true, reversalReason: true, reversesEntryId: true,
+        user: { select: { verifiedRealName: true, profile: { select: { displayName: true } } } },
+      },
+    })
+    const page = rows.slice(0, pageSize)
+    const enriched = await this.enrichLedgerEntries(page, 'shared')
+    return {
+      items: enriched.map((row) => ({
+        id: row.id,
+        displayName: memberName(row.user),
+        eventName: row.eventName,
+        category: row.category,
+        amount: row.amount.toString(),
+        scoreMonth: row.scoreMonth,
+        recordedAt: row.recordedAt.toISOString(),
+      })),
+      nextCursor: rows.length > pageSize ? page.at(-1)!.id : undefined,
+    }
+  }
+
+  async setBonusVisibility(actor: SessionActor, id: string, visible: boolean) {
+    return this.db.$transaction(async (tx) => {
+      // 与冲正/替代写入串行，避免已隐藏记录的替代分被重新公开。
+      await tx.$executeRaw`SELECT id FROM points_ledger WHERE id = ${id}::uuid FOR UPDATE`
+      const row = await tx.pointsLedgerEntry.findUnique({
+        where: { id }, select: { status: true, amount: true, category: true, bonusVisible: true },
+      })
+      if (!row) throw new ScoringError('积分记录不存在', 'NOT_FOUND')
+      if (row.status !== 'approved' || row.amount.lte(0) || row.category === 'reversal') {
+        throw new ScoringError('仅已生效的加分记录可以设置展示状态', 'STATE_INVALID')
+      }
+      if (row.bonusVisible !== visible) {
+        await tx.pointsLedgerEntry.update({ where: { id }, data: { bonusVisible: visible } })
+        await this.audit.log({
+          actorPrincipalId: actor.principalId, action: 'points.bonus_visibility',
+          resourceType: 'points_ledger', resourceId: id,
+          summary: visible ? '恢复成员端加分明细展示' : '隐藏成员端加分明细',
+        }, tx)
+      }
+      return { id, visible }
+    })
   }
 
   /** 将账本原记录批量解析为可读事件名称、发生时间与关联内容摘要（避免直接向成员暴露内部 sourceKey） */
@@ -767,7 +856,7 @@ export class ScoringService {
       reversesEntryId: string | null
       reversalReason: string | null
     },
-  >(rows: T[]) {
+  >(rows: T[], audience: 'private' | 'shared' = 'private') {
     const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
     const asObj = (v: unknown): Record<string, unknown> =>
       v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
@@ -881,8 +970,7 @@ export class ScoringService {
         asStr(detail.activityTitle) ??
         asStr(detail.eventTitle) ??
         asStr(detail.title) ??
-        asStr(detail.note) ??
-        asStr(detail.reason)
+        (audience === 'private' ? asStr(detail.note) ?? asStr(detail.reason) : null)
       if (explicit) return explicit
       if (category === 'initial') return `入社基础分（${scoreMonth}）`
       return `${CATEGORY_NAMES[category] ?? '积分记录'}（${scoreMonth}）`
@@ -1246,15 +1334,15 @@ export class ScoringService {
 
     const rows = await this.db.pointsLedgerEntry.findMany({
       where: andClauses.length > 0 ? { AND: andClauses } : undefined,
-      orderBy: { recordedAt: 'desc' },
+      orderBy: [{ recordedAt: 'desc' }, { id: 'desc' }],
       take: 51,
       ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
       include: {
         user: { select: { id: true, verifiedRealName: true, studentNo: true } },
       },
     })
-    const nextCursor = rows.length > 50 ? rows.pop()!.id : undefined
-    const enriched = await this.enrichLedgerEntries(rows)
+    const nextCursor = rows.length > 50 ? rows[49]!.id : undefined
+    const enriched = await this.enrichLedgerEntries(rows.slice(0, 50))
     return {
       items: enriched.map((row) => {
         const d = row.detail && typeof row.detail === 'object' && !Array.isArray(row.detail)
@@ -1277,6 +1365,7 @@ export class ScoringService {
           scoreMonth: row.scoreMonth,
           recordedAt: row.recordedAt.toISOString(),
           status: row.status,
+          bonusVisible: row.bonusVisible,
           reversesEntryId: row.reversesEntryId,
           replacedByEntryId: row.replacedByEntryId,
           reversalReason: row.reversalReason,
