@@ -14,7 +14,8 @@ import {
   type UseQueryResult,
 } from '@tanstack/react-query';
 import { useEffect } from 'react';
-import { ApiError, UNAUTHORIZED_EVENT } from './api';
+import { ApiError, resetCsrfToken, UNAUTHORIZED_EVENT } from './api';
+import { normalizeCsrfSession } from './session';
 
 export const SESSION_CHANGED_EVENT = 'club:session-changed';
 
@@ -42,13 +43,18 @@ export function createQueryClient(): QueryClient {
 export function attachSessionListeners(queryClient: QueryClient): () => void {
   const clear = () => {
     queryClient.clear();
-    queryClient.cancelQueries();
+  };
+  const expire = () => {
+    // 先通知正在显示私人数据的组件。只清空缓存会让挂载中的查询停留在旧状态。
+    queryClient.setQueryData(['session', 'csrf'], normalizeCsrfSession(null));
+    resetCsrfToken();
+    clear();
   };
   window.addEventListener(SESSION_CHANGED_EVENT, clear);
-  window.addEventListener(UNAUTHORIZED_EVENT, clear);
+  window.addEventListener(UNAUTHORIZED_EVENT, expire);
   return () => {
     window.removeEventListener(SESSION_CHANGED_EVENT, clear);
-    window.removeEventListener(UNAUTHORIZED_EVENT, clear);
+    window.removeEventListener(UNAUTHORIZED_EVENT, expire);
   };
 }
 

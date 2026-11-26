@@ -255,7 +255,7 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
         if (typeof fn === 'function') {
           return fn({
             evaluationBatch: { create: vi.fn().mockResolvedValue({}) },
-            evaluationRow: { createMany: vi.fn().mockResolvedValue({}) },
+            evaluationRow: { createMany: vi.fn().mockResolvedValue({}), findFirst: vi.fn().mockResolvedValue(null) },
           })
         }
         return Promise.all(fn as Promise<unknown>[])
@@ -365,6 +365,7 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
         update: vi.fn().mockResolvedValue({}),
       },
       evaluationRow: {
+        findFirst: vi.fn().mockResolvedValue(null),
         findUnique: vi.fn().mockResolvedValue({
           id: rowId,
           batchId,
@@ -396,8 +397,10 @@ describe('EvaluationService 实时无时间限制、不锁定与含积分导出'
         ]),
         update: vi.fn().mockResolvedValue({}),
       },
-      $transaction: vi.fn().mockImplementation(async (ops: Promise<unknown>[]) => Promise.all(ops)),
+      $executeRaw: vi.fn().mockResolvedValue(1),
+      $transaction: vi.fn(),
     }
+    db.$transaction.mockImplementation((run: (tx: typeof db) => Promise<unknown>) => run(db))
     const audit = { log: vi.fn().mockResolvedValue(undefined) }
     const svc = new EvaluationService(db as never, audit as never)
 

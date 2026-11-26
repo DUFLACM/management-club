@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common'
 import { computeEffectiveScore } from '@acm/scoring-core'
+import type { Prisma } from '@acm/db'
 import { DomainError } from '../../common/domain-error.js'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
@@ -117,6 +118,30 @@ interface LivePointsSummary {
   contestRaw: number
   serviceRaw: number
   penaltyRaw: number
+}
+
+const latestAdjustmentOrder = [
+  { overrideAt: 'desc' }, { batchId: 'desc' }, { id: 'desc' },
+] satisfies Prisma.EvaluationRowOrderByWithRelationInput[]
+
+function rankedRows<T extends { cadre: boolean; rankNo: number | null; tier: string | null; studentNo: string }>(candidates: T[]) {
+  return candidates.filter((r): r is T & { rankNo: number; tier: string } => !r.cadre && r.rankNo != null && r.tier != null)
+    .sort((a, b) => a.rankNo - b.rankNo || a.studentNo.localeCompare(b.studentNo))
+}
+
+/** 每个学期只跟随最近一次手工保存的非测试名单。生成、刷新、重算均不改写 overrideAt。 */
+function latestAdjustment(db: Prisma.TransactionClient, semesterId: string) {
+  return db.evaluationRow.findFirst({
+    where: { overrideAt: { not: null }, batch: { semesterId, isTest: false } },
+    orderBy: latestAdjustmentOrder,
+    select: { batchId: true, overrideAt: true },
+  })
+}
+
+/** 将同学期的修改串行化。事务锁独立于学期表，积分服务无须该表的写权限。 */
+async function lockEvaluationSemester(tx: Prisma.TransactionClient, batchId: string) {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('acm.evaluation.semester'), hashtext(semester_id::text))
+    FROM evaluation_batches WHERE id = ${batchId}::uuid`
 }
 
 /** 学期覆盖的月份键（Asia/Shanghai），含首尾月 */
@@ -239,24 +264,65 @@ export class EvaluationService {
   private async semesterLeaderboard(semesterId: string, viewerId?: string) {
     const semester = await this.db.semester.findFirst({ where: { id: semesterId, startsOn: { lte: new Date() } } })
     if (!semester) throw new EvaluationError('学期不存在或尚未开始', 'NOT_FOUND')
-    const ranked = await this.realtimeTierRows(semester, viewerId ? memberName : publicEvaluationName)
+    const displayNameFor = viewerId ? memberName : publicEvaluationName
+    const saved = await this.db.$transaction(async (tx) => {
+      const adjustment = await latestAdjustment(tx, semesterId)
+      if (!adjustment?.overrideAt) return null
+      const rows = await tx.evaluationRow.findMany({
+        where: { batchId: adjustment.batchId, excluded: false },
+        select: {
+          userId: true, studentNo: true, rankNo: true, tier: true, hScore: true,
+          suggestedScore: true, overrideScore: true, tiebreak: true, cadre: true,
+          user: { select: { studentNo: true, verifiedRealName: true, profile: { select: { displayName: true, visibility: true } } } },
+        },
+      })
+      return {
+        adjustedAt: adjustment.overrideAt.toISOString(),
+        rows: rows.map((r) => ({
+          userId: r.userId, studentNo: r.studentNo, displayName: displayNameFor(r.user),
+          cadre: r.cadre, rankNo: r.rankNo, tier: r.tier, hScore: Number(r.hScore),
+          score: Number(r.overrideScore ?? r.suggestedScore), cadreScore: r.overrideScore == null ? null : Number(r.overrideScore),
+          needsManual: parseTiebreak(r.tiebreak).needsManual,
+        })),
+      }
+    }, { isolationLevel: 'RepeatableRead' })
+    const candidates = saved?.rows ?? this.assign((await this.collect(semester, displayNameFor)).candidates)
+      .filter((r) => !r.excluded)
+      .map((r) => ({ ...r, score: r.suggestedScore, cadreScore: null, needsManual: r.tiebreak.needsManual }))
     return {
-      rows: ranked.map((r) => ({
+      source: saved ? 'adjusted' as const : 'live' as const,
+      adjustedAt: saved?.adjustedAt ?? null,
+      rows: rankedRows(candidates).map((r) => ({
         rank: r.rankNo,
         displayName: r.displayName,
         hScore: r.hScore,
         tier: r.tier,
-        suggestedScore: r.suggestedScore,
-        needsManual: r.tiebreak.needsManual,
+        suggestedScore: r.score,
+        needsManual: r.needsManual,
         ...(viewerId ? { isMe: r.userId === viewerId } : {}),
+      })),
+      cadres: candidates.filter((r) => r.cadre).sort((a, b) => a.studentNo.localeCompare(b.studentNo)).map((r) => ({
+        displayName: r.displayName, suggestedScore: r.cadreScore, ...(viewerId ? { isMe: r.userId === viewerId } : {}),
       })),
     }
   }
 
   async batches() {
+    const [recent, adjustments] = await Promise.all([
+      this.db.evaluationBatch.findMany({ orderBy: [{ generatedAt: 'desc' }, { id: 'desc' }], take: 30, select: { id: true } }),
+      this.db.evaluationRow.findMany({
+        where: { overrideAt: { not: null }, batch: { isTest: false } },
+        orderBy: latestAdjustmentOrder, distinct: ['batchId'],
+        select: { batchId: true, overrideAt: true, batch: { select: { semesterId: true } } },
+      }),
+    ])
+    const sources = new Map<string, typeof adjustments[number]>()
+    for (const adjustment of adjustments) {
+      if (!sources.has(adjustment.batch.semesterId)) sources.set(adjustment.batch.semesterId, adjustment)
+    }
     const rows = await this.db.evaluationBatch.findMany({
-      orderBy: { generatedAt: 'desc' },
-      take: 30,
+      where: { id: { in: [...recent.map((r) => r.id), ...Array.from(sources.values(), (s) => s.batchId)] } },
+      orderBy: [{ generatedAt: 'desc' }, { id: 'desc' }],
       include: { semester: { select: { code: true, name: true } }, _count: { select: { rows: true } } },
     })
     return rows.map((b) => ({
@@ -265,7 +331,9 @@ export class EvaluationService {
       semesterCode: b.semester.code,
       semesterName: b.semester.name,
       status: b.status,
-      isTest: false,
+      isTest: b.isTest,
+      isPublicSource: sources.get(b.semesterId)?.batchId === b.id,
+      adjustedAt: sources.get(b.semesterId)?.batchId === b.id ? sources.get(b.semesterId)?.overrideAt : null,
       memberCount: b.memberCount,
       rowCount: b._count.rows,
       note: b.note,
@@ -337,15 +405,16 @@ export class EvaluationService {
   async refreshBatch(actor: SessionActor, batchId: string) {
     const batch = await this.db.evaluationBatch.findUnique({
       where: { id: batchId },
-      include: { semester: true, rows: true },
+      include: { semester: true },
     })
     if (!batch) throw new EvaluationError('批次不存在', 'NOT_FOUND')
 
     const { candidates, diagnostics } = await this.collect(batch.semester)
     const scored = this.assign(candidates)
-    const existingByUser = new Map(batch.rows.map((r) => [r.userId, r]))
-
-    await this.db.$transaction(async (tx) => {
+    const result = await this.db.$transaction(async (tx) => {
+      await lockEvaluationSemester(tx, batchId)
+      const existingRows = await tx.evaluationRow.findMany({ where: { batchId }, select: { userId: true, id: true } })
+      const existingByUser = new Map(existingRows.map((r) => [r.userId, r]))
       for (const r of scored) {
         const existing = existingByUser.get(r.userId)
         if (existing) {
@@ -391,9 +460,8 @@ export class EvaluationService {
         where: { id: batchId },
         data: { note: diagnostics, generatedAt: new Date() },
       })
-    })
-
-    const result = await this.recompute(actor, batchId)
+      return this.recomputeRows(tx, actor, batchId)
+    }, { timeout: 60_000 })
     await this.audit.log({
       actorPrincipalId: actor.principalId,
       action: 'evaluation.batch.refresh',
@@ -753,31 +821,7 @@ export class EvaluationService {
     })
 
     const tierable = scored.filter((r) => !r.excluded && !r.cadre)
-    // 完全同分仍标记「需人工认定」，在裁定前让各次实时读取显示一致的名次。
-    tierable.sort((a, b) => compareForTier(a, b) || a.studentNo.localeCompare(b.studentNo))
-    for (let i = 1; i < tierable.length; i += 1) {
-      const prev = tierable[i - 1]!
-      const curr = tierable[i]!
-      if (compareForTier(prev, curr) === 0) {
-        prev.tiebreak = { ...prev.tiebreak, needsManual: true }
-        curr.tiebreak = { ...curr.tiebreak, needsManual: true }
-      }
-    }
-
-    const counts = tierCounts(tierable.length, TIER_RATIOS)
-    tierable.forEach((row, index) => {
-      row.rankNo = index + 1
-      if (index < counts.a) {
-        row.tier = 'A'
-        row.suggestedScore = tierScore('A', index + 1, counts)
-      } else if (index < counts.a + counts.b) {
-        row.tier = 'B'
-        row.suggestedScore = tierScore('B', index - counts.a + 1, counts)
-      } else {
-        row.tier = 'C'
-        row.suggestedScore = tierScore('C', index - counts.a - counts.b + 1, counts)
-      }
-    })
+    assignRanks(tierable, TIER_RATIOS)
     return scored
   }
 
@@ -791,10 +835,11 @@ export class EvaluationService {
       where: { batchId },
       orderBy: [{ rankNo: 'asc' }, { studentNo: 'asc' }],
     })
-    const liveMap = await this.loadLivePointsForUsers(
-      batch.semester,
-      rows.map((r) => r.userId),
-    )
+    const [liveMap, adjustment] = await Promise.all([
+      this.loadLivePointsForUsers(batch.semester, rows.map((r) => r.userId)),
+      latestAdjustment(this.db, batch.semesterId),
+    ])
+    const isPublicSource = adjustment?.batchId === batch.id
 
     return {
       batch: {
@@ -803,7 +848,9 @@ export class EvaluationService {
         semesterCode: batch.semester.code,
         semesterName: batch.semester.name,
         status: batch.status,
-        isTest: false,
+        isTest: batch.isTest,
+        isPublicSource,
+        adjustedAt: isPublicSource ? adjustment?.overrideAt : null,
         memberCount: batch.memberCount,
         weights: batch.weights,
         tierRatios: batch.tierRatios,
@@ -881,47 +928,60 @@ export class EvaluationService {
       reason: string
     },
   ) {
-    const row = await this.db.evaluationRow.findUnique({ where: { id: rowId }, include: { batch: true } })
-    if (!row || row.batchId !== batchId) throw new EvaluationError('记录不存在', 'NOT_FOUND')
+    return this.db.$transaction(async (tx) => {
+      await lockEvaluationSemester(tx, batchId)
+      const row = await tx.evaluationRow.findUnique({ where: { id: rowId }, include: { batch: true } })
+      if (!row || row.batchId !== batchId) throw new EvaluationError('记录不存在', 'NOT_FOUND')
 
-    await this.db.evaluationRow.update({
-      where: { id: rowId },
-      data: {
-        overridePointsStd: patch.pointsStd === undefined ? undefined : patch.pointsStd?.toFixed(4) ?? null,
-        overrideContestStd: patch.contestStd === undefined ? undefined : patch.contestStd?.toFixed(4) ?? null,
-        overrideServiceStd: patch.serviceStd === undefined ? undefined : patch.serviceStd?.toFixed(4) ?? null,
-        overridePenalty: patch.penalty === undefined ? undefined : patch.penalty?.toFixed(4) ?? null,
-        overrideScore: patch.score === undefined ? undefined : patch.score?.toFixed(3) ?? null,
-        excluded: patch.excluded,
-        excludeReason:
-          patch.excluded === undefined && patch.excludeReason === undefined
-            ? undefined
-            : patch.excludeReason ?? (patch.excluded ? '主席团认定不纳入（附录三·六）' : null),
-        cadre: patch.cadre,
-        overrideReason: patch.reason,
-        overrideBy: actor.principalId,
-        overrideAt: new Date(),
-      },
-    })
-    await this.audit.log({
-      actorPrincipalId: actor.principalId,
-      action: 'evaluation.row.override',
-      resourceType: 'evaluation_row',
-      resourceId: rowId,
-      summary: `${row.studentNo} ${row.realName} 综评分量修改`,
-      before: { pointsStd: row.pointsStd, score: row.overrideScore ?? row.suggestedScore, excluded: row.excluded, cadre: row.cadre },
-      after: patch,
-      reason: patch.reason,
-    })
-    await this.recompute(actor, batchId)
-    return { updated: true }
+      const previous = row.batch.isTest ? null : await latestAdjustment(tx, row.batch.semesterId)
+      // 多台应用的时钟可能有偏差，毫秒精度下连续两次保存也须让较晚提交的名单胜出。
+      const overrideAt = new Date(Math.max(Date.now(), (previous?.overrideAt?.getTime() ?? 0) + 1))
+      await tx.evaluationRow.update({
+        where: { id: rowId },
+        data: {
+          overridePointsStd: patch.pointsStd === undefined ? undefined : patch.pointsStd?.toFixed(4) ?? null,
+          overrideContestStd: patch.contestStd === undefined ? undefined : patch.contestStd?.toFixed(4) ?? null,
+          overrideServiceStd: patch.serviceStd === undefined ? undefined : patch.serviceStd?.toFixed(4) ?? null,
+          overridePenalty: patch.penalty === undefined ? undefined : patch.penalty?.toFixed(4) ?? null,
+          overrideScore: patch.score === undefined ? undefined : patch.score?.toFixed(3) ?? null,
+          excluded: patch.excluded,
+          excludeReason:
+            patch.excluded === undefined && patch.excludeReason === undefined
+              ? undefined
+              : patch.excludeReason ?? (patch.excluded ? '主席团认定不纳入（附录三·六）' : null),
+          cadre: patch.cadre,
+          overrideReason: patch.reason,
+          overrideBy: actor.principalId,
+          overrideAt,
+        },
+      })
+      await this.audit.log({
+        actorPrincipalId: actor.principalId,
+        action: 'evaluation.row.override',
+        resourceType: 'evaluation_row',
+        resourceId: rowId,
+        summary: `${row.studentNo} ${row.realName} 综评分量修改`,
+        before: { pointsStd: row.pointsStd, score: row.overrideScore ?? row.suggestedScore, excluded: row.excluded, cadre: row.cadre },
+        after: patch,
+        reason: patch.reason,
+      }, tx)
+      await this.recomputeRows(tx, actor, batchId)
+      return { updated: true }
+    }, { timeout: 60_000 })
   }
 
   /** 按「覆盖值优先」重算 H、名次与建议值；overrideScore 不被覆盖，且永不锁定 */
   async recompute(actor: SessionActor, batchId: string) {
-    const batch = await this.db.evaluationBatch.findUnique({ where: { id: batchId } })
+    return this.db.$transaction(async (tx) => {
+      await lockEvaluationSemester(tx, batchId)
+      return this.recomputeRows(tx, actor, batchId)
+    }, { timeout: 60_000 })
+  }
+
+  private async recomputeRows(tx: Prisma.TransactionClient, actor: SessionActor, batchId: string) {
+    const batch = await tx.evaluationBatch.findUnique({ where: { id: batchId } })
     if (!batch) throw new EvaluationError('批次不存在', 'NOT_FOUND')
-    const rows = await this.db.evaluationRow.findMany({ where: { batchId } })
+    const rows = await tx.evaluationRow.findMany({ where: { batchId } })
 
     const weights = parseWeights(batch.weights)
     const ratios = parseRatios(batch.tierRatios)
@@ -935,7 +995,7 @@ export class EvaluationService {
         studentNo: r.studentNo,
         excluded: r.excluded,
         cadre: r.cadre,
-        tiebreak: parseTiebreak(r.tiebreak),
+        tiebreak: { ...parseTiebreak(r.tiebreak), needsManual: false },
         hScore: hOf({ pointsStd, contestStd, serviceStd, disciplinePenalty }, weights),
         rankNo: null as number | null,
         tier: null as 'A' | 'B' | 'C' | null,
@@ -944,30 +1004,16 @@ export class EvaluationService {
     })
 
     const tierable = effective.filter((r) => !r.excluded && !r.cadre)
-    tierable.sort((a, b) => compareForTier(a, b) || a.studentNo.localeCompare(b.studentNo))
-    const counts = tierCounts(tierable.length, ratios)
-    tierable.forEach((row, index) => {
-      row.rankNo = index + 1
-      if (index < counts.a) {
-        row.tier = 'A'
-        row.suggestedScore = tierScore('A', index + 1, counts)
-      } else if (index < counts.a + counts.b) {
-        row.tier = 'B'
-        row.suggestedScore = tierScore('B', index - counts.a + 1, counts)
-      } else {
-        row.tier = 'C'
-        row.suggestedScore = tierScore('C', index - counts.a - counts.b + 1, counts)
-      }
-    })
+    const counts = assignRanks(tierable, ratios)
 
-    await this.db.$transaction([
+    await Promise.all([
       ...effective.map((r) =>
-        this.db.evaluationRow.update({
+        tx.evaluationRow.update({
           where: { id: r.id },
-          data: { hScore: r.hScore.toFixed(4), rankNo: r.rankNo, tier: r.tier, suggestedScore: r.suggestedScore.toFixed(3) },
+          data: { hScore: r.hScore.toFixed(4), rankNo: r.rankNo, tier: r.tier, suggestedScore: r.suggestedScore.toFixed(3), tiebreak: jsonTiebreak(r.tiebreak) },
         }),
       ),
-      this.db.evaluationBatch.update({ where: { id: batchId }, data: { memberCount: tierable.length } }),
+      tx.evaluationBatch.update({ where: { id: batchId }, data: { memberCount: tierable.length } }),
     ])
     await this.audit.log({
       actorPrincipalId: actor.principalId,
@@ -975,7 +1021,7 @@ export class EvaluationService {
       resourceType: 'evaluation_batch',
       resourceId: batchId,
       summary: `重算定档：N=${tierable.length}，A ${counts.a} / B ${counts.b} / C ${counts.c}`,
-    })
+    }, tx)
     return { memberCount: tierable.length, counts }
   }
 
@@ -1084,21 +1130,11 @@ export class EvaluationService {
     return { csv: `${lines.join('\n')}\n`, filename }
   }
 
-  private async realtimeTierRows(
-    semester: { id: string; startsOn: Date; endsOn: Date },
-    displayNameFor: (user: EvaluationMemberIdentity) => string = memberName,
-  ) {
-    const { candidates } = await this.collect(semester, displayNameFor)
-    return this.assign(candidates)
-      .filter((r): r is ScoredCandidate & { rankNo: number; tier: 'A' | 'B' | 'C' } => r.rankNo !== null && r.tier !== null)
-      .sort((a, b) => a.rankNo - b.rankNo)
-  }
-
   /** 实时按学期直接导出综评表（含积分），不落库、不锁定、不受时间限制 */
   async exportRealtimeCsv(semesterId: string): Promise<{ csv: string; filename: string }> {
     const semester = await this.db.semester.findUnique({ where: { id: semesterId } })
     if (!semester) throw new EvaluationError('学期不存在', 'NOT_FOUND')
-    const tierable = await this.realtimeTierRows(semester)
+    const tierable = rankedRows(this.assign((await this.collect(semester)).candidates))
     const lines = [
       '学号,姓名,口径,排名,定档,当前有效积分,学期总积分,月均积分,积分标准分,竞赛标准分,服务标准分,纪律扣减,综合分H,加分',
     ]
@@ -1189,6 +1225,39 @@ function compareForTier(
   if (a.tiebreak.recentContest !== b.tiebreak.recentContest) return b.tiebreak.recentContest - a.tiebreak.recentContest
   if (a.tiebreak.recentActivity !== b.tiebreak.recentActivity) return b.tiebreak.recentActivity - a.tiebreak.recentActivity
   return 0
+}
+
+/** 实时名单和手工调整后的快照共用排名、并列标记与定档规则。 */
+function assignRanks(
+  tierable: Array<Pick<ScoredCandidate, 'studentNo' | 'hScore' | 'tiebreak' | 'rankNo' | 'tier' | 'suggestedScore'>>,
+  ratios: TierRatios,
+) {
+  // 完全同分仍标记「需人工认定」，在裁定前让各次实时读取显示一致的名次。
+  tierable.sort((a, b) => compareForTier(a, b) || a.studentNo.localeCompare(b.studentNo))
+  for (let i = 1; i < tierable.length; i += 1) {
+    const prev = tierable[i - 1]!
+    const curr = tierable[i]!
+    if (compareForTier(prev, curr) === 0) {
+      prev.tiebreak = { ...prev.tiebreak, needsManual: true }
+      curr.tiebreak = { ...curr.tiebreak, needsManual: true }
+    }
+  }
+
+  const counts = tierCounts(tierable.length, ratios)
+  tierable.forEach((row, index) => {
+    row.rankNo = index + 1
+    if (index < counts.a) {
+      row.tier = 'A'
+      row.suggestedScore = tierScore('A', index + 1, counts)
+    } else if (index < counts.a + counts.b) {
+      row.tier = 'B'
+      row.suggestedScore = tierScore('B', index - counts.a + 1, counts)
+    } else {
+      row.tier = 'C'
+      row.suggestedScore = tierScore('C', index - counts.a - counts.b + 1, counts)
+    }
+  })
+  return counts
 }
 
 function parseWeights(value: unknown): Weights {

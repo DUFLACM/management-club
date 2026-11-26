@@ -31,6 +31,7 @@ const db = {
   user: { findUnique: vi.fn(), findMany: async () => [] },
   membershipTerm: { findMany: async () => [] },
   pointsLedgerEntry: { findMany: async () => [] },
+  $transaction: async (read: (tx: unknown) => unknown) => read({ evaluationRow: { findFirst: async () => null } }),
 }
 const scoring = new ScoringService(db, {}, {}, {})
 const setBonusVisibility = vi.spyOn(scoring, 'setBonusVisibility')
@@ -66,7 +67,7 @@ it('匿名可读公开学期及综评排名，加分明细仅在成员接口提�
     semesters: [{ id: semester.id, code: semester.code, name: semester.name }], defaultSemesterId: semester.id,
   })
   const board = await http.get(`/api/v1/public/evaluation/semesters/${semester.id}/leaderboard`).expect(200)
-  expect(board.body.data).toEqual({ rows: [] })
+  expect(board.body.data).toEqual({ source: 'live', adjustedAt: null, rows: [], cadres: [] })
   await http.get('/api/v1/public/evaluation/semesters/invalid/leaderboard').expect(400)
   await http.get(`/api/v1/public/bonus-records?semesterId=${semester.id}`).expect(404)
   await http.get(`/api/v1/me/bonus-records?semesterId=${semester.id}`).expect(401)

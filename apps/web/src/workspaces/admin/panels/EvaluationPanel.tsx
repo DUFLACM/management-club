@@ -55,6 +55,8 @@ interface BatchSummaryDto {
   semesterName: string;
   status: string;
   isTest: boolean;
+  isPublicSource: boolean;
+  adjustedAt: string | null;
   memberCount: number;
   rowCount: number;
   generatedAt: string;
@@ -100,10 +102,13 @@ interface RowDto {
 interface BatchDetailDto {
   batch: {
     id: string;
+    semesterId: string;
     semesterCode: string;
     semesterName: string;
     status: string;
     isTest: boolean;
+    isPublicSource: boolean;
+    adjustedAt: string | null;
     memberCount: number;
     note: string | null;
     generatedAt: string;
@@ -279,7 +284,12 @@ function EvaluationBody({ principalId }: { principalId: string }) {
 
       <Card>
         <CardContent className="p-0">
-          <h2 className="border-b border-border p-5 pb-3 text-sm font-semibold text-foreground">已生成名单快照（随时可改、不锁定）</h2>
+          <div className="border-b border-border px-5 pt-5 pb-3">
+            <h2 className="text-sm font-semibold text-foreground">已生成名单快照</h2>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              每个学期的公示页自动采用最近一次手工保存成员修改的名单。尚无手工修改时，公示页按实时积分计算。
+            </p>
+          </div>
           <QueryBoundary query={batchesQuery}>
             {(batches) =>
               batches.length === 0 ? (
@@ -292,18 +302,26 @@ function EvaluationBody({ principalId }: { principalId: string }) {
                     <li key={batch.id}>
                       <button
                         type="button"
+                        aria-expanded={batch.id === batchId}
                         onClick={() => setBatchId(batch.id === batchId ? null : batch.id)}
                         className={`flex w-full flex-wrap items-center gap-2 p-4 text-left transition-colors hover:bg-muted/60 ${batch.id === batchId ? 'bg-muted/60' : ''}`}
                       >
                         <span className="text-sm font-medium text-foreground">
                           {batch.semesterCode} {batch.semesterName}
                         </span>
-                        <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                          可编辑
-                        </span>
+                        {batch.isPublicSource && (
+                          <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                            当前公示名单
+                          </span>
+                        )}
                         <span className="text-xs text-muted-foreground tabular-nums">
-                          定档 {batch.memberCount} / 共 {batch.rowCount} 人 · {formatDateTime(batch.generatedAt)}
+                          定档 {batch.memberCount} / 共 {batch.rowCount} 人 · 积分更新于 {formatDateTime(batch.generatedAt)}
                         </span>
+                        {batch.adjustedAt && (
+                          <span className="text-xs text-muted-foreground tabular-nums">
+                            手工保存于 {formatDateTime(batch.adjustedAt)}
+                          </span>
+                        )}
                       </button>
                     </li>
                   ))}
@@ -314,7 +332,14 @@ function EvaluationBody({ principalId }: { principalId: string }) {
         </CardContent>
       </Card>
 
-      {batchId && <BatchDetail principalId={principalId} batchId={batchId} onDeleted={() => setBatchId(null)} />}
+      {batchId && (
+        <BatchDetail
+          key={batchId}
+          principalId={principalId}
+          batchId={batchId}
+          onDeleted={() => setBatchId((current) => current === batchId ? null : current)}
+        />
+      )}
     </div>
   );
 }
@@ -343,7 +368,17 @@ function BatchDetail({
   );
 
   const invalidate = () => {
-    void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'evaluation'] });
+    const semesterId = detailQuery.data?.batch.semesterId;
+    const admin = queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin', 'evaluation'] });
+    if (!semesterId) return admin;
+    return Promise.all([
+      admin,
+      queryClient.invalidateQueries({ queryKey: ['public', 'evaluation', 'leaderboard', semesterId] }),
+      queryClient.invalidateQueries({
+        predicate: ({ queryKey }) => queryKey[0] === 'principal' && queryKey[2] === 'me'
+          && queryKey[3] === 'evaluation' && queryKey[5] === semesterId,
+      }),
+    ]);
   };
 
   const actionMutation = useMutation({
@@ -352,7 +387,7 @@ function BatchDetail({
       else await api.post(`/admin/evaluation/batches/${batchId}/${action}`);
       return action;
     },
-    onSuccess: (action) => {
+    onSuccess: async (action) => {
       setError(null);
       if (action === 'delete') {
         onDeleted();
@@ -361,7 +396,7 @@ function BatchDetail({
       } else {
         setNotice('已按当前分量重新计算 H 分与定档。');
       }
-      invalidate();
+      await invalidate();
     },
     onError: (err: ApiError) => {
       setNotice(null);
@@ -382,11 +417,26 @@ function BatchDetail({
                 <h2 className="text-sm font-semibold text-foreground">
                   {batch.semesterCode} {batch.semesterName} · 建议名单与积分
                 </h2>
+                {batch.isPublicSource && (
+                  <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+                    当前公示名单
+                  </span>
+                )}
                 <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground tabular-nums">
-                  更新于 {formatDateTime(batch.generatedAt)}
+                  积分更新于 {formatDateTime(batch.generatedAt)}
                 </span>
+                {batch.adjustedAt && (
+                  <span className="text-xs text-muted-foreground tabular-nums">
+                    手工保存于 {formatDateTime(batch.adjustedAt)}
+                  </span>
+                )}
               </div>
 
+              <p className="text-sm leading-5 text-muted-foreground">
+                {batch.isTest ? '这份测试名单仅供后台核对。' : batch.isPublicSource
+                  ? '公示页展示这份名单的排名与最终加分。干部加分单列，未填写的显示为「待核定」。'
+                  : '修改成员后点击「保存并重算」，本学期公示页会改用这份名单。干部加分单列。'}
+              </p>
               {batch.note && <p className="text-xs leading-5 text-muted-foreground">{batch.note}</p>}
 
               <div className="flex flex-wrap gap-2">
@@ -522,7 +572,7 @@ function RowGroup({
                 <span className="text-sm font-medium text-foreground tabular-nums">{row.studentNo}</span>
                 <span className="text-sm text-foreground">{row.realName}</span>
                 <span className="ml-auto text-sm font-semibold text-foreground tabular-nums">
-                  加分 {row.finalScore.toFixed(3)}
+                  加分 {row.cadre && row.overrides.score == null ? '待核定' : row.finalScore.toFixed(3)}
                 </span>
               </div>
               <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground tabular-nums">
@@ -649,7 +699,7 @@ function RowEditor({
         ))}
       </div>
       <p className="text-xs leading-5 text-muted-foreground">
-        留空表示不覆盖、沿用引擎值。填写「最终加分」后该行直接按此值导出，不再跟随定档。
+        {cadre ? '干部的最终加分由管理员核定，留空时公示为「待核定」。' : '最终加分留空时使用定档建议值。'}
       </p>
 
       <div className="flex flex-wrap gap-4">
