@@ -116,6 +116,7 @@ interface CommitResponseDto {
     memberName: string | null;
     teamName?: string;
     points: string;
+    postedAmount?: string;
     status: 'archived' | 'roster_only' | 'duplicate' | 'failed';
     error?: string;
   }>;
@@ -317,7 +318,7 @@ export function CompetitionImportDialog({
             竞赛正式赛报名名单与成绩导入
           </DialogTitle>
           <DialogDescription>
-            导入后自动创建并归档该场正式赛事、生成个人/团队报名名单与成绩，并将非零积分归档入账，联动每位成员的账号档案、积分流水与比赛记录。
+            导入正式赛名单与成绩。积分按每位成员本场比赛的应得总分填写，已有参赛分的成员只补差额。
             支持学号或姓名导入；遇到重名成员会集中列出供手动选择。
           </DialogDescription>
         </DialogHeader>
@@ -741,7 +742,7 @@ export function CompetitionImportDialog({
                 {preview.existingEvent && !preview.existingMismatch && (
                   <Alert variant="info">
                     <AlertDescription>
-                      检测到同名同日已归档正式赛「{preview.existingEvent.title}」，本次导入将自动复用该赛事并增量更新名单与积分（已入账成员不会重复计分）。
+                      将更新已有赛事「{preview.existingEvent.title}」的名单与成绩。成员本场已记积分低于应得总分时补足差额，已足额的跳过。
                     </AlertDescription>
                   </Alert>
                 )}
@@ -753,7 +754,7 @@ export function CompetitionImportDialog({
                   {preview.summary.teamCount > 0 && (
                     <span className="tabular-nums">共 {preview.summary.teamCount} 支队伍</span>
                   )}
-                  <span className="tabular-nums">预计归档积分 {preview.summary.totalPoints} 分</span>
+                  <span className="tabular-nums">应得总分合计 {preview.summary.totalPoints} 分</span>
                   <span className="tabular-nums">计入月份 {preview.scoreMonth}</span>
                   {preview.summary.errorCount > 0 && (
                     <span className="text-destructive tabular-nums">{preview.summary.errorCount} 行有问题</span>
@@ -771,7 +772,7 @@ export function CompetitionImportDialog({
                         )}
                         <TableHead className="text-xs">奖项 / 成绩</TableHead>
                         <TableHead className="text-xs">排名</TableHead>
-                        <TableHead className="text-xs">归档积分</TableHead>
+                        <TableHead className="text-xs">本场应得总分</TableHead>
                         <TableHead className="pr-3 text-xs">备注 / 状态</TableHead>
                       </TableRow>
                     </TableHeader>
@@ -889,7 +890,6 @@ function CommitResultView({
   onViewContests: () => void;
   onAgain: () => void;
 }) {
-  const issues = result.rows.filter((r) => r.status === 'failed' || r.status === 'duplicate');
   return (
     <div className="flex flex-col gap-4 text-sm">
       <Alert variant={result.failed > 0 ? 'destructive' : 'info'}>
@@ -906,27 +906,42 @@ function CommitResultView({
           <span className="tabular-nums">
             登记名单 {result.registeredCount} 人
             {result.teamsCreated > 0 ? `（新建 ${result.teamsCreated} 支队伍）` : ''}；
-            归档积分 {result.posted} 条
+            新增积分流水 {result.posted} 条
             {result.rosterOnly > 0 ? `，仅记名单（0 分）${result.rosterOnly} 人` : ''}
-            {result.duplicate > 0 ? `，重复积分跳过 ${result.duplicate} 条` : ''}
+            {result.duplicate > 0 ? `，跳过入账 ${result.duplicate} 人` : ''}
             {result.failed > 0 ? `，失败 ${result.failed} 条` : ''}。
-          </span>
-          <span className="text-xs text-muted-foreground">
-            所有已匹配成员的积分账本、正式赛参赛记录与站内通知已自动联动更新。
           </span>
         </AlertDescription>
       </Alert>
 
-      {issues.length > 0 && (
-        <div className="flex flex-col gap-1">
-          <p className="text-xs font-medium text-muted-foreground">跳过或失败的行</p>
-          <ul className="flex max-h-48 flex-col gap-0.5 overflow-y-auto rounded-lg border border-border p-3 text-xs text-muted-foreground">
-            {issues.map((row) => (
-              <li key={row.row} className={row.status === 'failed' ? 'text-destructive' : undefined}>
-                第 {row.row} 行（{row.memberName ?? row.studentNo}）：{row.error}
-              </li>
-            ))}
-          </ul>
+      {result.rows.length > 0 && (
+        <div className="max-h-64 overflow-auto rounded-lg border border-border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>行</TableHead>
+                <TableHead>成员</TableHead>
+                <TableHead>本场应得总分</TableHead>
+                <TableHead>本次入账</TableHead>
+                <TableHead>结果</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {result.rows.map((row) => (
+                <TableRow key={row.row}>
+                  <TableCell className="tabular-nums">{row.row}</TableCell>
+                  <TableCell>{row.memberName ?? row.studentNo}</TableCell>
+                  <TableCell className="tabular-nums">{row.points}</TableCell>
+                  <TableCell className="tabular-nums">
+                    {row.postedAmount ?? (row.status === 'duplicate' || row.status === 'roster_only' ? '0' : '—')}
+                  </TableCell>
+                  <TableCell className={row.status === 'failed' ? 'whitespace-normal text-destructive' : 'whitespace-normal'}>
+                    {row.error ?? { archived: '已入账', duplicate: '已足额', roster_only: '仅记名单', failed: '失败' }[row.status]}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         </div>
       )}
 

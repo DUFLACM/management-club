@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common'
+import type { Prisma } from '@acm/db'
 import { PrismaService } from '../database/database.module.js'
 import { newId, sha256Hex } from '../../common/utils.js'
 
@@ -19,8 +20,8 @@ export class AuditService {
     before?: unknown
     after?: unknown
     reason?: string
-  }): Promise<void> {
-    await this.db.auditLog.create({
+  }, db: Pick<Prisma.TransactionClient, 'auditLog'> = this.db): Promise<void> {
+    await db.auditLog.create({
       data: {
         id: newId(),
         actorPrincipalId: entry.actorPrincipalId ?? null,

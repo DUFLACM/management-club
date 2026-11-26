@@ -1,6 +1,8 @@
 import { Inject, Injectable, Optional } from '@nestjs/common'
+import type { Prisma } from '@acm/db'
 import { z } from 'zod'
 import {
+  Decimal,
   formalContestScore,
   networkQualifierScore,
   ladderScore,
@@ -118,8 +120,36 @@ export interface CompetitionImportRowOutcome {
   memberName: string | null
   teamName?: string
   points: string
+  postedAmount?: string
   status: 'archived' | 'roster_only' | 'duplicate' | 'failed'
   error?: string
+}
+
+type MatchedRow = CompetitionImportPreviewRow & { userId: string }
+
+interface ImportContext {
+  actor: SessionActor
+  event: CompetitionImportCommitInput['event']
+  eventId: string
+  batchId: string
+  scoreMonth: string
+}
+
+function outcomeFor(row: CompetitionImportPreviewRow, status: CompetitionImportRowOutcome['status']): CompetitionImportRowOutcome {
+  return {
+    row: row.row,
+    studentNo: row.studentNo || row.inputName || `第 ${row.row} 行`,
+    memberName: row.memberName,
+    ...(row.teamName ? { teamName: row.teamName } : {}),
+    points: row.points,
+    status,
+  }
+}
+
+/** 旧版可能已存获奖成绩，但只记了参赛分。重传旧参赛表或仅登记名单时保留该成绩。 */
+function keepRecordedScore(outcome: CompetitionImportRowOutcome, previousPoints: number): boolean {
+  return (outcome.status === 'roster_only' && previousPoints !== 0) ||
+    (outcome.status === 'duplicate' && previousPoints > Number(outcome.points))
 }
 
 interface LoadedMember {
@@ -132,6 +162,10 @@ interface LoadedMember {
   membershipTerms: Array<{ membershipStatus: string }>
 }
 
+export function isNonScoringCompetitor(awardText: string): boolean {
+  return /(打星|非正式|随队|不计分|unofficial|star)/i.test(awardText)
+}
+
 /** 根据赛事档位 + 奖项文本自动推算附录二标准分；无法识别时返回 null（不猜测） */
 export function resolveOfficialAwardPoints(
   contestTier: CompetitionImportTier | null | undefined,
@@ -142,7 +176,7 @@ export function resolveOfficialAwardPoints(
   if (!text) return null
   const lower = text.toLowerCase()
 
-  if (/(打星|非正式|随队|不计分|unofficial|star)/i.test(text)) {
+  if (isNonScoringCompetitor(text)) {
     return { points: '0', hint: '打星/非正式队员不计分（仅记报名名单）' }
   }
 
@@ -442,14 +476,10 @@ export class CompetitionImportService {
 
   /** 预览：解析学号/姓名、识别同名候选、自动推算档位分值、校验重复成员 */
   async preview(input: CompetitionImportPreviewInput) {
-    const { startAt } = competitionSchedule(input.event.competitionDate)
+    const schedule = competitionSchedule(input.event.competitionDate)
     const [members, existingEvent] = await Promise.all([
       this.loadMembers(input.rows),
-      this.db.competitionEvent.findFirst({
-        where: { title: input.event.title, startAt, status: 'archived' },
-        orderBy: { createdAt: 'asc' },
-        select: { id: true, title: true, status: true, teamSize: true },
-      }),
+      this.findArchivedEvent(this.db, input.event.title, schedule.registerDeadline),
     ])
 
     const resolved = input.rows.map((row) => this.resolveRow(row, input.event, members))
@@ -500,7 +530,7 @@ export class CompetitionImportService {
    * 正式导入提交：
    * 1. 自动创建（或复用同名同日）已归档正式赛事 CompetitionEvent；
    * 2. 写入报名名单与成绩（个人赛 CompetitionRegistration / 团队赛 Team + TeamCompetitionEntry）；
-   * 3. 对非零积分写入 PointsLedgerEntry（sourceKey 与正式赛审核同源，天然幂等）；
+   * 3. 在同一事务中按该成员本场已入账的分数补差；
    * 4. 向关联成员发送站内通知并写审计日志。
    */
   async commit(actor: SessionActor, input: CompetitionImportCommitInput): Promise<{
@@ -537,33 +567,28 @@ export class CompetitionImportService {
       throw new ScoringError(`还有 ${unresolvedDuplicates.length} 行姓名重复未手动选择对应成员，请先选择后再导入`, 'AMBIGUOUS_MEMBERS')
     }
 
-    const validRows = resolved.filter((r): r is CompetitionImportPreviewRow & { userId: string } => !r.error && r.userId != null)
+    const validRows = resolved.filter((r): r is MatchedRow => !r.error && r.userId != null)
     if (validRows.length === 0) {
       throw new ScoringError('没有可导入的有效名单记录，请检查错误提示', 'NO_VALID_ROWS')
     }
 
-    // 1. 自动创建或复用同名同日已归档正式赛
-    const existing = await this.db.competitionEvent.findFirst({
-      where: { title: input.event.title, startAt: schedule.startAt, status: 'archived' },
-      orderBy: { createdAt: 'asc' },
-    })
-    if (existing && (existing.teamSize ?? null) !== teamSize) {
-      throw new ScoringError(
-        `已存在同名同日的归档赛事「${existing.title}」，但其参赛形式与本次不一致，请修改比赛名称或保持一致`,
-        'CONFLICT',
-      )
-    }
-
     const batchId = newId()
-    const now = new Date()
-    let eventId: string
-    let eventCreated = false
-    if (existing) {
-      eventId = existing.id
-    } else {
-      eventId = newId()
-      eventCreated = true
-      await this.db.competitionEvent.create({
+    const { eventId, eventCreated } = await this.db.$transaction(async (tx) => {
+      // 尚未建档时没有可锁的赛事行，按导入匹配键串行化查询与创建。
+      const eventKey = `competition-import:event:${input.event.competitionDate}:${input.event.title}`
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${eventKey}, 0))`
+      const existing = await this.findArchivedEvent(tx, input.event.title, schedule.registerDeadline)
+      if (existing) {
+        if ((existing.teamSize ?? null) !== teamSize) {
+          throw new ScoringError(
+            `已存在同名同日的归档赛事「${existing.title}」，但其参赛形式与本次不一致，请修改比赛名称或保持一致`,
+            'CONFLICT',
+          )
+        }
+        return { eventId: existing.id, eventCreated: false }
+      }
+      const eventId = newId()
+      await tx.competitionEvent.create({
         data: {
           id: eventId,
           title: input.event.title,
@@ -572,9 +597,7 @@ export class CompetitionImportService {
           scoringMode: 'manual_review',
           contestTier: input.event.contestTier ?? null,
           announcement: input.event.announcement?.trim() || DEFAULT_ARCHIVE_ANNOUNCEMENT,
-          registerDeadline: schedule.registerDeadline,
-          startAt: schedule.startAt,
-          endAt: schedule.endAt,
+          ...schedule,
           status: 'archived',
           createdBy: actor.principalId,
         },
@@ -585,330 +608,63 @@ export class CompetitionImportService {
         resourceType: 'competition_event',
         resourceId: eventId,
         summary: `正式赛名单成绩导入自动创建并归档赛事：${input.event.title}（${input.event.category} 类${teamSize ? `，${teamSize} 人团队赛` : '，个人赛'}）`,
-      })
+      }, tx)
+      return { eventId, eventCreated: true }
+    })
+
+    const ctx = { actor, event: input.event, eventId, batchId, scoreMonth }
+    const outcomes: CompetitionImportRowOutcome[] = resolved
+      .filter((row) => row.error || !row.userId)
+      .map((row) => ({ ...outcomeFor(row, 'failed'), error: row.error ?? '成员无效' }))
+    const groups = new Map<string, MatchedRow[]>()
+    for (const row of validRows) {
+      const key = teamSize == null ? row.userId : row.teamName!
+      const group = groups.get(key) ?? []
+      group.push(row)
+      groups.set(key, group)
     }
 
-    const outcomes: CompetitionImportRowOutcome[] = []
-    for (const row of resolved) {
-      if (row.error || !row.userId) {
-        outcomes.push({
-          row: row.row,
-          studentNo: row.studentNo || row.inputName || `第 ${row.row} 行`,
-          memberName: row.memberName,
-          ...(row.teamName ? { teamName: row.teamName } : {}),
-          points: row.points,
-          status: 'failed',
-          error: row.error ?? '成员无效',
-        })
-      }
-    }
-
-    let registeredCount = 0
     let teamsCreated = 0
-    let posted = 0
-    let duplicate = 0
-    let rosterOnly = 0
-
-    if (teamSize != null) {
-      // 团队赛：按队名分组，自动建立常驻/归档小队、队员关联与队伍赛事记录
-      const teamGroups = new Map<string, Array<CompetitionImportPreviewRow & { userId: string }>>()
-      for (const row of validRows) {
-        const key = row.teamName!.trim()
-        teamGroups.set(key, [...(teamGroups.get(key) ?? []), row])
+    for (const [key, rows] of groups) {
+      let group: { created: boolean; outcomes: CompetitionImportRowOutcome[] }
+      try {
+        group = await this.db.$transaction(async (tx) => {
+          // 成绩与差额流水一起提交。同场并发导入在锁内读取最新成绩和账本。
+          await tx.$executeRaw`SELECT id FROM competition_events WHERE id = ${eventId}::uuid FOR UPDATE`
+          return teamSize == null
+            ? this.importIndividual(tx, ctx, rows[0]!)
+            : this.importTeam(tx, ctx, key, teamSize, rows)
+        }, { timeout: 30_000 })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '成绩与积分入账失败'
+        outcomes.push(...rows.map((row) => ({ ...outcomeFor(row, 'failed'), error: message })))
+        continue
       }
 
-      const existingEntries = await this.db.teamCompetitionEntry.findMany({
-        where: { eventId },
-        include: { team: true },
-      })
-      const existingByTeamName = new Map(existingEntries.map((entry) => [entry.team.name, entry]))
-
-      for (const [teamName, groupRows] of teamGroups) {
-        const existingEntry = existingByTeamName.get(teamName)
-        let teamId: string
-        if (existingEntry) {
-          teamId = existingEntry.teamId
-        } else {
-          teamId = newId()
-          await this.db.team.create({
-            data: {
-              id: teamId,
-              name: teamName,
-              teamSize: Math.max(teamSize, groupRows.length),
-              captainUserId: groupRows[0]!.userId,
-              status: 'locked',
-              createdBy: actor.principalId,
-            },
-          })
-          teamsCreated++
-        }
-
-        for (let i = 0; i < groupRows.length; i++) {
-          const member = groupRows[i]!
-          await this.db.teamMember.upsert({
-            where: { teamId_userId: { teamId, userId: member.userId } },
-            create: {
-              id: newId(),
-              teamId,
-              userId: member.userId,
-              role: i === 0 && !existingEntry ? 'captain' : 'member',
-              status: 'active',
-            },
-            update: { status: 'active', leftAt: null },
-          })
-        }
-
-        const maxPoints = groupRows.reduce((max, r) => Math.max(max, Number(r.points || 0)), 0)
-        const hasAnyPoints = groupRows.some((r) => Number(r.points || 0) !== 0)
-        const uniqueAwards = [...new Set(groupRows.map((r) => r.awardText).filter((v): v is string => Boolean(v)))]
-        const uniqueRanks = [...new Set(groupRows.map((r) => r.rankText).filter((v): v is string => Boolean(v)))]
-        const teamReviewNote = [
-          uniqueAwards.join(' / '),
-          uniqueRanks.length > 0 ? `排名 ${uniqueRanks.join(' / ')}` : '',
-        ].filter(Boolean).join(' · ') || null
-
-        const teamResultDetail = {
-          source: 'competition_import',
-          importBatchId: batchId,
-          contestTier: input.event.contestTier ?? null,
-          awardText: uniqueAwards[0] ?? null,
-          rankText: uniqueRanks[0] ?? null,
-          memberResults: groupRows.map((r) => ({
-            userId: r.userId,
-            studentNo: r.studentNo,
-            awardText: r.awardText ?? null,
-            rankText: r.rankText ?? null,
-            points: r.points,
-            note: r.note ?? null,
-          })),
-        }
-
-        const entry = await this.db.teamCompetitionEntry.upsert({
-          where: { teamId_eventId: { teamId, eventId } },
-          create: {
-            id: newId(),
-            teamId,
-            eventId,
-            status: 'approved',
-            resultScore: hasAnyPoints ? maxPoints.toFixed(2) : null,
-            resultDetail: teamResultDetail as never,
-            reviewNote: teamReviewNote,
-            reviewedBy: actor.principalId,
-            reviewedAt: now,
-          },
-          update: {
-            status: 'approved',
-            resultScore: hasAnyPoints ? maxPoints.toFixed(2) : null,
-            resultDetail: teamResultDetail as never,
-            reviewNote: teamReviewNote,
-            reviewedBy: actor.principalId,
-            reviewedAt: now,
-          },
-        })
-
-        for (const member of groupRows) {
-          registeredCount++
-          const numPoints = Number(member.points || 0)
-          if (numPoints === 0) {
-            rosterOnly++
-            outcomes.push({
-              row: member.row,
-              studentNo: member.studentNo,
-              memberName: member.memberName,
-              teamName,
-              points: '0',
-              status: 'roster_only',
-            })
-            if (!existingEntry) {
-              await this.notifyMember(member.userId, input.event.title, scoreMonth, member.awardText, null, teamName)
-            }
-            continue
-          }
-
-          try {
-            const amount = numPoints.toFixed(2)
-            const res = await this.scoring.postLedgerEntry(actor, {
-              userId: member.userId,
-              sourceKey: `team-competition:${eventId}:${teamId}:${member.userId}`,
-              category: input.event.ledgerCategory,
-              amount,
-              scoreMonth,
-              detail: {
-                eventId,
-                eventTitle: input.event.title,
-                competitionDate: input.event.competitionDate,
-                contestTier: input.event.contestTier ?? null,
-                teamId,
-                teamName,
-                awardText: member.awardText ?? null,
-                rankText: member.rankText ?? null,
-                note: member.note ?? null,
-                source: 'competition_import',
-                importBatchId: batchId,
-              },
-              evidenceRef: `team_competition_entry:${entry.id}`,
-            })
-            if (res.deduplicated) {
-              duplicate++
-              outcomes.push({
-                row: member.row,
-                studentNo: member.studentNo,
-                memberName: member.memberName,
-                teamName,
-                points: amount,
-                status: 'duplicate',
-                error: '该成员本场正式赛积分已入账，名单已同步更新',
-              })
-            } else {
-              posted++
-              outcomes.push({
-                row: member.row,
-                studentNo: member.studentNo,
-                memberName: member.memberName,
-                teamName,
-                points: amount,
-                status: 'archived',
-              })
-              await this.notifyMember(member.userId, input.event.title, scoreMonth, member.awardText, amount, teamName)
-            }
-          } catch (error) {
-            outcomes.push({
-              row: member.row,
-              studentNo: member.studentNo,
-              memberName: member.memberName,
-              teamName,
-              points: member.points,
-              status: 'failed',
-              error: error instanceof Error ? error.message : '积分入账失败',
-            })
-          }
-        }
-      }
-    } else {
-      // 个人赛：逐人写入 CompetitionRegistration 并归档积分
-      for (const row of validRows) {
-        const numPoints = Number(row.points || 0)
-        const existedReg = await this.db.competitionRegistration.findUnique({
-          where: { eventId_userId: { eventId, userId: row.userId } },
-          select: { id: true },
-        })
-        const reviewNote = summarizeResultNote(row, true)
-        const resultDetail = {
-          source: 'competition_import',
-          importBatchId: batchId,
-          contestTier: input.event.contestTier ?? null,
-          awardText: row.awardText ?? null,
-          rankText: row.rankText ?? null,
-          teamName: row.teamName ?? null,
-          pointsSource: row.pointsSource,
-          note: row.note ?? null,
-        }
-        const reg = await this.db.competitionRegistration.upsert({
-          where: { eventId_userId: { eventId, userId: row.userId } },
-          create: {
-            id: newId(),
-            eventId,
+      if (teamSize != null && group.created) teamsCreated++
+      outcomes.push(...group.outcomes)
+      for (const [index, result] of group.outcomes.entries()) {
+        const row = rows[index]!
+        if (result.postedAmount != null) {
+          await this.scoring.notifyPostedPoints({
             userId: row.userId,
-            status: 'approved',
-            resultScore: numPoints !== 0 ? numPoints.toFixed(2) : null,
-            resultDetail: resultDetail as never,
-            reviewNote,
-            note: row.note ?? (row.teamName ? `队伍：${row.teamName}` : null),
-            reviewedBy: actor.principalId,
-            reviewedAt: now,
-            confirmedAt: now,
-          },
-          update: {
-            status: 'approved',
-            resultScore: numPoints !== 0 ? numPoints.toFixed(2) : null,
-            resultDetail: resultDetail as never,
-            reviewNote,
-            note: row.note ?? (row.teamName ? `队伍：${row.teamName}` : null),
-            reviewedBy: actor.principalId,
-            reviewedAt: now,
-            confirmedAt: now,
-          },
-        })
-        registeredCount++
-
-        if (numPoints === 0) {
-          rosterOnly++
-          outcomes.push({
-            row: row.row,
-            studentNo: row.studentNo,
-            memberName: row.memberName,
-            ...(row.teamName ? { teamName: row.teamName } : {}),
-            points: '0',
-            status: 'roster_only',
-          })
-          if (!existedReg) {
-            await this.notifyMember(row.userId, input.event.title, scoreMonth, row.awardText, null, row.teamName)
-          }
-          continue
-        }
-
-        try {
-          const amount = numPoints.toFixed(2)
-          const res = await this.scoring.postLedgerEntry(actor, {
-            userId: row.userId,
-            sourceKey: `competition:${eventId}:${row.userId}`,
-            category: input.event.ledgerCategory,
-            amount,
+            amount: result.postedAmount,
             scoreMonth,
-            detail: {
-              eventId,
-              eventTitle: input.event.title,
-              competitionDate: input.event.competitionDate,
-              contestTier: input.event.contestTier ?? null,
-              teamName: row.teamName ?? null,
-              awardText: row.awardText ?? null,
-              rankText: row.rankText ?? null,
-              note: row.note ?? null,
-              source: 'competition_import',
-              importBatchId: batchId,
-            },
-            evidenceRef: `competition_registration:${reg.id}`,
+            detail: { eventTitle: input.event.title },
           })
-          if (res.deduplicated) {
-            duplicate++
-            outcomes.push({
-              row: row.row,
-              studentNo: row.studentNo,
-              memberName: row.memberName,
-              ...(row.teamName ? { teamName: row.teamName } : {}),
-              points: amount,
-              status: 'duplicate',
-              error: '该成员本场正式赛积分已入账，名单已同步更新',
-            })
-          } else {
-            posted++
-            outcomes.push({
-              row: row.row,
-              studentNo: row.studentNo,
-              memberName: row.memberName,
-              ...(row.teamName ? { teamName: row.teamName } : {}),
-              points: amount,
-              status: 'archived',
-            })
-            await this.notifyMember(row.userId, input.event.title, scoreMonth, row.awardText, amount, row.teamName)
-          }
-        } catch (error) {
-          outcomes.push({
-            row: row.row,
-            studentNo: row.studentNo,
-            memberName: row.memberName,
-            ...(row.teamName ? { teamName: row.teamName } : {}),
-            points: row.points,
-            status: 'failed',
-            error: error instanceof Error ? error.message : '积分入账失败',
-          })
+        }
+        if (result.status === 'archived' || (result.status === 'roster_only' && group.created)) {
+          await this.notifyMember(row.userId, input.event.title, scoreMonth, row.awardText, result.postedAmount ?? null, row.teamName)
         }
       }
     }
 
     outcomes.sort((a, b) => a.row - b.row)
+    const posted = outcomes.filter((o) => o.status === 'archived').length
+    const rosterOnly = outcomes.filter((o) => o.status === 'roster_only').length
+    const duplicate = outcomes.filter((o) => o.status === 'duplicate').length
     const failed = outcomes.filter((o) => o.status === 'failed').length
-
+    const registeredCount = posted + rosterOnly + duplicate
     await this.audit.log({
       actorPrincipalId: actor.principalId,
       action: 'points.competition_import',
@@ -935,6 +691,176 @@ export class CompetitionImportService {
       failed,
       rows: outcomes,
     }
+  }
+
+  // 导入表只提供比赛日期。手工创建的赛事可能在当天任意时刻开赛。
+  private async findArchivedEvent(db: Prisma.TransactionClient, title: string, dayStart: Date) {
+    const nextDay = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000)
+    const events = await db.competitionEvent.findMany({
+      where: { title, status: 'archived', startAt: { gte: dayStart, lt: nextDay } },
+      select: { id: true, title: true, status: true, teamSize: true },
+      take: 2,
+    })
+    if (events.length > 1) throw new ScoringError(`同一天有多场名为「${title}」的归档赛事，无法确定积分归属`, 'CONFLICT')
+    return events[0] ?? null
+  }
+
+  private async postRow(
+    tx: Prisma.TransactionClient, ctx: ImportContext, row: MatchedRow, entryId: string, teamId?: string,
+  ): Promise<CompetitionImportRowOutcome> {
+    const amount = new Decimal(row.points).toFixed(2)
+    if (Number(amount) === 0) return { ...outcomeFor(row, 'roster_only'), points: '0' }
+    const { postedAmount, error } = await this.scoring.postCompetitionResultPoints(tx, ctx.actor, {
+      userId: row.userId,
+      sourceKey: teamId
+        ? `team-competition:${ctx.eventId}:${teamId}:${row.userId}`
+        : `competition:${ctx.eventId}:${row.userId}`,
+      category: ctx.event.ledgerCategory,
+      scoreMonth: ctx.scoreMonth,
+      amount,
+      detail: {
+        eventId: ctx.eventId,
+        eventTitle: ctx.event.title,
+        competitionDate: ctx.event.competitionDate,
+        contestTier: ctx.event.contestTier ?? null,
+        teamName: row.teamName ?? null,
+        ...(teamId ? { teamId } : {}),
+        awardText: row.awardText ?? null,
+        rankText: row.rankText ?? null,
+        note: row.note ?? null,
+        source: 'competition_import',
+        importBatchId: ctx.batchId,
+      },
+      evidenceRef: teamId ? `team_competition_entry:${entryId}` : `competition_registration:${entryId}`,
+    })
+    if (error) return { ...outcomeFor(row, 'failed'), error }
+    if (postedAmount == null) return { ...outcomeFor(row, 'duplicate'), points: amount, error: '本场积分已足额入账' }
+    return { ...outcomeFor(row, 'archived'), points: amount, postedAmount }
+  }
+
+  private async importIndividual(tx: Prisma.TransactionClient, ctx: ImportContext, row: MatchedRow) {
+    const where = { eventId_userId: { eventId: ctx.eventId, userId: row.userId } }
+    const existing = await tx.competitionRegistration.findUnique({ where, select: { id: true, resultScore: true } })
+    const id = existing?.id ?? newId()
+    const outcome = await this.postRow(tx, ctx, row, id)
+    const rosterOnly = outcome.status === 'roster_only'
+    if (outcome.status !== 'failed' && !keepRecordedScore(outcome, Number(existing?.resultScore ?? 0))) {
+      const now = new Date()
+      const result = {
+        status: 'approved',
+        resultScore: rosterOnly ? null : outcome.points,
+        resultDetail: {
+          source: 'competition_import',
+          importBatchId: ctx.batchId,
+          contestTier: ctx.event.contestTier ?? null,
+          awardText: row.awardText ?? null,
+          rankText: row.rankText ?? null,
+          teamName: row.teamName ?? null,
+          pointsSource: row.pointsSource,
+          note: row.note ?? null,
+        },
+        reviewNote: summarizeResultNote(row, true),
+        note: row.note ?? (row.teamName ? `队伍：${row.teamName}` : null),
+        reviewedBy: ctx.actor.principalId,
+        reviewedAt: now,
+        confirmedAt: now,
+      }
+      await tx.competitionRegistration.upsert({
+        where,
+        create: { id, ...where.eventId_userId, ...result },
+        update: result,
+      })
+    }
+    return { created: !existing && outcome.status !== 'failed', outcomes: [outcome] }
+  }
+
+  private async importTeam(tx: Prisma.TransactionClient, ctx: ImportContext, teamName: string, teamSize: number, rows: MatchedRow[]) {
+    const existing = await tx.teamCompetitionEntry.findFirst({
+      where: { eventId: ctx.eventId, team: { name: teamName } },
+      orderBy: [{ registeredAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, teamId: true, resultDetail: true },
+    })
+    const teamId = existing?.teamId ?? newId()
+    const entryId = existing?.id ?? newId()
+    const resultsByUser = new Map<string, Prisma.JsonObject>()
+    const previous = existing?.resultDetail
+    if (previous && typeof previous === 'object' && !Array.isArray(previous) && Array.isArray(previous.memberResults)) {
+      for (const member of previous.memberResults) {
+        if (member && typeof member === 'object' && !Array.isArray(member) && typeof member.userId === 'string') {
+          resultsByUser.set(member.userId, member)
+        }
+      }
+    }
+    const outcomes: CompetitionImportRowOutcome[] = []
+    const accepted: MatchedRow[] = []
+    for (const row of rows) {
+      const outcome = await this.postRow(tx, ctx, row, entryId, teamId)
+      outcomes.push(outcome)
+      if (outcome.status === 'failed') continue
+      accepted.push(row)
+      if (keepRecordedScore(outcome, Number(resultsByUser.get(row.userId)?.points ?? 0))) continue
+      resultsByUser.set(row.userId, {
+        userId: row.userId,
+        studentNo: row.studentNo,
+        points: new Decimal(outcome.points).toFixed(),
+        awardText: row.awardText ?? null,
+        rankText: row.rankText ?? null,
+        note: row.note ?? null,
+      })
+    }
+    if (accepted.length === 0) return { created: false, outcomes }
+    if (!existing) {
+      await tx.team.create({
+        data: {
+          id: teamId,
+          name: teamName,
+          teamSize: Math.max(teamSize, accepted.length),
+          captainUserId: accepted[0]!.userId,
+          status: 'locked',
+          createdBy: ctx.actor.principalId,
+        },
+      })
+    }
+    await tx.teamMember.createMany({
+      data: accepted.map((row, index) => ({
+        id: newId(),
+        teamId,
+        userId: row.userId,
+        role: index === 0 && !existing ? 'captain' : 'member',
+        status: 'active',
+      })),
+      skipDuplicates: true,
+    })
+    if (existing) {
+      await tx.teamMember.updateMany({
+        where: { teamId, userId: { in: accepted.map((row) => row.userId) } },
+        data: { status: 'active', leftAt: null },
+      })
+    }
+
+    const memberResults = [...resultsByUser.values()]
+    const points = memberResults.map((r) => Number(r.points || 0))
+    const uniqueAwards = [...new Set(memberResults.map((r) => r.awardText).filter((v): v is string => typeof v === 'string' && v.length > 0))]
+    const uniqueRanks = [...new Set(memberResults.map((r) => r.rankText).filter((v): v is string => typeof v === 'string' && v.length > 0))]
+    const result = {
+      status: 'approved',
+      resultScore: points.some((v) => v !== 0) ? Math.max(0, ...points).toFixed(2) : null,
+      resultDetail: {
+        source: 'competition_import',
+        importBatchId: ctx.batchId,
+        contestTier: ctx.event.contestTier ?? null,
+        awardText: uniqueAwards[0] ?? null,
+        rankText: uniqueRanks[0] ?? null,
+        memberResults,
+      } as Prisma.InputJsonObject,
+      reviewNote: [uniqueAwards.join(' / '), uniqueRanks.length ? `排名 ${uniqueRanks.join(' / ')}` : ''].filter(Boolean).join(' · ') || null,
+      reviewedBy: ctx.actor.principalId, reviewedAt: new Date(),
+    }
+    await tx.teamCompetitionEntry.upsert({
+      where: { teamId_eventId: { teamId, eventId: ctx.eventId } },
+      create: { id: entryId, teamId, eventId: ctx.eventId, ...result }, update: result,
+    })
+    return { created: !existing, outcomes }
   }
 
   private async notifyMember(

@@ -4,6 +4,7 @@ import { Inject, Injectable, Optional } from '@nestjs/common'
 import {
   buildSourceKey,
   computeEffectiveScore,
+  Decimal,
   defaultRuleParams,
   rollupMonthly,
   ruleParamsSchema,
@@ -89,11 +90,11 @@ export class ScoringService {
     @Optional() @Inject(NotificationsService) private readonly notifications?: NotificationsService,
   ) {}
 
-  private async currentRuleVersion(): Promise<{ id: string; params: RuleParams }> {
-    const rv = await this.db.ruleVersion.findFirst({ where: { status: 'published' }, orderBy: { version: 'desc' } })
+  private async currentRuleVersion(db: Prisma.TransactionClient = this.db): Promise<{ id: string; params: RuleParams }> {
+    const rv = await db.ruleVersion.findFirst({ where: { status: 'published' }, orderBy: { version: 'desc' } })
     // 旧版本参数经默认值合并补齐（R01–R13 拍板后的新字段对历史版本同样生效）
     if (rv) return { id: rv.id, params: mergeRuleParams(rv.params) }
-    const fallback = await this.db.ruleVersion.findFirst({ orderBy: { version: 'desc' } })
+    const fallback = await db.ruleVersion.findFirst({ orderBy: { version: 'desc' } })
     if (fallback) return { id: fallback.id, params: mergeRuleParams(fallback.params) }
     return { id: 'default', params: defaultRuleParams() }
   }
@@ -504,13 +505,77 @@ export class ScoringService {
   }
 
   async postLedgerEntry(actor: SessionActor | null, input: z.infer<typeof ledgerEntrySchema>): Promise<{ entryId: string; deduplicated: boolean }> {
-    const rule = await this.currentRuleVersion()
     const existing = await this.db.pointsLedgerEntry.findFirst({ where: { sourceKey: input.sourceKey, status: 'approved' } })
     if (existing) {
       return { entryId: existing.id, deduplicated: true }
     }
+    const entryId = await this.createApprovedEntry(this.db, actor, input)
+    await this.notifyPostedPoints(input)
+    return { entryId, deduplicated: false }
+  }
+
+  /** 调用方已在同一事务内锁定该场赛事。以成员本场应得总分为准，只追加尚未入账的部分。 */
+  async postCompetitionResultPoints(
+    tx: Prisma.TransactionClient,
+    actor: SessionActor,
+    input: z.infer<typeof ledgerEntrySchema> & { detail: Record<string, unknown> & { eventId: string } },
+    options: { recordInitialZero?: boolean; useOriginalScoreMonth?: boolean } = {},
+  ): Promise<{ postedAmount: string | null; scoreMonth?: string; error?: string }> {
+    const { eventId } = input.detail
+    const entries = await tx.pointsLedgerEntry.findMany({
+      where: {
+        userId: input.userId,
+        OR: [
+          { sourceKey: { startsWith: `competition:${eventId}:${input.userId}` } },
+          { sourceKey: { startsWith: `team-competition:${eventId}:` } },
+          { detail: { path: ['eventId'], equals: eventId } },
+          ...(input.evidenceRef ? [{ evidenceRef: input.evidenceRef }] : []),
+        ],
+      },
+      select: { sourceKey: true, status: true, amount: true, scoreMonth: true },
+      orderBy: [{ recordedAt: 'asc' }, { id: 'asc' }],
+    })
+    // 同一成员换队后仍只得一份分。限定标准个人/团队流水及其补分，保留其他来源的独立性。
+    const scoredEntries = entries.filter((entry) => {
+      const parts = entry.sourceKey.split(':')
+      if (parts[1] !== eventId || (parts[0] !== 'competition' && parts[0] !== 'team-competition')) return false
+      const memberIndex = parts[0] === 'team-competition' ? 3 : 2
+      if (parts[memberIndex] !== input.userId) return false
+      return parts.length === memberIndex + 1 || (
+        parts.length === memberIndex + 3 && parts[memberIndex + 1] === 'topup' && /^-?\d+(\.\d+)?$/.test(parts[memberIndex + 2]!)
+      )
+    })
+    if (scoredEntries.length !== entries.length || scoredEntries.some((entry) => entry.status !== 'approved')) {
+      return { postedAmount: null, error: '本场积分已有人工更正，请核对积分流水后处理。' }
+    }
+    const posted = scoredEntries.reduce((sum, entry) => sum.plus(entry.amount.toString()), new Decimal(0))
+    const target = new Decimal(input.amount)
+    const difference = target.minus(posted)
+    if (difference.isZero() && (scoredEntries.length > 0 || !options.recordInitialZero)) return { postedAmount: null }
+    if (difference.isNegative() && scoredEntries.length > 0) {
+      return { postedAmount: null, error: `本场已入账 ${posted.toFixed()} 分，高于本次应得总分 ${target.toFixed()} 分，请核对后处理。` }
+    }
+    const amount = difference.toFixed(Math.max(2, difference.decimalPlaces()))
+    const supplement = scoredEntries.length > 0
+    const scoreMonth = options.useOriginalScoreMonth ? scoredEntries[0]?.scoreMonth ?? input.scoreMonth : input.scoreMonth
+    await this.createApprovedEntry(tx, actor, {
+      ...input,
+      amount,
+      scoreMonth,
+      sourceKey: supplement ? `${input.sourceKey}:topup:${target.toFixed()}` : input.sourceKey,
+      detail: supplement ? { ...input.detail, previousTotal: posted.toFixed(), targetTotal: target.toFixed() } : input.detail,
+    })
+    return { postedAmount: amount, scoreMonth }
+  }
+
+  private async createApprovedEntry(
+    db: Prisma.TransactionClient,
+    actor: SessionActor | null,
+    input: z.infer<typeof ledgerEntrySchema>,
+  ): Promise<string> {
+    const rule = await this.currentRuleVersion(db)
     const id = newId()
-    await this.db.pointsLedgerEntry.create({
+    await db.pointsLedgerEntry.create({
       data: {
         id,
         userId: input.userId,
@@ -533,7 +598,17 @@ export class ScoringService {
       resourceType: 'points_ledger',
       resourceId: id,
       summary: `${input.category} ${input.amount}（${input.scoreMonth}，来源 ${input.sourceKey}）`,
-    })
+    }, db)
+    return id
+  }
+
+  async notifyPostedPoints(input: {
+    userId: string
+    amount: string
+    scoreMonth: string
+    detail?: Record<string, unknown>
+    category?: string
+  }): Promise<void> {
     const numericAmount = Number(input.amount)
     if (Number.isFinite(numericAmount) && numericAmount !== 0) {
       const sign = numericAmount > 0 ? `+${numericAmount}` : `${numericAmount}`
@@ -545,7 +620,7 @@ export class ScoringService {
         (typeof detailObj?.eventTitle === 'string' && detailObj.eventTitle) ||
         (typeof detailObj?.title === 'string' && detailObj.title) ||
         (typeof detailObj?.reason === 'string' && detailObj.reason) ||
-        input.category
+        input.category || '正式赛积分'
       await this.notifications?.notify({
         userId: input.userId,
         kind: 'points_change',
@@ -554,7 +629,6 @@ export class ScoringService {
         link: '/app?section=points',
       })
     }
-    return { entryId: id, deduplicated: false }
   }
 
   /** 冲正 + 替代（一个事务；保留原记录与依据） */

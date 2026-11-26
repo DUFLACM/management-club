@@ -1,3 +1,4 @@
+import type { Prisma } from '@acm/db'
 import { DomainError } from '../../common/domain-error.js'
 import { Inject, Injectable, Optional } from '@nestjs/common'
 import { z } from 'zod'
@@ -19,6 +20,7 @@ import {
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { ScoringService } from '../scoring/scoring.service.js'
+import { isNonScoringCompetitor } from '../scoring/competition-import.service.js'
 import { ContestStandingsService, contestExternalUrl } from '../activities/contest-standings.service.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { newId, monthKey, memberName } from '../../common/utils.js'
@@ -40,6 +42,7 @@ export class CompetitionError extends DomainError {
 
 const RANKED_MEMBERSHIPS = ['formal', 'provisional', 'observing']
 const EFFECTIVE_WEIGHTS = [1, 0.85, 0.7, 0.55, 0.4, 0.25]
+const MEDAL_LABELS = { gold: '金奖', silver: '银奖', bronze: '铜奖', honorable: '优胜奖' }
 
 export const competitionEventInputSchema = z.object({
   designatedContestId: z.string().uuid().optional(),
@@ -328,7 +331,7 @@ export class CompetitionEventService {
           : []
         const myResult = memberResults.find((m) => m.userId === userId)
         const myScore =
-          myResult && typeof myResult.points === 'string' && Number(myResult.points) !== 0
+          myResult && typeof myResult.points === 'string'
             ? Number(myResult.points).toFixed(2)
             : entry.resultScore
               ? entry.resultScore.toString()
@@ -630,12 +633,13 @@ export class CompetitionEventService {
   }
 
   /** 人工审核档位计分输入（按附录二档位对应的奖项枚举） */
-  private computeManualScore(tier: string, award: Record<string, unknown>): { value: InstanceType<typeof Decimal>; detail: unknown } {
+  private computeManualScore(tier: string, award: Record<string, unknown>): { value: InstanceType<typeof Decimal>; detail: Record<string, unknown> } {
     switch (tier) {
       case 'school_select': case 'provincial': case 'icpc_invite': case 'icpc_regional': case 'top_final': {
-        const outcome = formalContestScore({ tier: tier as ContestTier, medal: (award.medal as MedalLevel) ?? null, registeredOfficial: true })
+        const medal = (award.medal as MedalLevel) ?? null
+        const outcome = formalContestScore({ tier: tier as ContestTier, medal, registeredOfficial: true })
         if (outcome.status !== 'ok' || outcome.value == null) throw new CompetitionError(outcome.pendingReason ?? '计分口径未决', 'SCORE_PENDING')
-        return { value: outcome.value, detail: { tier, medal: award.medal ?? null, decisions: outcome.decisions } }
+        return { value: outcome.value, detail: { tier, medal, awardText: medal ? MEDAL_LABELS[medal] : '参赛', decisions: outcome.decisions } }
       }
       case 'network_qualifier': {
         const outcome = networkQualifierScore({
@@ -663,56 +667,112 @@ export class CompetitionEventService {
     }
   }
 
-  async reviewRegistration(actor: SessionActor, registrationId: string, decision: 'approve' | 'reject', input: { note?: string; award?: Record<string, unknown> }): Promise<void> {
-    const reg = await this.db.competitionRegistration.findUnique({ where: { id: registrationId }, include: { event: true } })
-    if (!reg) throw new CompetitionError('报名不存在', 'NOT_FOUND')
-    if (decision === 'reject') {
-      await this.db.competitionRegistration.update({ where: { id: registrationId }, data: { status: 'rejected', reviewNote: input.note ?? '未说明原因', reviewedBy: actor.principalId, reviewedAt: new Date() } })
-      await this.audit.log({ actorPrincipalId: actor.principalId, action: 'competition_registration.reject', resourceType: 'competition_registration', resourceId: registrationId, summary: input.note ?? '驳回' })
-      return
+  private async postManualReviewScore(tx: Prisma.TransactionClient, actor: SessionActor, input: {
+    userId: string; sourceKey: string; amount: string; evidenceRef: string
+    detail: Record<string, unknown> & { eventId: string }
+  }) {
+    const scoreMonth = monthKey(new Date())
+    const posted = await this.scoring.postCompetitionResultPoints(tx, actor, { ...input, category: 'award', scoreMonth }, {
+      recordInitialZero: true, useOriginalScoreMonth: true,
+    })
+    if (posted.error) throw new CompetitionError(posted.error, 'STATE_INVALID')
+    return posted.postedAmount === null ? null : {
+      userId: input.userId, amount: posted.postedAmount, scoreMonth: posted.scoreMonth ?? scoreMonth, detail: input.detail,
     }
-    const { value, detail } = this.computeManualScore(reg.event.contestTier ?? '', input.award ?? {})
-    await this.scoring.postLedgerEntry(actor, {
-      userId: reg.userId,
-      sourceKey: `competition:${reg.eventId}:${reg.userId}`,
-      category: 'award',
-      amount: value.toFixed(2),
-      scoreMonth: monthKey(new Date()),
-      detail: { eventId: reg.eventId, eventTitle: reg.event.title, ...(detail as object) },
-      evidenceRef: `competition_registration:${registrationId}`,
+  }
+
+  async reviewRegistration(actor: SessionActor, registrationId: string, decision: 'approve' | 'reject', input: { note?: string; award?: Record<string, unknown> }): Promise<void> {
+    const notification = await this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM competition_events
+        WHERE id = (SELECT event_id FROM competition_registrations WHERE id = ${registrationId}::uuid) FOR UPDATE`
+      const reg = await tx.competitionRegistration.findUnique({ where: { id: registrationId }, include: { event: true } })
+      if (!reg) throw new CompetitionError('报名不存在', 'NOT_FOUND')
+      const where = { id: registrationId }
+      const review = { reviewedBy: actor.principalId, reviewedAt: new Date(), reviewNote: input.note }
+      const audit = { actorPrincipalId: actor.principalId, resourceType: 'competition_registration', resourceId: registrationId }
+      if (decision === 'reject') {
+        await tx.competitionRegistration.update({ where, data: { ...review, status: 'rejected', reviewNote: input.note ?? '未说明原因' } })
+        await this.audit.log({ ...audit, action: 'competition_registration.reject', summary: input.note ?? '驳回' }, tx)
+        return null
+      }
+      const { value, detail } = this.computeManualScore(reg.event.contestTier ?? '', input.award ?? {})
+      const amount = value.toFixed(2)
+      if (reg.resultScore?.gt(amount)) throw new CompetitionError('本次核定分数低于已有比赛成绩，请核对后处理。', 'STATE_INVALID')
+      const posted = await this.postManualReviewScore(tx, actor, {
+        userId: reg.userId,
+        sourceKey: `competition:${reg.eventId}:${reg.userId}`,
+        amount, detail: { ...detail, eventId: reg.eventId, eventTitle: reg.event.title },
+        evidenceRef: `competition_registration:${registrationId}`,
+      })
+      await tx.competitionRegistration.update({
+        where, data: { ...review, status: 'approved', resultScore: amount, resultDetail: detail as Prisma.InputJsonObject, confirmedAt: review.reviewedAt },
+      })
+      await this.audit.log({ ...audit, action: 'competition_registration.approve', summary: `本场核定 ${amount} 分，本次入账 ${posted?.amount ?? '0'} 分` }, tx)
+      return posted
     })
-    await this.db.competitionRegistration.update({
-      where: { id: registrationId },
-      data: { status: 'approved', resultScore: value.toFixed(2), resultDetail: detail as never, reviewNote: input.note, reviewedBy: actor.principalId, reviewedAt: new Date(), confirmedAt: new Date() },
-    })
-    await this.audit.log({ actorPrincipalId: actor.principalId, action: 'competition_registration.approve', resourceType: 'competition_registration', resourceId: registrationId, summary: `通过并入账 ${value.toFixed(2)} 分` })
+    if (notification) await this.scoring.notifyPostedPoints(notification)
   }
 
   async reviewTeamEntry(actor: SessionActor, entryId: string, decision: 'approve' | 'reject', input: { note?: string; award?: Record<string, unknown> }): Promise<void> {
-    const entry = await this.db.teamCompetitionEntry.findUnique({ where: { id: entryId }, include: { event: true, team: { include: { members: { where: { status: 'active' } } } } } })
-    if (!entry) throw new CompetitionError('队伍报名不存在', 'NOT_FOUND')
-    if (decision === 'reject') {
-      await this.db.teamCompetitionEntry.update({ where: { id: entryId }, data: { status: 'rejected', reviewNote: input.note ?? '未说明原因', reviewedBy: actor.principalId, reviewedAt: new Date() } })
-      await this.audit.log({ actorPrincipalId: actor.principalId, action: 'team_competition_entry.reject', resourceType: 'team_competition_entry', resourceId: entryId, summary: input.note ?? '驳回' })
-      return
-    }
-    const { value, detail } = this.computeManualScore(entry.event.contestTier ?? '', input.award ?? {})
-    for (const member of entry.team.members) {
-      await this.scoring.postLedgerEntry(actor, {
-        userId: member.userId,
-        sourceKey: `team-competition:${entry.eventId}:${entry.teamId}:${member.userId}`,
-        category: 'award',
-        amount: value.toFixed(2),
-        scoreMonth: monthKey(new Date()),
-        detail: { eventId: entry.eventId, eventTitle: entry.event.title, teamId: entry.teamId, teamName: entry.team.name, ...(detail as object) },
-        evidenceRef: `team_competition_entry:${entryId}`,
+    const notifications = await this.db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM competition_events
+        WHERE id = (SELECT event_id FROM team_competition_entries WHERE id = ${entryId}::uuid) FOR UPDATE`
+      const entry = await tx.teamCompetitionEntry.findUnique({
+        where: { id: entryId },
+        include: { event: true, team: { include: { members: { where: { status: 'active' }, select: { userId: true } } } } },
       })
-    }
-    await this.db.teamCompetitionEntry.update({
-      where: { id: entryId },
-      data: { status: 'approved', resultScore: value.toFixed(2), resultDetail: detail as never, reviewNote: input.note, reviewedBy: actor.principalId, reviewedAt: new Date() },
+      if (!entry) throw new CompetitionError('队伍报名不存在', 'NOT_FOUND')
+      const where = { id: entryId }
+      const review = { reviewedBy: actor.principalId, reviewedAt: new Date(), reviewNote: input.note }
+      const audit = { actorPrincipalId: actor.principalId, resourceType: 'team_competition_entry', resourceId: entryId }
+      if (decision === 'reject') {
+        await tx.teamCompetitionEntry.update({ where, data: { ...review, status: 'rejected', reviewNote: input.note ?? '未说明原因' } })
+        await this.audit.log({ ...audit, action: 'team_competition_entry.reject', summary: input.note ?? '驳回' }, tx)
+        return []
+      }
+      const { value, detail } = this.computeManualScore(entry.event.contestTier ?? '', input.award ?? {})
+      const amount = value.toFixed(2)
+      if (entry.resultScore?.gt(amount)) throw new CompetitionError('本次核定分数低于已有队伍成绩，请核对后处理。', 'STATE_INVALID')
+      const keyPrefix = `team-competition:${entry.eventId}:${entry.teamId}:`
+      const previous = entry.resultDetail
+      let members: Array<{ userId: string } & Prisma.JsonObject> = entry.team.members
+      if (previous && typeof previous === 'object' && !Array.isArray(previous) && Array.isArray(previous.memberResults)) {
+        members = previous.memberResults.flatMap((r) =>
+          r && typeof r === 'object' && !Array.isArray(r) && typeof r.userId === 'string' ? [{ ...r, userId: r.userId }] : [])
+      } else if (entry.resultScore !== null || entry.status === 'approved') {
+        // 旧版人工审核没有保存参赛者快照，每位当时的队员（含零分）都有本队原始流水。
+        const original = await tx.pointsLedgerEntry.findMany({
+          where: { sourceKey: { startsWith: keyPrefix } }, select: { sourceKey: true, userId: true },
+        })
+        members = original.filter((r) => r.sourceKey === keyPrefix + r.userId).map(({ userId }) => ({ userId }))
+      }
+      if (members.length === 0) throw new CompetitionError('缺少本场参赛队员记录，请核对报名名单后处理。', 'STATE_INVALID')
+      const postedScores = []
+      const memberResults = []
+      let scoredMembers = 0
+      for (const member of members) {
+        if (typeof member.awardText === 'string' && isNonScoringCompetitor(member.awardText)) {
+          memberResults.push(member)
+          continue
+        }
+        scoredMembers++
+        const posted = await this.postManualReviewScore(tx, actor, {
+          userId: member.userId, sourceKey: keyPrefix + member.userId, amount,
+          detail: { ...detail, eventId: entry.eventId, eventTitle: entry.event.title, teamId: entry.teamId, teamName: entry.team.name },
+          evidenceRef: `team_competition_entry:${entryId}`,
+        })
+        if (posted) postedScores.push(posted)
+        const awardText = typeof detail.awardText === 'string' ? detail.awardText : Number(member.points) === Number(amount) ? member.awardText ?? null : null
+        memberResults.push({ ...member, points: amount, awardText })
+      }
+      await tx.teamCompetitionEntry.update({
+        where, data: { ...review, status: 'approved', resultScore: amount, resultDetail: { ...detail, memberResults } as Prisma.InputJsonObject },
+      })
+      const total = postedScores.reduce((sum, r) => sum.plus(r.amount), new Decimal(0))
+      await this.audit.log({ ...audit, action: 'team_competition_entry.approve', summary: `核定 ${scoredMembers} 名计分队员各 ${amount} 分，本次合计入账 ${total.toFixed()} 分` }, tx)
+      return postedScores
     })
-    await this.audit.log({ actorPrincipalId: actor.principalId, action: 'team_competition_entry.approve', resourceType: 'team_competition_entry', resourceId: entryId, summary: `通过并为 ${entry.team.members.length} 名队员各入账 ${value.toFixed(2)} 分` })
+    for (const notification of notifications) await this.scoring.notifyPostedPoints(notification)
   }
 
   // ---------------- 平台自动结算（无到场基础分 B；非 club 组织的线下活动） ----------------
@@ -839,7 +899,7 @@ export class CompetitionEventService {
             entry.reviewNote ||
             ''
           const score =
-            mr && typeof mr.points === 'string' && Number(mr.points) !== 0
+            mr && typeof mr.points === 'string'
               ? Number(mr.points).toFixed(2)
               : (entry.resultScore ?? '')
           return [m.user.studentNo, m.user.verifiedRealName, entry.team.name, entry.status, note, score].map(csvCell).join(',')

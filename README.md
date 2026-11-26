@@ -117,6 +117,8 @@ docs/                 制度原文、方案、部署、状态、验收与截图�
 
 升级服务器代码后，务必先执行 `pnpm db:migrate:deploy`，再重启 API 与 Worker。新增业务表（例如 `announcements`）只随迁移创建；只重启进程不会补表。API 启动时会检查公告表，缺失时在日志打印迁移命令，成员端公告接口按「暂无公告」降级，避免反复刷 Prisma 错误。
 
+正式赛获奖分迁移会核对已审核的成绩和原始积分流水，按原计分月补足历史差额。成员可以在积分流水和站内通知查看补分。只有参赛记录、缺少已确认获奖分，或有冲正等人工调账的情况，需要核对成绩后处理。
+
 同域 HTTPS 反向代理将 `/api/v1` 交给 API，静态资源交给 web，`/app /admin /admin/login /login /register` 交给 SPA 入口。CAS 回调必须由后端处理，不能被 SPA fallback 截获。配置、白名单与备份恢复见 `docs/deploy.md`；实现分档见 `docs/implementation-status.md`；实测与剩余条件见 `docs/acceptance-report.md`。
 
 仍需校方 CAS 成功属性与 service 白名单、学生与教职工有效账号的真实验票/属性契约、真实地点采样认证、Hydro/Mongo 实际环境、协会确认 R01–R13，以及真机浏览器、目标服务器压测与 RUM。构建体积与浏览器模拟视口不能替代这些验收。

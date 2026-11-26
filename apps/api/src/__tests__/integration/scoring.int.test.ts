@@ -2,6 +2,7 @@ import { beforeAll, afterAll, describe, expect, it } from 'vitest'
 import { PrismaService } from '../../infrastructure/database/database.module.js'
 import { ensureTestDatabase, TEST_URL } from './setup.js'
 import { ScoringService, ledgerEntrySchema } from '../../modules/scoring/scoring.service.js'
+import { CompetitionEventService } from '../../modules/competitions/competition-event.service.js'
 import { AuditService } from '../../infrastructure/audit/audit.service.js'
 import { createTestUser, makeActor } from './helpers.js'
 import { monthKey } from '../../common/utils.js'
@@ -291,5 +292,88 @@ describe('批量加分：学号 / 姓名二选一', () => {
     expect(chosen.failed).toHaveLength(0)
     expect(await db.pointsLedgerEntry.count({ where: { userId: dupB.userId, status: 'approved' } })).toBe(1)
     expect(await db.pointsLedgerEntry.count({ where: { userId: dupA.userId, status: 'approved' } })).toBe(1)
+  })
+})
+
+describe('正式赛人工审核补发获奖分', () => {
+  const reviewer = makeActor()
+  async function createEvent(contestTier: 'provincial' | 'lanqiao', teamSize?: number) {
+    const events = new CompetitionEventService(db, new AuditService(db), scoring, {} as never)
+    const { eventId } = await events.createEvent(reviewer, {
+      title: '历史正式赛审核测试', category: 'B', contestTier, scoringMode: 'manual_review', teamSize,
+      announcement: '测试人工复核及补分', registerDeadline: '2026-04-01T00:00:00Z',
+      startAt: '2026-04-10T00:00:00Z', endAt: '2026-04-10T04:00:00Z',
+    })
+    return { eventId, events }
+  }
+
+  it('个人先记参赛分，跨月审核和重复审核只在原月份补一次奖项差额', async () => {
+    const { eventId, events } = await createEvent('provincial')
+    const { userId } = await createTestUser(db, { studentNo: '202604060' })
+    const { id } = await db.competitionRegistration.create({ data: { id: crypto.randomUUID(), eventId, userId } })
+    await events.reviewRegistration(reviewer, id, 'approve', {})
+    await db.pointsLedgerEntry.updateMany({ where: { userId }, data: { scoreMonth: '2026-04' } })
+    const silver = { award: { medal: 'silver' } }
+    await Promise.all([events.reviewRegistration(reviewer, id, 'approve', silver), events.reviewRegistration(reviewer, id, 'approve', silver)])
+    const rows = await db.pointsLedgerEntry.findMany({ where: { userId }, orderBy: { recordedAt: 'asc' } })
+    expect(rows.map((r) => [Number(r.amount), r.scoreMonth])).toEqual([[20, '2026-04'], [50, '2026-04']])
+    await expect(events.reviewRegistration(reviewer, id, 'approve', { award: { medal: 'bronze' } })).rejects.toThrow('低于')
+    const result = await db.competitionRegistration.findUniqueOrThrow({ where: { id } })
+    expect(Number(result.resultScore)).toBe(70)
+    expect(result.resultDetail).toMatchObject({ medal: 'silver' })
+  })
+
+  it('首次核定零分保留一条流水，重审和后续获奖不重复登记', async () => {
+    const { eventId, events } = await createEvent('lanqiao')
+    const { userId } = await createTestUser(db, { studentNo: '202604061' })
+    const { id } = await db.competitionRegistration.create({ data: { id: crypto.randomUUID(), eventId, userId } })
+    await events.reviewRegistration(reviewer, id, 'approve', {})
+    await events.reviewRegistration(reviewer, id, 'approve', {})
+    await events.reviewRegistration(reviewer, id, 'approve', { award: { group: 'B', awards: ['prov3'] } })
+    const rows = await db.pointsLedgerEntry.findMany({ where: { userId }, orderBy: { recordedAt: 'asc' } })
+    expect(rows.map((r) => Number(r.amount))).toEqual([0, 12])
+  })
+
+  it('老队伍按原参赛名单补分，拒绝已有人工更正的整队重审', async () => {
+    const { eventId, events } = await createEvent('provincial', 2)
+    const captain = await createTestUser(db, { studentNo: '202604062' })
+    const former = await createTestUser(db, { studentNo: '202604063' })
+    const newcomer = await createTestUser(db, { studentNo: '202604064' })
+    const { id: teamId } = await db.team.create({ data: {
+      id: crypto.randomUUID(), name: '原参赛队', teamSize: 2, captainUserId: captain.userId, createdBy: reviewer.principalId,
+      members: { create: [captain, former].map((m) => ({ id: crypto.randomUUID(), role: m === captain ? 'captain' : 'member', userId: m.userId })) },
+    } })
+    const { id } = await db.teamCompetitionEntry.create({ data: { id: crypto.randomUUID(), eventId, teamId } })
+    await events.reviewTeamEntry(reviewer, id, 'approve', {})
+    // 旧版人工审核只保存队伍成绩，无法直接从成绩明细取原参赛队员。
+    await db.teamCompetitionEntry.update({ where: { id }, data: { resultDetail: { tier: 'provincial' } } })
+    await db.teamMember.update({ where: { teamId_userId: { teamId, userId: former.userId } }, data: { status: 'left', leftAt: new Date() } })
+    await db.teamMember.create({ data: { id: crypto.randomUUID(), teamId, userId: newcomer.userId, role: 'member' } })
+    const silver = { award: { medal: 'silver' } }
+    await events.reviewTeamEntry(reviewer, id, 'approve', silver)
+    await events.reviewTeamEntry(reviewer, id, 'approve', silver)
+    for (const userId of [captain.userId, former.userId]) {
+      const rows = await db.pointsLedgerEntry.findMany({ where: { userId }, orderBy: { recordedAt: 'asc' } })
+      expect(rows.map((r) => Number(r.amount))).toEqual([20, 50])
+    }
+    expect(await db.pointsLedgerEntry.count({ where: { userId: newcomer.userId } })).toBe(0)
+
+    const snapshot = await db.teamCompetitionEntry.findUniqueOrThrow({ where: { id } })
+    const detail = snapshot.resultDetail as { memberResults: { userId: string; points: string }[] }
+    await db.teamCompetitionEntry.update({ where: { id }, data: {
+      resultDetail: { ...detail, memberResults: [...detail.memberResults, { userId: newcomer.userId, awardText: '打星', points: '0' }] },
+    } })
+    await events.reviewTeamEntry(reviewer, id, 'approve', silver)
+    expect(await db.pointsLedgerEntry.count({ where: { userId: newcomer.userId } })).toBe(0)
+    const myEvents = await events.myCompetitions(newcomer.userId)
+    expect(myEvents.find((r) => r.eventId === eventId)).toMatchObject({ awardText: '打星', resultScore: '0.00' })
+    expect(await events.exportRosterCsv(eventId)).toMatch(/202604064,[^\n]*,0\.00/)
+
+    const original = await db.pointsLedgerEntry.findFirstOrThrow({ where: { sourceKey: `team-competition:${eventId}:${teamId}:${former.userId}` } })
+    await scoring.reverseEntry(reviewer, original.id, '人工核对原比赛积分', null)
+    await expect(events.reviewTeamEntry(reviewer, id, 'approve', { award: { medal: 'gold' } })).rejects.toThrow('人工更正')
+    expect(await db.pointsLedgerEntry.count({ where: { userId: captain.userId } })).toBe(2)
+    const retained = await db.teamCompetitionEntry.findUniqueOrThrow({ where: { id } })
+    expect(Number(retained.resultScore)).toBe(70)
   })
 })

@@ -1037,12 +1037,7 @@ function RegistrationsSection({
           onClose={() => setReviewing(null)}
           onSubmit={async (input) => {
             await competitionsAdminApi.reviewRegistration(reviewing.id, input);
-            void queryClient.invalidateQueries({
-              queryKey: ['principal', principalId, 'admin', 'competition-registrations', event.id],
-            });
-            void queryClient.invalidateQueries({
-              queryKey: ['principal', principalId, 'admin', 'competition-events'],
-            });
+            void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
           }}
         />
       )}
@@ -1460,12 +1455,7 @@ function TeamEntriesSection({
           onClose={() => setReviewing(null)}
           onSubmit={async (input) => {
             await competitionsAdminApi.reviewTeamEntry(reviewing.id, input);
-            void queryClient.invalidateQueries({
-              queryKey: ['principal', principalId, 'admin', 'competition-team-entries', event.id],
-            });
-            void queryClient.invalidateQueries({
-              queryKey: ['principal', principalId, 'admin', 'competition-events'],
-            });
+            void queryClient.invalidateQueries({ queryKey: ['principal', principalId, 'admin'] });
           }}
         />
       )}

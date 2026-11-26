@@ -42,7 +42,7 @@ describe('CompetitionImportService 正式赛名单与成绩导入', () => {
   it('预览支持学号或姓名导入，姓名重复返回全部候选供手动选择，选定后可正常通过并按档位算分', async () => {
     const db = {
       user: { findMany: vi.fn().mockResolvedValue(sampleUsers) },
-      competitionEvent: { findFirst: vi.fn().mockResolvedValue(null) },
+      competitionEvent: { findMany: vi.fn().mockResolvedValue([]) },
     }
     const svc = new CompetitionImportService(db as never, { log: vi.fn() } as never, {} as never)
 
@@ -72,9 +72,11 @@ describe('CompetitionImportService 正式赛名单与成绩导入', () => {
 
   it('提交时自动创建已归档正式赛、登记报名名单并归档积分，同时向关联成员发通知', async () => {
     const db = {
+      $transaction: vi.fn(async (work) => work(db)),
+      $executeRaw: vi.fn().mockResolvedValue(1),
       user: { findMany: vi.fn().mockResolvedValue(sampleUsers) },
       competitionEvent: {
-        findFirst: vi.fn().mockResolvedValue(null),
+        findMany: vi.fn().mockResolvedValue([]),
         create: vi.fn().mockResolvedValue({}),
       },
       competitionRegistration: {
@@ -83,7 +85,10 @@ describe('CompetitionImportService 正式赛名单与成绩导入', () => {
       },
     }
     const audit = { log: vi.fn().mockResolvedValue(undefined) }
-    const scoring = { postLedgerEntry: vi.fn().mockResolvedValue({ entryId: 'le-1', deduplicated: false }) }
+    const scoring = {
+      postCompetitionResultPoints: vi.fn(async (_tx, _actor, input) => ({ postedAmount: input.amount })),
+      notifyPostedPoints: vi.fn().mockResolvedValue(undefined),
+    }
     const notifications = { notify: vi.fn().mockResolvedValue(undefined) }
     const svc = new CompetitionImportService(db as never, audit as never, scoring as never, notifications as never)
 
@@ -107,9 +112,9 @@ describe('CompetitionImportService 正式赛名单与成绩导入', () => {
       expect.objectContaining({ data: expect.objectContaining({ status: 'archived', title: '2026 蓝桥杯省赛' }) }),
     )
     expect(db.competitionRegistration.upsert).toHaveBeenCalledTimes(2)
-    expect(scoring.postLedgerEntry).toHaveBeenCalledTimes(1)
-    expect(scoring.postLedgerEntry).toHaveBeenCalledWith(
-      ACTOR,
+    expect(scoring.postCompetitionResultPoints).toHaveBeenCalledTimes(1)
+    expect(scoring.postCompetitionResultPoints).toHaveBeenCalledWith(
+      db, ACTOR,
       expect.objectContaining({
         userId: U1,
         category: 'award',
@@ -117,25 +122,31 @@ describe('CompetitionImportService 正式赛名单与成绩导入', () => {
         scoreMonth: '2026-04',
       }),
     )
+    expect(scoring.notifyPostedPoints).toHaveBeenCalledTimes(1)
     expect(notifications.notify).toHaveBeenCalledTimes(2)
   })
 
   it('团队赛按队名编组并逐人归档积分；未解决重名行被拒绝提交', async () => {
     const db = {
+      $transaction: vi.fn(async (work) => work(db)),
+      $executeRaw: vi.fn().mockResolvedValue(1),
       user: { findMany: vi.fn().mockResolvedValue(sampleUsers) },
       competitionEvent: {
-        findFirst: vi.fn().mockResolvedValue(null),
+        findMany: vi.fn().mockResolvedValue([]),
         create: vi.fn().mockResolvedValue({}),
       },
       teamCompetitionEntry: {
-        findMany: vi.fn().mockResolvedValue([]),
+        findFirst: vi.fn().mockResolvedValue(null),
         upsert: vi.fn().mockImplementation(async ({ create }) => ({ id: create.id })),
       },
       team: { create: vi.fn().mockResolvedValue({}) },
-      teamMember: { upsert: vi.fn().mockResolvedValue({}) },
+      teamMember: { createMany: vi.fn().mockResolvedValue({ count: 2 }), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
     }
     const audit = { log: vi.fn().mockResolvedValue(undefined) }
-    const scoring = { postLedgerEntry: vi.fn().mockResolvedValue({ entryId: 'le-team', deduplicated: false }) }
+    const scoring = {
+      postCompetitionResultPoints: vi.fn(async (_tx, _actor, input) => ({ postedAmount: input.amount })),
+      notifyPostedPoints: vi.fn().mockResolvedValue(undefined),
+    }
     const svc = new CompetitionImportService(db as never, audit as never, scoring as never)
 
     await expect(
@@ -154,9 +165,30 @@ describe('CompetitionImportService 正式赛名单与成绩导入', () => {
     })
     expect(res).toMatchObject({ registeredCount: 2, teamsCreated: 1, posted: 2, failed: 0 })
     expect(db.team.create).toHaveBeenCalledTimes(1)
-    expect(db.teamMember.upsert).toHaveBeenCalledTimes(2)
+    expect(db.teamMember.createMany).toHaveBeenCalledWith({
+      data: [expect.objectContaining({ userId: U1, role: 'captain' }), expect.objectContaining({ userId: U2, role: 'member' })],
+      skipDuplicates: true,
+    })
     expect(db.teamCompetitionEntry.upsert).toHaveBeenCalledTimes(1)
-    expect(scoring.postLedgerEntry).toHaveBeenCalledTimes(2)
+    expect(scoring.postCompetitionResultPoints).toHaveBeenCalledTimes(2)
+
+    const initial = db.teamCompetitionEntry.upsert.mock.calls[0]![0].create
+    db.competitionEvent.findMany.mockResolvedValue([{ id: initial.eventId, teamSize: 3 }])
+    db.teamCompetitionEntry.findFirst.mockResolvedValue({ id: initial.id, teamId: initial.teamId, resultDetail: initial.resultDetail })
+    scoring.postCompetitionResultPoints.mockResolvedValueOnce({ postedAmount: '35.00' })
+    const partial = await svc.commit(ACTOR, {
+      event: { title: '2026 ICPC 沈阳站', competitionDate: '2026-11-15', category: 'A', teamSize: 3, ledgerCategory: 'award' },
+      rows: [{ row: 2, selectedUserId: U2, teamName: '大外一队', awardText: '银奖', points: '155' }],
+    })
+    expect(partial).toMatchObject({ posted: 1, teamsCreated: 0, failed: 0 })
+    expect(scoring.notifyPostedPoints).toHaveBeenLastCalledWith(expect.objectContaining({ userId: U2, amount: '35.00' }))
+    expect(db.teamCompetitionEntry.upsert.mock.calls[1]![0].update).toMatchObject({
+      resultScore: '155.00',
+      resultDetail: { memberResults: [
+        { userId: U1, awardText: '铜奖', points: '120' },
+        { userId: U2, awardText: '银奖', points: '155' },
+      ] },
+    })
   })
 })
 
