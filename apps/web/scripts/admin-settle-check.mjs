@@ -60,7 +60,7 @@ try {
   await page.getByRole('button', { name: '加载比赛榜单' }).click();
   await page.getByText('阿林', { exact: true }).waitFor({ timeout: 5000 });
   // displayName 优先于 handle 展示（符合设计：昵称可读性优先）
-  assert.ok(await page.locator('main, [data-slot="sheet-content"], body').first().evaluate((el) => el.scrollWidth <= el.clientWidth + 2), 'no horizontal overflow on admin detail');
+  assert.ok(await page.locator('[data-slot="dialog-content"], [data-slot="sheet-content"], main, body').first().evaluate((el) => el.scrollWidth <= el.clientWidth + 2), 'no horizontal overflow on admin detail');
   await page.screenshot({ path: '/private/tmp/admin-standings-tab.png', fullPage: true });
   console.log('✓ admin detail: settle button + standings tab render');
 

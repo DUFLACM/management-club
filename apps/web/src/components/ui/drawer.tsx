@@ -5,10 +5,10 @@ import { GripVerticalIcon, XIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 /**
- * Drawer：手机全高抽屉（基于 Radix Dialog 自写，不引入 vaul）。
- * - 手机：从底部滑出的全高面板（100dvh），顶部仅保留 8px 拖动示意与关闭按钮，
+ * Drawer：手机底部抽屉（基于 Radix Dialog 自写，不引入 vaul）。
+ * - 手机：从底部滑出（自适应内容高度，上限 90dvh），顶部保留 8px 拖动示意与关闭按钮，
  *   内容区滚动，底部动作固定，预留安全区（env(safe-area-inset-bottom)）；
- * - ≥768px 桌面：自动退化为居中 Dialog 样式（详情抽屉桌面应优先使用 sheet.tsx）。
+ * - ≥768px 桌面：自动退化为居中 Dialog 卡片样式。
  */
 
 const Drawer = DialogPrimitive.Root;
@@ -39,10 +39,10 @@ function DrawerContent({
       <DialogPrimitive.Content
         data-slot="drawer-content"
         className={cn(
-          // 手机全高：100dvh 底部抽屉，圆角 20px 只在顶部
-          'fixed inset-x-0 bottom-0 z-50 flex h-[100dvh] max-h-[100dvh] flex-col rounded-t-[20px] border-t border-border bg-card text-card-foreground shadow-overlay',
-          // 桌面退化为居中面板
-          'md:inset-x-auto md:top-1/2 md:left-1/2 md:right-auto md:bottom-auto md:h-auto md:max-h-[calc(100vh-64px)] md:w-full md:max-w-[560px] md:-translate-x-1/2 md:-translate-y-1/2 md:rounded-[20px] md:border',
+          // 手机底部抽屉：自适应内容高度，上限 90dvh，圆角 20px 只在顶部
+          'fixed inset-x-0 bottom-0 z-50 flex h-auto max-h-[90dvh] flex-col overflow-y-auto rounded-t-[20px] border-t border-border bg-card text-card-foreground shadow-overlay',
+          // 桌面退化为居中卡片
+          'md:inset-0 md:m-auto md:h-fit md:max-h-[min(calc(100dvh-64px),760px)] md:w-[calc(100%-32px)] md:max-w-[560px] md:rounded-2xl md:border',
           className,
         )}
         {...props}
